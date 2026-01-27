@@ -45,16 +45,12 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 
 // ✅ LISTAR JOBS
 app.get("/jobs", async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `select * from jobs order by created_at desc limit 50`
-    );
-    res.json(rows);
-  } catch (e) {
-    console.error("list jobs error", e);
-    res.status(500).json({ error: "db error" });
-  }
+  const { rows } = await pool.query(
+    `select * from jobs order by created_at desc limit 50`
+  );
+  res.json(rows); // <-- array
 });
+
 
 // ✅ DETALLE JOB
 app.get("/jobs/:id", async (req, res) => {
