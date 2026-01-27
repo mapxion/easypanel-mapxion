@@ -20,25 +20,7 @@ app.get("/version", (req, res) => {
 
 });
 
-// ✅ INIT DB (temporal)
-app.post("/admin/init-db", async (req, res) => {
-  try {
-    await pool.query(`create extension if not exists "pgcrypto"`);
-    await pool.query(`
-      create table if not exists jobs (
-        id uuid primary key default gen_random_uuid(),
-        status text not null,
-        photos_count int not null,
-        price numeric(10,2) not null,
-        created_at timestamp default now()
-      )
-    `);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("init-db error", e);
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
+
 
 app.get("/", (req, res) => res.send("mapxion api ok"));
 app.get("/health", (req, res) => res.json({ ok: true }));
