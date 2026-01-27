@@ -12,6 +12,9 @@ import express from "express";
 
 const app = express();
 app.use(express.json());
+app.get("/version", (req, res) => {
+  res.json({ version: "v1-initdb" });
+});
 
 // ✅ INIT DB (temporal)
 app.post("/admin/init-db", async (req, res) => {
