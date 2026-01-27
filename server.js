@@ -33,6 +33,7 @@ app.post("/admin/init-db", async (req, res) => {
   }
 });
 
+
 app.get("/", (req, res) => res.send("mapxion api ok"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
