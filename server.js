@@ -75,6 +75,38 @@ app.post("/jobs", async (req, res) => {
     res.status(500).json({ error: "db error" });
   }
 });
+// ✅ ACTUALIZAR JOB (tracking)
+app.patch("/jobs/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, progress, message, error } = req.body;
+
+    const p = progress === undefined ? null : Number(progress);
+    if (p !== null && (!Number.isFinite(p) || p < 0 || p > 100)) {
+      return res.status(400).json({ error: "progress must be 0..100" });
+    }
+
+    const { rows } = await pool.query(
+      `update jobs
+         set status = coalesce($2, status),
+             progress = coalesce($3, progress),
+             message = coalesce($4, message),
+             error = coalesce($5, error),
+             updated_at = now(),
+             started_at = case when $2 = 'running' and started_at is null then now() else started_at end,
+             finished_at = case when $2 in ('done','failed') then now() else finished_at end
+       where id = $1
+       returning *`,
+      [id, status ?? null, p, message ?? null, error ?? null]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: "not found" });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("patch job error", e);
+    res.status(500).json({ error: "db error" });
+  }
+});
 
 const port = 3000;
 app.listen(port, "0.0.0.0", () => {
