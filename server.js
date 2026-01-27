@@ -48,6 +48,22 @@ app.listen(port, "0.0.0.0", () => {
 app.post("/jobs", async (req, res) => {
   const { photos_count } = req.body;
   const price = photos_count * 0.07;
+app.get("/jobs", async (req, res) => {
+  const { rows } = await pool.query(
+    `select * from jobs order by created_at desc limit 50`
+  );
+  res.json(rows);
+});
+
+app.get("/jobs/:id", async (req, res) => {
+  const { id } = req.params;
+  const { rows } = await pool.query(
+    `select * from jobs where id = $1`,
+    [id]
+  );
+  if (!rows.length) return res.status(404).json({ error: "not found" });
+  res.json(rows[0]);
+});
 
   const { rows } = await pool.query(
     `insert into jobs (status, photos_count, price)
