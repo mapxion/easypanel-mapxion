@@ -22,3 +22,17 @@ const port = 3000;
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
+app.post("/jobs", async (req, res) => {
+  const { photos_count } = req.body;
+
+  const price = photos_count * 0.07;
+
+  const { rows } = await pool.query(
+    `insert into jobs (status, photos_count, price)
+     values ($1, $2, $3)
+     returning *`,
+    ["created", photos_count, price]
+  );
+
+  res.json(rows[0]);
+});
