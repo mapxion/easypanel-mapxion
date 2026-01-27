@@ -16,7 +16,8 @@ pool.query("select 1")
   .catch(err => console.error("Error Postgres", err));
 
 app.get("/version", (req, res) => {
-  res.json({ version: "v1-initdb" });
+  res.json({ version: "v2-jobs-get" });
+
 });
 
 // ✅ INIT DB (temporal)
