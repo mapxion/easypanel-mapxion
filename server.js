@@ -26,24 +26,16 @@ pool.query("select 1")
 // REDIS + BULLMQ
 // =====================
 const redis = new IORedis(process.env.REDIS_URL);
-
 redis.on("connect", () => console.log("Redis conectado"));
 redis.on("error", (e) => console.error("Redis error", e));
 
-const processQueue = new Queue("processQueue", {
-  connection: redis
-});
+const processQueue = new Queue("processQueue", { connection: redis });
 
 // =====================
 // ENDPOINTS BASICOS
 // =====================
-app.get("/", (req, res) => {
-  res.send("mapxion api ok");
-});
-
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
-});
+app.get("/", (req, res) => res.send("mapxion api ok"));
+app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.get("/version", (req, res) => {
   res.json({ version: "v4-redis-queue" });
@@ -52,8 +44,6 @@ app.get("/version", (req, res) => {
 // =====================
 // JOBS
 // =====================
-
-// LISTAR JOBS
 app.get("/jobs", async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -66,7 +56,6 @@ app.get("/jobs", async (req, res) => {
   }
 });
 
-// DETALLE JOB
 app.get("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -74,9 +63,7 @@ app.get("/jobs/:id", async (req, res) => {
       `select * from jobs where id = $1`,
       [id]
     );
-    if (!rows.length) {
-      return res.status(404).json({ error: "not found" });
-    }
+    if (!rows.length) return res.status(404).json({ error: "not found" });
     res.json(rows[0]);
   } catch (e) {
     console.error("get job error", e);
@@ -84,7 +71,6 @@ app.get("/jobs/:id", async (req, res) => {
   }
 });
 
-// CREAR JOB (POSTGRES + REDIS)
 app.post("/jobs", async (req, res) => {
   try {
     const { photos_count } = req.body;
@@ -103,14 +89,10 @@ app.post("/jobs", async (req, res) => {
       ["queued", n, price]
     );
 
-    // ENCOLAR EN REDIS
     await processQueue.add(
       "process_job",
       { jobId: rows[0].id },
-      {
-        attempts: 3,
-        backoff: { type: "exponential", delay: 5000 }
-      }
+      { attempts: 3, backoff: { type: "exponential", delay: 5000 } }
     );
 
     res.json(rows[0]);
@@ -120,7 +102,6 @@ app.post("/jobs", async (req, res) => {
   }
 });
 
-// TRACKING (PATCH)
 app.patch("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -138,23 +119,14 @@ app.patch("/jobs/:id", async (req, res) => {
              message = coalesce($4, message),
              error = coalesce($5, error),
              updated_at = now(),
-             started_at = case
-               when $2 = 'running' and started_at is null then now()
-               else started_at
-             end,
-             finished_at = case
-               when $2 in ('done','failed') then now()
-               else finished_at
-             end
+             started_at = case when $2 = 'running' and started_at is null then now() else started_at end,
+             finished_at = case when $2 in ('done','failed') then now() else finished_at end
        where id = $1
        returning *`,
       [id, status ?? null, p, message ?? null, error ?? null]
     );
 
-    if (!rows.length) {
-      return res.status(404).json({ error: "not found" });
-    }
-
+    if (!rows.length) return res.status(404).json({ error: "not found" });
     res.json(rows[0]);
   } catch (e) {
     console.error("patch job error", e);
@@ -163,7 +135,7 @@ app.patch("/jobs/:id", async (req, res) => {
 });
 
 // =====================
-// LISTEN
+// LISTEN (SOLO UNA VEZ)
 // =====================
 const port = 3000;
 app.listen(port, "0.0.0.0", () => {
