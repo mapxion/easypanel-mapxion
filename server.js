@@ -1,3 +1,4 @@
+import IORedis from "ioredis";
 import express from "express";
 import pkg from "pg";
 const { Pool } = pkg;
@@ -14,7 +15,7 @@ pool.query("select 1")
   .catch(err => console.error("Error Postgres", err));
 
 app.get("/health", (req, res) => res.json({ ok: true }));
-app.get("/version", (req, res) => res.json({ version: "v3-stable-no-redis" }));
+app.get("/version", (req, res) => res.json({ version: "v3.1-redis-check" }));
 
 app.get("/jobs", async (req, res) => {
   try {
@@ -26,6 +27,19 @@ app.get("/jobs", async (req, res) => {
     console.error("list jobs error", e);
     res.status(500).json({ error: "db error" });
   }
+});
+let redis = null;
+let redisReady = false;
+
+if (process.env.REDIS_URL) {
+  redis = new IORedis(process.env.REDIS_URL);
+  redis.on("ready", () => { redisReady = true; console.log("Redis conectado"); });
+  redis.on("error", (e) => { redisReady = false; console.error("Redis error", e?.message || e); });
+} else {
+  console.log("REDIS_URL no definido");
+}
+app.get("/redis", (req, res) => {
+  res.json({ configured: !!process.env.REDIS_URL, ready: redisReady });
 });
 
 app.get("/jobs/:id", async (req, res) => {
