@@ -5,6 +5,7 @@ import IORedis from "ioredis";
 import { Queue } from "bullmq";
 import express from "express";
 import pkg from "pg";
+import archiver from "archiver";
 
 const { Pool } = pkg;
 
@@ -212,6 +213,55 @@ app.get("/jobs/:id/files", async (req, res) => {
   } catch (e) {
     console.error("files error", e);
     res.status(500).json({ ok: false, error: "files error" });
+  }
+});
+app.get("/jobs/:id/download", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // 1) comprobar que el job existe
+    const { rows } = await pool.query(`select id from jobs where id = $1`, [id]);
+    if (!rows.length) return res.status(404).json({ error: "job not found" });
+
+    // 2) carpeta output
+    const outDir = path.join(jobDir(id), "output");
+    if (!fs.existsSync(outDir)) {
+      return res.status(404).json({ error: "no output folder yet" });
+    }
+
+    const files = fs.readdirSync(outDir);
+    if (!files.length) {
+      return res.status(404).json({ error: "no outputs yet" });
+    }
+
+    // 3) headers descarga
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="mapxion-${id}.zip"`);
+
+    // 4) zip en streaming (sin crear zip en disco)
+    const archive = archiver("zip", { zlib: { level: 9 } });
+
+    archive.on("error", (err) => {
+      console.error("zip error", err);
+      try { res.status(500).end(); } catch (_) {}
+    });
+
+    // si el cliente corta la descarga, paramos
+    req.on("close", () => {
+      if (!res.writableEnded) {
+        archive.abort();
+      }
+    });
+
+    archive.pipe(res);
+
+    // añade carpeta output completa dentro del zip
+    archive.directory(outDir, false);
+
+    await archive.finalize();
+  } catch (e) {
+    console.error("download error", e);
+    res.status(500).json({ error: "download error" });
   }
 });
 
