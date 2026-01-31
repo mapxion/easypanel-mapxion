@@ -1,6 +1,8 @@
 import IORedis from "ioredis";
+import { Queue } from "bullmq";
 import express from "express";
 import pkg from "pg";
+
 const { Pool } = pkg;
 
 const app = express();
@@ -14,9 +16,55 @@ pool.query("select 1")
   .then(() => console.log("Postgres conectado"))
   .catch(err => console.error("Error Postgres", err));
 
-app.get("/health", (req, res) => res.json({ ok: true }));
-app.get("/version", (req, res) => res.json({ version: "v3.1-redis-check" }));
+// =====================
+// REDIS (robusto) + QUEUE
+// =====================
+let redis = null;
+let redisReady = false;
+let processQueue = null;
 
+if (process.env.REDIS_URL) {
+  redis = new IORedis(process.env.REDIS_URL);
+
+  redis.on("ready", () => {
+    redisReady = true;
+    console.log("Redis conectado (ready)");
+  });
+
+  redis.on("error", (e) => {
+    redisReady = false;
+    console.error("Redis error", e?.message || e);
+  });
+
+  processQueue = new Queue("processQueue", { connection: redis });
+} else {
+  console.log("REDIS_URL no definido");
+}
+
+// =====================
+// ENDPOINTS BASICOS
+// =====================
+app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/version", (req, res) => res.json({ version: "v4.0-queue" }));
+
+app.get("/", (req, res) => res.send("mapxion api ok"));
+
+app.get("/redis", (req, res) => {
+  res.json({ configured: !!process.env.REDIS_URL, ready: redisReady });
+});
+
+// debug cola
+app.get("/queue", async (req, res) => {
+  if (!processQueue || !redisReady) {
+    return res.status(503).json({ ok: false, error: "queue unavailable" });
+  }
+  const counts = await processQueue.getJobCounts();
+  res.json({ ok: true, counts });
+});
+
+// =====================
+// JOBS
+// =====================
 app.get("/jobs", async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -27,19 +75,6 @@ app.get("/jobs", async (req, res) => {
     console.error("list jobs error", e);
     res.status(500).json({ error: "db error" });
   }
-});
-let redis = null;
-let redisReady = false;
-
-if (process.env.REDIS_URL) {
-  redis = new IORedis(process.env.REDIS_URL);
-  redis.on("ready", () => { redisReady = true; console.log("Redis conectado"); });
-  redis.on("error", (e) => { redisReady = false; console.error("Redis error", e?.message || e); });
-} else {
-  console.log("REDIS_URL no definido");
-}
-app.get("/redis", (req, res) => {
-  res.json({ configured: !!process.env.REDIS_URL, ready: redisReady });
 });
 
 app.get("/jobs/:id", async (req, res) => {
@@ -57,6 +92,7 @@ app.get("/jobs/:id", async (req, res) => {
   }
 });
 
+// crear job + encolar
 app.post("/jobs", async (req, res) => {
   try {
     const n = Number(req.body.photos_count);
@@ -73,13 +109,30 @@ app.post("/jobs", async (req, res) => {
       ["queued", n, price]
     );
 
-    res.json(rows[0]);
+    const jobRow = rows[0];
+
+    // si redis no está listo, no rompemos: devolvemos job creado pero avisamos
+    if (!processQueue || !redisReady) {
+      return res.status(503).json({
+        error: "queue unavailable (redis not ready)",
+        job: jobRow
+      });
+    }
+
+    await processQueue.add(
+      "process_job",
+      { jobId: jobRow.id },
+      { attempts: 3, backoff: { type: "exponential", delay: 5000 } }
+    );
+
+    res.json(jobRow);
   } catch (e) {
     console.error("create job error", e);
     res.status(500).json({ error: "db error" });
   }
 });
 
+// tracking patch
 app.patch("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -116,6 +169,7 @@ const port = 3000;
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
+
 
 
 
