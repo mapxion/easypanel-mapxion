@@ -151,7 +151,7 @@ app.post("/jobs", async (req, res) => {
     const jobRow = rows[0];
 
     // ✅ crear carpeta del job en el drive
-    ensureJobDirs(jobRow.id);
+    ensureJobDirs(id);
 
     if (!processQueue || !redisReady) {
       return res.status(503).json({
@@ -305,9 +305,6 @@ const port = 3000;
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
-
-
-
 
 
 
