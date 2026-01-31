@@ -31,7 +31,6 @@ let redisReady = false;
 let processQueue = null;
 
 if (process.env.REDIS_URL) {
-  // ✅ importante para BullMQ
   redis = new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null });
 
   redis.on("ready", () => {
@@ -63,7 +62,10 @@ function ensureJobDirs(jobId) {
   fs.mkdirSync(path.join(jobDir(jobId), "output"), { recursive: true });
 }
 
-const storage = multer.diskStorage({
+// =====================
+// MULTER (INPUT UPLOAD)
+// =====================
+const inputStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     const { id } = req.params;
     ensureJobDirs(id);
@@ -75,9 +77,28 @@ const storage = multer.diskStorage({
   }
 });
 
-const upload = multer({
-  storage,
+const uploadInput = multer({
+  storage: inputStorage,
   limits: { fileSize: 250 * 1024 * 1024 } // 250MB por foto
+});
+
+// Para outputs (zip) — 5GB por ejemplo (ajusta)
+const outputStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const { id } = req.params;
+    ensureJobDirs(id);
+    cb(null, path.join(jobDir(id), "output"));
+  },
+  filename: (_req, file, cb) => {
+    // guardamos como outputs.zip o el nombre que venga
+    const safe = file.originalname.replace(/[^\w.\-() ]+/g, "_");
+    cb(null, safe);
+  }
+});
+
+const uploadOutput = multer({
+  storage: outputStorage,
+  limits: { fileSize: 5 * 1024 * 1024 * 1024 } // 5GB
 });
 
 // =====================
@@ -86,14 +107,13 @@ const upload = multer({
 app.get("/", (req, res) => res.send("mapxion api ok"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ✅ cambia versión para saber qué está desplegado
-app.get("/version", (req, res) => res.json({ version: "v5-upload-drive" }));
+app.get("/version", (_req, res) => res.json({ version: "v6-api-input-output-zip" }));
 
-app.get("/redis", (req, res) => {
+app.get("/redis", (_req, res) => {
   res.json({ configured: !!process.env.REDIS_URL, ready: redisReady });
 });
 
-app.get("/queue", async (req, res) => {
+app.get("/queue", async (_req, res) => {
   if (!processQueue || !redisReady) {
     return res.status(503).json({ ok: false, error: "queue unavailable" });
   }
@@ -104,7 +124,7 @@ app.get("/queue", async (req, res) => {
 // =====================
 // JOBS
 // =====================
-app.get("/jobs", async (req, res) => {
+app.get("/jobs", async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `select * from jobs order by created_at desc limit 50`
@@ -119,10 +139,7 @@ app.get("/jobs", async (req, res) => {
 app.get("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { rows } = await pool.query(
-      `select * from jobs where id = $1`,
-      [id]
-    );
+    const { rows } = await pool.query(`select * from jobs where id = $1`, [id]);
     if (!rows.length) return res.status(404).json({ error: "not found" });
     res.json(rows[0]);
   } catch (e) {
@@ -150,8 +167,8 @@ app.post("/jobs", async (req, res) => {
 
     const jobRow = rows[0];
 
-    // ✅ crear carpeta del job en el drive
-    ensureJobDirs(id);
+    // ✅ BUG FIX: aquí NO existe "id". Hay que usar jobRow.id
+    ensureJobDirs(jobRow.id);
 
     if (!processQueue || !redisReady) {
       return res.status(503).json({
@@ -173,22 +190,21 @@ app.post("/jobs", async (req, res) => {
   }
 });
 
-// SUBIR FOTOS AL JOB (multipart)
-app.post("/jobs/:id/upload", upload.array("photos", 5000), async (req, res) => {
+// =====================
+// INPUTS (FOTOS)
+// =====================
+
+// SUBIR FOTOS (multipart)
+app.post("/jobs/:id/upload", uploadInput.array("photos", 5000), async (req, res) => {
   try {
     const { id } = req.params;
 
     const { rows } = await pool.query(`select id from jobs where id = $1`, [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
-    // ✅ por seguridad: aseguramos dirs
     ensureJobDirs(id);
 
-    const files = (req.files || []).map(f => ({
-      filename: f.filename,
-      size: f.size
-    }));
-
+    const files = (req.files || []).map(f => ({ filename: f.filename, size: f.size }));
     res.json({ ok: true, uploaded: files.length, files });
   } catch (e) {
     console.error("upload error", e);
@@ -196,12 +212,11 @@ app.post("/jobs/:id/upload", upload.array("photos", 5000), async (req, res) => {
   }
 });
 
-// LISTAR FOTOS
+// LISTAR INPUTS
 app.get("/jobs/:id/files", async (req, res) => {
   try {
     const { id } = req.params;
     const inputDir = path.join(jobDir(id), "input");
-
     if (!fs.existsSync(inputDir)) return res.json({ ok: true, files: [] });
 
     const files = fs.readdirSync(inputDir).map(name => {
@@ -215,49 +230,123 @@ app.get("/jobs/:id/files", async (req, res) => {
     res.status(500).json({ ok: false, error: "files error" });
   }
 });
+
+// DESCARGAR INPUTS COMO ZIP (para worker Windows)
+app.get("/jobs/:id/input.zip", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(`select id from jobs where id = $1`, [id]);
+    if (!rows.length) return res.status(404).json({ error: "job not found" });
+
+    const inputDir = path.join(jobDir(id), "input");
+    if (!fs.existsSync(inputDir)) return res.status(404).json({ error: "no input folder yet" });
+
+    const files = fs.readdirSync(inputDir);
+    if (!files.length) return res.status(404).json({ error: "no inputs yet" });
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="mapxion-${id}-input.zip"`);
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.on("error", (err) => {
+      console.error("input.zip error", err);
+      try { res.status(500).end(); } catch (_) {}
+    });
+
+    req.on("close", () => {
+      if (!res.writableEnded) archive.abort();
+    });
+
+    archive.pipe(res);
+    archive.directory(inputDir, false);
+    await archive.finalize();
+  } catch (e) {
+    console.error("input.zip error", e);
+    res.status(500).json({ error: "input.zip error" });
+  }
+});
+
+// =====================
+// OUTPUTS (SUBIR + LISTAR + DESCARGAR)
+// =====================
+
+// SUBIR OUTPUTS (worker Windows sube un zip aquí)
+app.post("/jobs/:id/output", uploadOutput.single("file"), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(`select id from jobs where id = $1`, [id]);
+    if (!rows.length) return res.status(404).json({ error: "job not found" });
+
+    ensureJobDirs(id);
+
+    if (!req.file) return res.status(400).json({ error: "missing file field (file)" });
+
+    // Opcional: marcar progreso
+    await pool.query(
+      `update jobs set message = coalesce(message,'') where id = $1`,
+      [id]
+    );
+
+    res.json({
+      ok: true,
+      saved: { filename: req.file.filename, size: req.file.size }
+    });
+  } catch (e) {
+    console.error("upload output error", e);
+    res.status(500).json({ ok: false, error: "upload output error" });
+  }
+});
+
+// LISTAR OUTPUTS
+app.get("/jobs/:id/outputs", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const outDir = path.join(jobDir(id), "output");
+    if (!fs.existsSync(outDir)) return res.json({ ok: true, files: [] });
+
+    const files = fs.readdirSync(outDir).map(name => {
+      const stat = fs.statSync(path.join(outDir, name));
+      return { filename: name, size: stat.size };
+    });
+
+    res.json({ ok: true, files });
+  } catch (e) {
+    console.error("outputs error", e);
+    res.status(500).json({ ok: false, error: "outputs error" });
+  }
+});
+
+// DESCARGAR OUTPUTS COMO ZIP (lo que el cliente bajará)
 app.get("/jobs/:id/download", async (req, res) => {
   try {
     const { id } = req.params;
 
-    // 1) comprobar que el job existe
     const { rows } = await pool.query(`select id from jobs where id = $1`, [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
-    // 2) carpeta output
     const outDir = path.join(jobDir(id), "output");
-    if (!fs.existsSync(outDir)) {
-      return res.status(404).json({ error: "no output folder yet" });
-    }
+    if (!fs.existsSync(outDir)) return res.status(404).json({ error: "no output folder yet" });
 
     const files = fs.readdirSync(outDir);
-    if (!files.length) {
-      return res.status(404).json({ error: "no outputs yet" });
-    }
+    if (!files.length) return res.status(404).json({ error: "no outputs yet" });
 
-    // 3) headers descarga
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Content-Disposition", `attachment; filename="mapxion-${id}.zip"`);
 
-    // 4) zip en streaming (sin crear zip en disco)
     const archive = archiver("zip", { zlib: { level: 9 } });
-
     archive.on("error", (err) => {
       console.error("zip error", err);
       try { res.status(500).end(); } catch (_) {}
     });
 
-    // si el cliente corta la descarga, paramos
     req.on("close", () => {
-      if (!res.writableEnded) {
-        archive.abort();
-      }
+      if (!res.writableEnded) archive.abort();
     });
 
     archive.pipe(res);
-
-    // añade carpeta output completa dentro del zip
     archive.directory(outDir, false);
-
     await archive.finalize();
   } catch (e) {
     console.error("download error", e);
@@ -265,7 +354,9 @@ app.get("/jobs/:id/download", async (req, res) => {
   }
 });
 
+// =====================
 // PATCH TRACKING
+// =====================
 app.patch("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -301,10 +392,11 @@ app.patch("/jobs/:id", async (req, res) => {
 // =====================
 // LISTEN
 // =====================
-const port = 3000;
+const port = Number(process.env.PORT) || 3000;
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
+
 
 
 
