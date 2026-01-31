@@ -127,6 +127,25 @@ const worker = new Worker(
       // ✅ Genera outputs dummy en /data/.../output
       writeDummyOutputs(jobId);
 
+const DATA_ROOT = process.env.DATA_ROOT || "/data/mapxion";
+const outDir = path.join(DATA_ROOT, "jobs", jobId, "output");
+const inDir  = path.join(DATA_ROOT, "jobs", jobId, "input");
+
+fs.mkdirSync(outDir, { recursive: true });
+
+const inputs = fs.existsSync(inDir) ? fs.readdirSync(inDir) : [];
+fs.writeFileSync(
+  path.join(outDir, "report.txt"),
+  `jobId=${jobId}\ninputs=${inputs.length}\nfiles=${inputs.join(",")}\ncreated=${new Date().toISOString()}\n`,
+  "utf-8"
+);
+
+fs.writeFileSync(
+  path.join(outDir, "outputs.json"),
+  JSON.stringify({ jobId, inputs, createdAt: new Date().toISOString() }, null, 2),
+  "utf-8"
+);
+
       await patchJob(jobId, { status: "done", progress: 100, message: "Completado" });
       console.log("Job completado:", jobId);
 
@@ -154,6 +173,9 @@ const worker = new Worker(
   },
   { connection }
 );
+
+worker.on("completed", (job) => console.log("Worker completed:", job.id));
+worker.on("failed", (job, err) => console.error("Worker failed:", job?.id, err?.message || err));
 
 worker.on("completed", (job) => console.log("Worker completed:", job.id));
 worker.on("failed", (job, err) => console.error("Worker failed:", job?.id, err?.message || err));
