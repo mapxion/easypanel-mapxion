@@ -107,7 +107,7 @@ const uploadOutput = multer({
 app.get("/", (req, res) => res.send("mapxion api ok"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-app.get("/version", (_req, res) => res.json({ version: "v6-api-input-output-zip" }));
+app.get("/version", (_req, res) => res.json({ version: "v7-api-input-output-zip" }));
 
 app.get("/redis", (_req, res) => {
   res.json({ configured: !!process.env.REDIS_URL, ready: redisReady });
