@@ -279,7 +279,7 @@ app.post("/jobs/:id/output", uploadOutput.single("file"), async (req, res) => {
     const { rows } = await pool.query(`select id from jobs where id = $1`, [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
-    ensureJobDirs(id);
+    ensureJobDirs(jobRow.id);
 
     if (!req.file) return res.status(400).json({ error: "missing file field (file)" });
 
@@ -396,6 +396,7 @@ const port = Number(process.env.PORT) || 3000;
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
+
 
 
 
