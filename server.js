@@ -68,7 +68,7 @@ function ensureJobDirs(jobId) {
 const inputStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     const { id } = req.params;
-    ensureJobDirs(id);
+    ensureJobDirs(jobRow.id);
     cb(null, path.join(jobDir(id), "input"));
   },
   filename: (req, file, cb) => {
@@ -396,6 +396,7 @@ const port = Number(process.env.PORT) || 3000;
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
+
 
 
 
