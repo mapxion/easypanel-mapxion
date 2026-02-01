@@ -1,9 +1,9 @@
+import express from "express";
 import multer from "multer";
 import fs from "fs";
 import path from "path";
 import IORedis from "ioredis";
 import { Queue } from "bullmq";
-import express from "express";
 import pkg from "pg";
 import archiver from "archiver";
 
@@ -15,9 +15,7 @@ app.use(express.json());
 // =====================
 // POSTGRES
 // =====================
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 pool
   .query("select 1")
@@ -25,14 +23,13 @@ pool
   .catch((err) => console.error("Error Postgres", err));
 
 // =====================
-// REDIS (robusto) + QUEUE
+// REDIS + QUEUE
 // =====================
 let redis = null;
 let redisReady = false;
 let processQueue = null;
 
 if (process.env.REDIS_URL) {
-  // ✅ importante para BullMQ
   redis = new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null });
 
   redis.on("ready", () => {
@@ -51,26 +48,21 @@ if (process.env.REDIS_URL) {
 }
 
 // =====================
-// LOCAL DRIVE (/data)
+// DRIVE (/data)
 // =====================
 const DATA_ROOT = process.env.DATA_ROOT || "/data/mapxion";
 
-function jobDir(jobId) {
-  return path.join(DATA_ROOT, "jobs", jobId);
-}
-function inputDir(jobId) {
-  return path.join(jobDir(jobId), "input");
-}
-function outputDir(jobId) {
-  return path.join(jobDir(jobId), "output");
-}
+const jobDir = (jobId) => path.join(DATA_ROOT, "jobs", jobId);
+const inputDir = (jobId) => path.join(jobDir(jobId), "input");
+const outputDir = (jobId) => path.join(jobDir(jobId), "output");
+
 function ensureJobDirs(jobId) {
   fs.mkdirSync(inputDir(jobId), { recursive: true });
   fs.mkdirSync(outputDir(jobId), { recursive: true });
 }
 
 // =====================
-// MULTER (INPUT UPLOAD)
+// MULTER INPUT (photos)
 // =====================
 const inputStorage = multer.diskStorage({
   destination: (req, _file, cb) => {
@@ -86,11 +78,11 @@ const inputStorage = multer.diskStorage({
 
 const uploadInput = multer({
   storage: inputStorage,
-  limits: { fileSize: 250 * 1024 * 1024 }, // 250MB por foto
+  limits: { fileSize: 250 * 1024 * 1024 }, // 250MB/foto
 });
 
 // =====================
-// MULTER (OUTPUT UPLOAD)  (zip subido por worker windows)
+// MULTER OUTPUT (zip subido por worker Windows)
 // =====================
 const outputStorage = multer.diskStorage({
   destination: (req, _file, cb) => {
@@ -110,26 +102,29 @@ const uploadOutput = multer({
 });
 
 // =====================
-// ENDPOINTS BASICOS
+// BASIC
 // =====================
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
-
-// ✅ cambia si quieres
 app.get("/version", (_req, res) =>
-  res.json({ version: "v8-option-a-create-upload-submit" })
+  res.json({ version: "v10-option-a-create-upload-submit" })
 );
 
-app.get("/redis", (_req, res) => {
-  res.json({ configured: !!process.env.REDIS_URL, ready: redisReady });
-});
+app.get("/redis", (_req, res) =>
+  res.json({ configured: !!process.env.REDIS_URL, ready: redisReady })
+);
 
 app.get("/queue", async (_req, res) => {
-  if (!processQueue || !redisReady) {
-    return res.status(503).json({ ok: false, error: "queue unavailable" });
+  try {
+    if (!processQueue || !redisReady) {
+      return res.status(503).json({ ok: false, error: "queue unavailable" });
+    }
+    const counts = await processQueue.getJobCounts();
+    res.json({ ok: true, counts });
+  } catch (e) {
+    console.error("queue error", e);
+    res.status(500).json({ ok: false, error: "queue error" });
   }
-  const counts = await processQueue.getJobCounts();
-  res.json({ ok: true, counts });
 });
 
 // =====================
@@ -138,7 +133,7 @@ app.get("/queue", async (_req, res) => {
 app.get("/jobs", async (_req, res) => {
   try {
     const { rows } = await pool.query(
-      `select * from jobs order by created_at desc limit 50`
+      "select * from jobs order by created_at desc limit 50"
     );
     res.json(rows);
   } catch (e) {
@@ -150,7 +145,7 @@ app.get("/jobs", async (_req, res) => {
 app.get("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { rows } = await pool.query(`select * from jobs where id = $1`, [id]);
+    const { rows } = await pool.query("select * from jobs where id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "not found" });
     res.json(rows[0]);
   } catch (e) {
@@ -159,7 +154,7 @@ app.get("/jobs/:id", async (req, res) => {
   }
 });
 
-// ✅ OPCION A: CREAR JOB (NO ENCOLA AQUI)
+// ✅ OPCION A: crear job (NO ENCOLA AQUI)
 app.post("/jobs", async (req, res) => {
   try {
     const n = Number(req.body.photos_count);
@@ -177,8 +172,6 @@ app.post("/jobs", async (req, res) => {
     );
 
     const jobRow = rows[0];
-
-    // crear carpetas en drive
     ensureJobDirs(jobRow.id);
 
     res.json(jobRow);
@@ -188,23 +181,19 @@ app.post("/jobs", async (req, res) => {
   }
 });
 
-// ✅ OPCION A: SUBMIT (ENCOLAR CUANDO YA HAY FOTOS)
+// ✅ OPCION A: submit (encolar cuando ya hay fotos)
 app.post("/jobs/:id/submit", async (req, res) => {
   try {
     const { id } = req.params;
 
-    // existe job?
-    const { rows } = await pool.query(`select * from jobs where id = $1`, [id]);
+    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
-    // redis listo?
     if (!processQueue || !redisReady) {
       return res.status(503).json({ error: "queue unavailable (redis not ready)" });
     }
 
-    // hay inputs?
-    const inDir = inputDir(id);
-    const files = fs.existsSync(inDir) ? fs.readdirSync(inDir) : [];
+    const files = fs.existsSync(inputDir(id)) ? fs.readdirSync(inputDir(id)) : [];
     if (!files.length) {
       return res.status(400).json({ error: "no inputs uploaded yet" });
     }
@@ -234,13 +223,13 @@ app.post("/jobs/:id/submit", async (req, res) => {
 });
 
 // =====================
-// INPUTS (FOTOS)
+// INPUTS (photos)
 // =====================
 app.post("/jobs/:id/upload", uploadInput.array("photos", 5000), async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { rows } = await pool.query(`select id from jobs where id = $1`, [id]);
+    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     ensureJobDirs(id);
@@ -276,12 +265,11 @@ app.get("/jobs/:id/files", async (req, res) => {
   }
 });
 
-// INPUT.ZIP
 app.get("/jobs/:id/input.zip", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { rows } = await pool.query(`select id from jobs where id = $1`, [id]);
+    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     const dir = inputDir(id);
@@ -294,6 +282,7 @@ app.get("/jobs/:id/input.zip", async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="mapxion-${id}-input.zip"`);
 
     const archive = archiver("zip", { zlib: { level: 9 } });
+
     archive.on("error", (err) => {
       console.error("input.zip error", err);
       try { res.status(500).end(); } catch (_) {}
@@ -313,13 +302,13 @@ app.get("/jobs/:id/input.zip", async (req, res) => {
 });
 
 // =====================
-// OUTPUTS (subir + listar + descargar)
+// OUTPUTS
 // =====================
 app.post("/jobs/:id/output", uploadOutput.single("file"), async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { rows } = await pool.query(`select id from jobs where id = $1`, [id]);
+    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     ensureJobDirs(id);
@@ -355,12 +344,11 @@ app.get("/jobs/:id/outputs", async (req, res) => {
   }
 });
 
-// DOWNLOAD = ZIP de la carpeta output
 app.get("/jobs/:id/download", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { rows } = await pool.query(`select id from jobs where id = $1`, [id]);
+    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     const dir = outputDir(id);
@@ -373,8 +361,9 @@ app.get("/jobs/:id/download", async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="mapxion-${id}.zip"`);
 
     const archive = archiver("zip", { zlib: { level: 9 } });
+
     archive.on("error", (err) => {
-      console.error("zip error", err);
+      console.error("download zip error", err);
       try { res.status(500).end(); } catch (_) {}
     });
 
@@ -434,7 +423,6 @@ app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
 
-});
 
 
 
