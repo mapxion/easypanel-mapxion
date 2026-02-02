@@ -61,6 +61,17 @@ function ensureJobDirs(jobId) {
   fs.mkdirSync(outputDir(jobId), { recursive: true });
 }
 
+// ✅ helper: lista SOLO imágenes (evita mezclar txt, etc.)
+function listInputImages(jobId) {
+  const dir = inputDir(jobId);
+  if (!fs.existsSync(dir)) return [];
+  const exts = new Set([".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"]);
+  return fs
+    .readdirSync(dir)
+    .filter((name) => exts.has(path.extname(name).toLowerCase()))
+    .sort();
+}
+
 // =====================
 // MULTER INPUT (photos)
 // =====================
@@ -107,7 +118,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v11-option-a-create-upload-submit" })
+  res.json({ version: "v12-option-a-create-upload-submit" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -182,22 +193,98 @@ app.post("/jobs", async (req, res) => {
 });
 
 // ✅ OPCION A: submit (encolar cuando ya hay fotos)
+// 🔒 AHORA: valida fotos reales vs photos_count y evita mezclas
 app.post("/jobs/:id/submit", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
+    const { rows } = await pool.query(
+      "select id, photos_count from jobs where id = $1",
+      [id]
+    );
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
+    const job = rows[0];
+
     if (!processQueue || !redisReady) {
-      return res.status(503).json({ error: "queue unavailable (redis not ready)" });
+      return res
+        .status(503)
+        .json({ error: "queue unavailable (redis not ready)" });
     }
 
-    const files = fs.existsSync(inputDir(id)) ? fs.readdirSync(inputDir(id)) : [];
-    if (!files.length) {
-      return res.status(400).json({ error: "no inputs uploaded yet" });
+    ensureJobDirs(id);
+
+    const inputs = listInputImages(id);
+
+    if (inputs.length === 0) {
+      await pool.query(
+        `update jobs
+           set status='failed',
+               progress=0,
+               message=$2,
+               error=$3,
+               updated_at=now(),
+               finished_at=now()
+         where id=$1`,
+        [id, "No hay fotos en input", "no_input_files"]
+      );
+      return res.status(400).json({
+        ok: false,
+        error: "no_input_files",
+        inputs: 0,
+        expected: Number(job.photos_count),
+      });
     }
 
+    if (inputs.length < Number(job.photos_count)) {
+      await pool.query(
+        `update jobs
+           set status='failed',
+               progress=0,
+               message=$2,
+               error=$3,
+               updated_at=now(),
+               finished_at=now()
+         where id=$1`,
+        [
+          id,
+          `Faltan fotos: hay ${inputs.length} y se esperaban ${job.photos_count}`,
+          "not_enough_inputs",
+        ]
+      );
+      return res.status(400).json({
+        ok: false,
+        error: "not_enough_inputs",
+        inputs: inputs.length,
+        expected: Number(job.photos_count),
+      });
+    }
+
+    if (inputs.length > Number(job.photos_count)) {
+      await pool.query(
+        `update jobs
+           set status='failed',
+               progress=0,
+               message=$2,
+               error=$3,
+               updated_at=now(),
+               finished_at=now()
+         where id=$1`,
+        [
+          id,
+          `Demasiadas fotos: hay ${inputs.length} y se esperaban ${job.photos_count}`,
+          "too_many_inputs",
+        ]
+      );
+      return res.status(400).json({
+        ok: false,
+        error: "too_many_inputs",
+        inputs: inputs.length,
+        expected: Number(job.photos_count),
+      });
+    }
+
+    // encolar
     await processQueue.add(
       "process_job",
       { jobId: id },
@@ -208,14 +295,14 @@ app.post("/jobs/:id/submit", async (req, res) => {
       `update jobs
          set status='queued',
              progress=0,
-             message=null,
+             message='En cola',
              error=null,
              updated_at=now()
        where id=$1`,
       [id]
     );
 
-    res.json({ ok: true, enqueued: true, jobId: id, inputs: files.length });
+    res.json({ ok: true, enqueued: true, jobId: id, inputs: inputs.length });
   } catch (e) {
     console.error("submit error", e);
     res.status(500).json({ error: "submit error" });
@@ -225,23 +312,32 @@ app.post("/jobs/:id/submit", async (req, res) => {
 // =====================
 // INPUTS (photos)
 // =====================
-const uploadInputAny = multer({ storage: inputStorage, limits: { fileSize: 250 * 1024 * 1024 } });
 
-app.post("/jobs/:id/upload", uploadInputAny.any(), async (req, res) => {
+// ✅ CAMBIO CLAVE: acepta "photos" y "photos[]"
+// - Evita MulterError: Unexpected field
+// - No rompe el caso normal (photos=@file)
+app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { rows } = await pool.query(`select id, photos_count from jobs where id = $1`, [id]);
+    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     ensureJobDirs(id);
 
     const files = (req.files || [])
-      .filter(f => f.fieldname === "photos" || f.fieldname === "photos[]")
-      .map(f => ({ field: f.fieldname, filename: f.filename, size: f.size }));
+      .filter((f) => f.fieldname === "photos" || f.fieldname === "photos[]")
+      .map((f) => ({
+        field: f.fieldname,
+        filename: f.filename,
+        size: f.size,
+      }));
 
     if (!files.length) {
-      return res.status(400).json({ ok: false, error: "no files uploaded (use photos or photos[])" });
+      return res.status(400).json({
+        ok: false,
+        error: "no files uploaded (use photos or photos[])",
+      });
     }
 
     res.json({ ok: true, uploaded: files.length, files });
@@ -278,19 +374,25 @@ app.get("/jobs/:id/input.zip", async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     const dir = inputDir(id);
-    if (!fs.existsSync(dir)) return res.status(404).json({ error: "no input folder yet" });
+    if (!fs.existsSync(dir))
+      return res.status(404).json({ error: "no input folder yet" });
 
     const files = fs.readdirSync(dir);
     if (!files.length) return res.status(404).json({ error: "no inputs yet" });
 
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename="mapxion-${id}-input.zip"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="mapxion-${id}-input.zip"`
+    );
 
     const archive = archiver("zip", { zlib: { level: 9 } });
 
     archive.on("error", (err) => {
       console.error("input.zip error", err);
-      try { res.status(500).end(); } catch (_) {}
+      try {
+        res.status(500).end();
+      } catch (_) {}
     });
 
     req.on("close", () => {
@@ -318,7 +420,8 @@ app.post("/jobs/:id/output", uploadOutput.single("file"), async (req, res) => {
 
     ensureJobDirs(id);
 
-    if (!req.file) return res.status(400).json({ error: "missing file field (file)" });
+    if (!req.file)
+      return res.status(400).json({ error: "missing file field (file)" });
 
     res.json({
       ok: true,
@@ -357,19 +460,25 @@ app.get("/jobs/:id/download", async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     const dir = outputDir(id);
-    if (!fs.existsSync(dir)) return res.status(404).json({ error: "no output folder yet" });
+    if (!fs.existsSync(dir))
+      return res.status(404).json({ error: "no output folder yet" });
 
     const files = fs.readdirSync(dir);
     if (!files.length) return res.status(404).json({ error: "no outputs yet" });
 
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename="mapxion-${id}.zip"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="mapxion-${id}.zip"`
+    );
 
     const archive = archiver("zip", { zlib: { level: 9 } });
 
     archive.on("error", (err) => {
       console.error("download zip error", err);
-      try { res.status(500).end(); } catch (_) {}
+      try {
+        res.status(500).end();
+      } catch (_) {}
     });
 
     req.on("close", () => {
@@ -427,6 +536,7 @@ const port = Number(process.env.PORT) || 3000;
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
+
 
 
 
