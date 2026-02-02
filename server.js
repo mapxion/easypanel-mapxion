@@ -13,6 +13,12 @@ const app = express();
 app.use(express.json());
 
 // =====================
+// CONFIG
+// =====================
+const PRICE_PER_PHOTO = Number(process.env.PRICE_PER_PHOTO ?? 0.07); // €/foto
+const DATA_ROOT = process.env.DATA_ROOT || "/data/mapxion";
+
+// =====================
 // POSTGRES
 // =====================
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -50,8 +56,6 @@ if (process.env.REDIS_URL) {
 // =====================
 // DRIVE (/data)
 // =====================
-const DATA_ROOT = process.env.DATA_ROOT || "/data/mapxion";
-
 const jobDir = (jobId) => path.join(DATA_ROOT, "jobs", jobId);
 const inputDir = (jobId) => path.join(jobDir(jobId), "input");
 const outputDir = (jobId) => path.join(jobDir(jobId), "output");
@@ -70,6 +74,11 @@ function listInputImages(jobId) {
     .readdirSync(dir)
     .filter((name) => exts.has(path.extname(name).toLowerCase()))
     .sort();
+}
+
+// ✅ helper: status “bloqueado” (no permitir más uploads)
+function isLockedStatus(status) {
+  return ["queued", "running", "done"].includes(String(status || "").toLowerCase());
 }
 
 // =====================
@@ -118,7 +127,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v12-option-a-create-upload-submit" })
+  res.json({ version: "v13-option-a-create-upload-submit-dynamic-count" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -166,20 +175,14 @@ app.get("/jobs/:id", async (req, res) => {
 });
 
 // ✅ OPCION A: crear job (NO ENCOLA AQUI)
-app.post("/jobs", async (req, res) => {
+// 🔥 v13: ya NO exige photos_count. Crea job “created” con 0 fotos y precio 0.
+app.post("/jobs", async (_req, res) => {
   try {
-    const n = Number(req.body.photos_count);
-    if (!Number.isFinite(n) || n <= 0) {
-      return res.status(400).json({ error: "photos_count must be > 0" });
-    }
-
-    const price = n * 0.07;
-
     const { rows } = await pool.query(
       `insert into jobs (status, photos_count, price)
        values ($1, $2, $3)
        returning *`,
-      ["created", n, price]
+      ["created", 0, 0]
     );
 
     const jobRow = rows[0];
@@ -193,18 +196,26 @@ app.post("/jobs", async (req, res) => {
 });
 
 // ✅ OPCION A: submit (encolar cuando ya hay fotos)
-// 🔒 AHORA: valida fotos reales vs photos_count y evita mezclas
+// 🔥 v13: calcula inputs reales, calcula precio, y actualiza DB antes de encolar
 app.post("/jobs/:id/submit", async (req, res) => {
   try {
     const { id } = req.params;
 
     const { rows } = await pool.query(
-      "select id, photos_count from jobs where id = $1",
+      "select id, status from jobs where id = $1",
       [id]
     );
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     const job = rows[0];
+
+    if (isLockedStatus(job.status)) {
+      return res.status(409).json({
+        ok: false,
+        error: "job_locked",
+        message: `Job ya está en estado ${job.status}`,
+      });
+    }
 
     if (!processQueue || !redisReady) {
       return res
@@ -232,57 +243,26 @@ app.post("/jobs/:id/submit", async (req, res) => {
         ok: false,
         error: "no_input_files",
         inputs: 0,
-        expected: Number(job.photos_count),
       });
     }
 
-    if (inputs.length < Number(job.photos_count)) {
-      await pool.query(
-        `update jobs
-           set status='failed',
-               progress=0,
-               message=$2,
-               error=$3,
-               updated_at=now(),
-               finished_at=now()
-         where id=$1`,
-        [
-          id,
-          `Faltan fotos: hay ${inputs.length} y se esperaban ${job.photos_count}`,
-          "not_enough_inputs",
-        ]
-      );
-      return res.status(400).json({
-        ok: false,
-        error: "not_enough_inputs",
-        inputs: inputs.length,
-        expected: Number(job.photos_count),
-      });
-    }
+    const photosCount = inputs.length;
+    const price = Number((photosCount * PRICE_PER_PHOTO).toFixed(2));
 
-    if (inputs.length > Number(job.photos_count)) {
-      await pool.query(
-        `update jobs
-           set status='failed',
-               progress=0,
-               message=$2,
-               error=$3,
-               updated_at=now(),
-               finished_at=now()
-         where id=$1`,
-        [
-          id,
-          `Demasiadas fotos: hay ${inputs.length} y se esperaban ${job.photos_count}`,
-          "too_many_inputs",
-        ]
-      );
-      return res.status(400).json({
-        ok: false,
-        error: "too_many_inputs",
-        inputs: inputs.length,
-        expected: Number(job.photos_count),
-      });
-    }
+    // Guardamos conteo real + precio real y ponemos en cola
+    await pool.query(
+      `update jobs
+         set status='queued',
+             photos_count=$2,
+             price=$3,
+             progress=0,
+             message='En cola',
+             error=null,
+             updated_at=now(),
+             started_at = case when started_at is null then now() else started_at end
+       where id=$1`,
+      [id, photosCount, price]
+    );
 
     // encolar
     await processQueue.add(
@@ -291,18 +271,14 @@ app.post("/jobs/:id/submit", async (req, res) => {
       { attempts: 3, backoff: { type: "exponential", delay: 5000 } }
     );
 
-    await pool.query(
-      `update jobs
-         set status='queued',
-             progress=0,
-             message='En cola',
-             error=null,
-             updated_at=now()
-       where id=$1`,
-      [id]
-    );
-
-    res.json({ ok: true, enqueued: true, jobId: id, inputs: inputs.length });
+    res.json({
+      ok: true,
+      enqueued: true,
+      jobId: id,
+      inputs: photosCount,
+      price,
+      price_per_photo: PRICE_PER_PHOTO,
+    });
   } catch (e) {
     console.error("submit error", e);
     res.status(500).json({ error: "submit error" });
@@ -313,15 +289,25 @@ app.post("/jobs/:id/submit", async (req, res) => {
 // INPUTS (photos)
 // =====================
 
-// ✅ CAMBIO CLAVE: acepta "photos" y "photos[]"
-// - Evita MulterError: Unexpected field
-// - No rompe el caso normal (photos=@file)
+// ✅ acepta "photos" y "photos[]"
 app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
+    const { rows } = await pool.query("select id, status from jobs where id = $1", [
+      id,
+    ]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
+
+    const job = rows[0];
+
+    if (isLockedStatus(job.status)) {
+      return res.status(409).json({
+        ok: false,
+        error: "job_locked",
+        message: `No se pueden subir más fotos: estado ${job.status}`,
+      });
+    }
 
     ensureJobDirs(id);
 
@@ -536,6 +522,7 @@ const port = Number(process.env.PORT) || 3000;
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
+
 
 
 
