@@ -107,7 +107,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v10-option-a-create-upload-submit" })
+  res.json({ version: "v11-option-a-create-upload-submit" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -225,19 +225,24 @@ app.post("/jobs/:id/submit", async (req, res) => {
 // =====================
 // INPUTS (photos)
 // =====================
-app.post("/jobs/:id/upload", uploadInput.array("photos", 5000), async (req, res) => {
+const uploadInputAny = multer({ storage: inputStorage, limits: { fileSize: 250 * 1024 * 1024 } });
+
+app.post("/jobs/:id/upload", uploadInputAny.any(), async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
+    const { rows } = await pool.query(`select id, photos_count from jobs where id = $1`, [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     ensureJobDirs(id);
 
-    const files = (req.files || []).map((f) => ({
-      filename: f.filename,
-      size: f.size,
-    }));
+    const files = (req.files || [])
+      .filter(f => f.fieldname === "photos" || f.fieldname === "photos[]")
+      .map(f => ({ field: f.fieldname, filename: f.filename, size: f.size }));
+
+    if (!files.length) {
+      return res.status(400).json({ ok: false, error: "no files uploaded (use photos or photos[])" });
+    }
 
     res.json({ ok: true, uploaded: files.length, files });
   } catch (e) {
