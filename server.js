@@ -17,6 +17,26 @@ app.use(express.json());
 // =====================
 const PRICE_PER_PHOTO = Number(process.env.PRICE_PER_PHOTO ?? 0.07); // €/foto
 const DATA_ROOT = process.env.DATA_ROOT || "/data/mapxion";
+const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
+
+// =====================
+// AUTH WORKER
+// =====================
+function requireWorkerAuth(req, res, next) {
+  const auth = req.headers.authorization || "";
+
+  if (!WORKER_TOKEN) {
+    return res
+      .status(500)
+      .json({ ok: false, error: "WORKER_TOKEN not configured" });
+  }
+
+  if (auth !== `Bearer ${WORKER_TOKEN}`) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+
+  next();
+}
 
 // =====================
 // POSTGRES
@@ -78,7 +98,9 @@ function listInputImages(jobId) {
 
 // ✅ helper: status “bloqueado” (no permitir más uploads)
 function isLockedStatus(status) {
-  return ["queued", "running", "done"].includes(String(status || "").toLowerCase());
+  return ["queued", "running", "done"].includes(
+    String(status || "").toLowerCase()
+  );
 }
 
 // =====================
@@ -127,7 +149,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v13-option-a-create-upload-submit-dynamic-count" })
+  res.json({ version: "v14-worker-http-claim-confirm-download" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -294,9 +316,10 @@ app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { rows } = await pool.query("select id, status from jobs where id = $1", [
-      id,
-    ]);
+    const { rows } = await pool.query(
+      "select id, status from jobs where id = $1",
+      [id]
+    );
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     const job = rows[0];
@@ -516,21 +539,129 @@ app.patch("/jobs/:id", async (req, res) => {
 });
 
 // =====================
+// WORKER (HTTP por internet)
+// =====================
+app.post("/worker/claim", requireWorkerAuth, async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `update jobs
+          set status='running',
+              progress=0,
+              message='Worker claimed',
+              updated_at=now(),
+              started_at=case when started_at is null then now() else started_at end
+        where id = (
+          select id
+          from jobs
+          where status='queued'
+          order by created_at asc
+          limit 1
+          for update skip locked
+        )
+        returning *`
+    );
+
+    if (!rows.length) {
+      return res.json({ ok: true, job: null });
+    }
+
+    res.json({ ok: true, job: rows[0] });
+  } catch (e) {
+    console.error("worker claim error", e);
+    res.status(500).json({ ok: false, error: "worker claim error" });
+  }
+});
+
+app.get("/worker/jobs/:id/input.zip", requireWorkerAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
+    if (!rows.length) return res.status(404).json({ error: "job not found" });
+
+    const dir = inputDir(id);
+    if (!fs.existsSync(dir)) {
+      return res.status(404).json({ error: "no input folder yet" });
+    }
+
+    const files = fs.readdirSync(dir);
+    if (!files.length) {
+      return res.status(404).json({ error: "no inputs yet" });
+    }
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="mapxion-${id}-input.zip"`
+    );
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+
+    archive.on("error", (err) => {
+      console.error("worker input.zip error", err);
+      try {
+        res.status(500).end();
+      } catch (_) {}
+    });
+
+    req.on("close", () => {
+      if (!res.writableEnded) archive.abort();
+    });
+
+    archive.pipe(res);
+    archive.directory(dir, false);
+    await archive.finalize();
+  } catch (e) {
+    console.error("worker input.zip error", e);
+    res.status(500).json({ error: "worker input.zip error" });
+  }
+});
+
+app.post("/worker/jobs/:id/confirm-download", requireWorkerAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(
+      "select id, input_purged from jobs where id = $1",
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: "job not found" });
+
+    const job = rows[0];
+
+    if (job.input_purged) {
+      return res.json({ ok: true, alreadyPurged: true });
+    }
+
+    const dir = inputDir(id);
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+
+    await pool.query(
+      `update jobs
+          set input_purged = true,
+              input_purged_at = now(),
+              updated_at = now(),
+              message = 'Inputs descargados y borrados del servidor'
+        where id = $1`,
+      [id]
+    );
+
+    res.json({ ok: true, purged: true });
+  } catch (e) {
+    console.error("confirm-download error", e);
+    res.status(500).json({ ok: false, error: "confirm-download error" });
+  }
+});
+
+// =====================
 // LISTEN
 // =====================
 const port = Number(process.env.PORT) || 3000;
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
-
-
-
-
-
-
-
-
-
 
 
 
