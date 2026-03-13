@@ -667,7 +667,62 @@ app.post("/worker/jobs/:id/confirm-download", requireWorkerAuth, async (req, res
     res.status(500).json({ ok: false, error: "confirm-download error" });
   }
 });
+app.get("/worker/jobs/:id/files", requireWorkerAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
 
+    const { rows } = await pool.query(
+      "select id from jobs where id = $1",
+      [id]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: "job not found" });
+    }
+
+    const dir = inputDir(id);
+    if (!fs.existsSync(dir)) {
+      return res.json({ ok: true, files: [] });
+    }
+
+    const files = fs.readdirSync(dir).map((name) => {
+      const stat = fs.statSync(path.join(dir, name));
+      return {
+        filename: name,
+        size: stat.size,
+      };
+    });
+
+    res.json({ ok: true, files });
+  } catch (e) {
+    console.error("worker files error", e);
+    res.status(500).json({ ok: false, error: "worker files error" });
+  }
+});
+app.get("/worker/jobs/:id/file/:name", requireWorkerAuth, async (req, res) => {
+  try {
+    const { id, name } = req.params;
+
+    const { rows } = await pool.query(
+      "select id from jobs where id = $1",
+      [id]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: "job not found" });
+    }
+
+    const safeName = path.basename(name);
+    const filePath = path.join(inputDir(id), safeName);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ ok: false, error: "file not found" });
+    }
+
+    return res.sendFile(filePath);
+  } catch (e) {
+    console.error("worker file download error", e);
+    res.status(500).json({ ok: false, error: "worker file download error" });
+  }
+});
 // =====================
 // LISTEN
 // =====================
