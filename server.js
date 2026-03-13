@@ -149,7 +149,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v14-worker-http-claim-confirm-download" })
+  res.json({ version: "v15-worker-files-direct-download" })
 );
 
 app.get("/redis", (_req, res) =>
