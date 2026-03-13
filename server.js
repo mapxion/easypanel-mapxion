@@ -324,15 +324,28 @@ app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
 
     const job = rows[0];
 
-    if (isLockedStatus(job.status)) {
-      return res.status(409).json({
-        ok: false,
-        error: "job_locked",
-        message: `No se pueden subir más fotos: estado ${job.status}`,
-      });
-    }
+if (isLockedStatus(job.status)) {
+  return res.status(409).json({
+    ok: false,
+    error: "job_locked",
+    message: `No se pueden subir más fotos: estado ${job.status}`,
+  });
+}
 
-    ensureJobDirs(id);
+// Si entra la primera foto y el job aún está recién creado,
+// lo pasamos a "receiving"
+if (job.status === "created") {
+  await pool.query(
+    `update jobs
+        set status='receiving',
+            message='Recibiendo fotos',
+            updated_at=now()
+      where id=$1`,
+    [id]
+  );
+}
+
+ensureJobDirs(id);
 
     const files = (req.files || [])
       .filter((f) => f.fieldname === "photos" || f.fieldname === "photos[]")
