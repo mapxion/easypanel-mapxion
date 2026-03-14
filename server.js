@@ -149,7 +149,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v17-worker-receiving-list" })
+  res.json({ version: "v18-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -481,27 +481,18 @@ app.get("/jobs/:id/download", async (req, res) => {
     const { rows } = await pool.query("select id from jobs where id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
-    const dir = outputDir(id);
-    if (!fs.existsSync(dir))
-      return res.status(404).json({ error: "no output folder yet" });
+    const zipPath = path.join(outputDir(id), "outputs.zip");
 
-    const files = fs.readdirSync(dir);
-    if (!files.length) return res.status(404).json({ error: "no outputs yet" });
+    if (!fs.existsSync(zipPath)) {
+      return res.status(404).json({ error: "outputs.zip not found" });
+    }
 
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="mapxion-${id}.zip"`
-    );
-
-    const archive = archiver("zip", { zlib: { level: 9 } });
-
-    archive.on("error", (err) => {
-      console.error("download zip error", err);
-      try {
-        res.status(500).end();
-      } catch (_) {}
-    });
+    return res.download(zipPath, `mapxion-${id}.zip`);
+  } catch (e) {
+    console.error("download error", e);
+    res.status(500).json({ error: "download error" });
+  }
+});
 
     req.on("close", () => {
       if (!res.writableEnded) archive.abort();
