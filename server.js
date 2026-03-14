@@ -11,7 +11,7 @@ const { Pool } = pkg;
 
 const app = express();
 app.use(express.json());
-
+app.use(cors());
 // =====================
 // CONFIG
 // =====================
@@ -149,7 +149,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v20-worker-receiving-list" })
+  res.json({ version: "v21-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -656,14 +656,13 @@ app.post("/worker/jobs/:id/confirm-download", requireWorkerAuth, async (req, res
     }
 
     await pool.query(
-      `update jobs
-          set input_purged = true,
-              input_purged_at = now(),
-              updated_at = now(),
-              message = 'Inputs descargados y borrados del servidor'
-        where id = $1`,
-      [id]
-    );
+     `update jobs
+         set input_purged = true,
+             input_purged_at = now(),
+             updated_at = now()
+       where id = $1`,
+     [id]
+   );
 
     res.json({ ok: true, purged: true });
   } catch (e) {
