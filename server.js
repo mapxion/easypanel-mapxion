@@ -149,7 +149,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v19-worker-receiving-list" })
+  res.json({ version: "v20-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -478,8 +478,13 @@ app.get("/jobs/:id/download", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
-    if (!rows.length) return res.status(404).json({ error: "job not found" });
+    const { rows } = await pool.query(
+      "select id from jobs where id = $1",
+      [id]
+    );
+
+    if (!rows.length)
+      return res.status(404).json({ error: "job not found" });
 
     const zipPath = path.join(outputDir(id), "outputs.zip");
 
@@ -487,7 +492,13 @@ app.get("/jobs/:id/download", async (req, res) => {
       return res.status(404).json({ error: "outputs.zip not found" });
     }
 
+    const stat = fs.statSync(zipPath);
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Length", stat.size);
+
     return res.download(zipPath, `mapxion-${id}.zip`);
+
   } catch (e) {
     console.error("download error", e);
     res.status(500).json({ error: "download error" });
