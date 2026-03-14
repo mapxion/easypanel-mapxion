@@ -149,7 +149,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v15-worker-files-direct-download" })
+  res.json({ version: "v17-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -584,7 +584,22 @@ app.post("/worker/claim", requireWorkerAuth, async (_req, res) => {
     res.status(500).json({ ok: false, error: "worker claim error" });
   }
 });
+app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `select id, status, photos_count, price, created_at, updated_at, message
+       from jobs
+       where status = 'receiving'
+       order by created_at asc
+       limit 10`
+    );
 
+    res.json({ ok: true, jobs: rows });
+  } catch (e) {
+    console.error("worker receiving error", e);
+    res.status(500).json({ ok: false, error: "worker receiving error" });
+  }
+});
 app.get("/worker/jobs/:id/input.zip", requireWorkerAuth, async (req, res) => {
   try {
     const { id } = req.params;
