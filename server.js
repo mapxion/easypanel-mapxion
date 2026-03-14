@@ -149,7 +149,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v18-worker-receiving-list" })
+  res.json({ version: "v19-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -493,20 +493,7 @@ app.get("/jobs/:id/download", async (req, res) => {
     res.status(500).json({ error: "download error" });
   }
 });
-
-    req.on("close", () => {
-      if (!res.writableEnded) archive.abort();
-    });
-
-    archive.pipe(res);
-    archive.directory(dir, false);
-    await archive.finalize();
-  } catch (e) {
-    console.error("download error", e);
-    res.status(500).json({ error: "download error" });
-  }
-});
-
+   
 // =====================
 // PATCH TRACKING
 // =====================
