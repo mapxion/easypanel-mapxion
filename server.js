@@ -98,6 +98,18 @@ function listInputImages(jobId) {
     .sort();
 }
 
+function getInputTotalBytes(jobId) {
+  const dir = inputDir(jobId);
+  if (!fs.existsSync(dir)) return 0;
+
+  return fs.readdirSync(dir).reduce((acc, name) => {
+    const full = path.join(dir, name);
+    const stat = fs.statSync(full);
+    if (stat.isFile()) return acc + stat.size;
+    return acc;
+  }, 0);
+}
+
 // ✅ helper: status “bloqueado” (no permitir más uploads)
 function isLockedStatus(status) {
   return ["queued", "running", "done"].includes(
@@ -151,7 +163,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v22-worker-receiving-list" })
+  res.json({ version: "v23-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -272,6 +284,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
 
     const photosCount = inputs.length;
     const price = Number((photosCount * PRICE_PER_PHOTO).toFixed(2));
+    const inputTotalBytes = getInputTotalBytes(id);
 
     // Guardamos conteo real + precio real y ponemos en cola
     await pool.query(
@@ -279,13 +292,14 @@ app.post("/jobs/:id/submit", async (req, res) => {
          set status='queued',
              photos_count=$2,
              price=$3,
+             input_total_bytes=$4,
              progress=0,
              message='En cola',
              error=null,
              updated_at=now(),
              started_at = case when started_at is null then now() else started_at end
        where id=$1`,
-      [id, photosCount, price]
+      [id, photosCount, price, inputTotalBytes]
     );
 
     // encolar
@@ -513,7 +527,15 @@ app.get("/jobs/:id/download", async (req, res) => {
 app.patch("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, progress, message, error } = req.body;
+    const {
+      status,
+      progress,
+      message,
+      error,
+      download_seconds,
+      processing_seconds,
+      total_seconds
+    } = req.body;
 
     const p = progress === undefined ? null : Number(progress);
     if (p !== null && (!Number.isFinite(p) || p < 0 || p > 100)) {
@@ -526,12 +548,24 @@ app.patch("/jobs/:id", async (req, res) => {
              progress = coalesce($3, progress),
              message = coalesce($4, message),
              error = coalesce($5, error),
+             download_seconds = coalesce($6, download_seconds),
+             processing_seconds = coalesce($7, processing_seconds),
+             total_seconds = coalesce($8, total_seconds),
              updated_at = now(),
              started_at = case when $2 = 'running' and started_at is null then now() else started_at end,
              finished_at = case when $2 in ('done','failed') then now() else finished_at end
        where id = $1
        returning *`,
-      [id, status ?? null, p, message ?? null, error ?? null]
+      [
+        id,
+        status ?? null,
+        p,
+        message ?? null,
+        error ?? null,
+        download_seconds ?? null,
+        processing_seconds ?? null,
+        total_seconds ?? null
+      ]
     );
 
     if (!rows.length) return res.status(404).json({ error: "not found" });
@@ -728,6 +762,118 @@ app.get("/worker/jobs/:id/file/:name", requireWorkerAuth, async (req, res) => {
     res.status(500).json({ ok: false, error: "worker file download error" });
   }
 });
+
+function estimateProcessingSecondsFromFallback(job) {
+  const photos = Number(job.photos_count || 0);
+  const bytes = Number(job.input_total_bytes || 0);
+  const gb = bytes / (1024 * 1024 * 1024);
+
+  return Math.round(
+    120 + (photos * 18) + (gb * 420)
+  );
+}
+
+async function estimateProcessingSeconds(pool, job) {
+  const photos = Number(job.photos_count || 0);
+  const bytes = Number(job.input_total_bytes || 0);
+
+  const minPhotos = Math.max(0, photos - 200);
+  const maxPhotos = photos + 200;
+
+  const minBytes = Math.max(0, Math.round(bytes * 0.5));
+  const maxBytes = Math.round(bytes * 1.5);
+
+  const { rows } = await pool.query(
+    `select processing_seconds
+     from jobs
+     where status = 'done'
+       and processing_seconds is not null
+       and photos_count between $1 and $2
+       and input_total_bytes between $3 and $4
+     order by created_at desc
+     limit 20`,
+    [minPhotos, maxPhotos, minBytes, maxBytes]
+  );
+
+  if (rows.length >= 3) {
+    const avg = rows.reduce((acc, r) => acc + Number(r.processing_seconds || 0), 0) / rows.length;
+    return Math.round(avg);
+  }
+
+  return estimateProcessingSecondsFromFallback(job);
+}
+
+function formatEtaSeconds(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.ceil((s % 3600) / 60);
+
+  if (h <= 0) return `${m} min`;
+  return `${h} h ${m} min`;
+}
+
+app.get("/jobs/:id/eta", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(
+      `select id, status, progress, photos_count, input_total_bytes, created_at
+       from jobs
+       where id = $1`,
+      [id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: "job not found" });
+    }
+
+    const targetJob = rows[0];
+
+    const allRows = await pool.query(
+      `select id, status, progress, photos_count, input_total_bytes, created_at
+       from jobs
+       where status in ('queued', 'running')
+       order by created_at asc`
+    );
+
+    const activeJobs = allRows.rows;
+
+    let waitSeconds = 0;
+
+    for (const j of activeJobs) {
+      if (j.id === id) break;
+
+      const est = await estimateProcessingSeconds(pool, j);
+
+      if (j.status === "running") {
+        const progress = Math.max(0, Math.min(100, Number(j.progress || 0)));
+        const remaining = Math.round(est * (1 - progress / 100));
+        waitSeconds += remaining;
+      } else if (j.status === "queued") {
+        waitSeconds += est;
+      }
+    }
+
+    const ownProcessingSeconds = await estimateProcessingSeconds(pool, targetJob);
+    const totalSeconds = waitSeconds + ownProcessingSeconds;
+
+    res.json({
+      ok: true,
+      job_id: id,
+      status: targetJob.status,
+      queue_wait_seconds: waitSeconds,
+      own_processing_seconds: ownProcessingSeconds,
+      total_estimated_seconds: totalSeconds,
+      queue_wait_human: formatEtaSeconds(waitSeconds),
+      own_processing_human: formatEtaSeconds(ownProcessingSeconds),
+      total_estimated_human: formatEtaSeconds(totalSeconds)
+    });
+  } catch (e) {
+    console.error("eta error", e);
+    res.status(500).json({ ok: false, error: "eta error" });
+  }
+});
+
 // =====================
 // LISTEN
 // =====================
