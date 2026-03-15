@@ -186,7 +186,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v24-worker-receiving-list" })
+  res.json({ version: "v25-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -222,7 +222,8 @@ app.post("/pricing/preview", async (req, res) => {
       return res.status(400).json({ ok: false, error: "invalid total_bytes" });
     }
 
-    const estimatedSeconds = estimateProcessingSecondsFromInputs(
+    const estimatedSeconds = await estimateProcessingSecondsFromInputsHistorical(
+      pool,
       photosCount,
       totalBytes
     );
@@ -849,9 +850,9 @@ function estimateProcessingSecondsFromFallback(job) {
   );
 }
 
-async function estimateProcessingSeconds(pool, job) {
-  const photos = Number(job.photos_count || 0);
-  const bytes = Number(job.input_total_bytes || 0);
+async function estimateProcessingSecondsFromInputsHistorical(pool, photosCount, totalBytes) {
+  const photos = Number(photosCount || 0);
+  const bytes = Number(totalBytes || 0);
 
   const minPhotos = Math.max(0, photos - 200);
   const maxPhotos = photos + 200;
@@ -872,11 +873,12 @@ async function estimateProcessingSeconds(pool, job) {
   );
 
   if (rows.length >= 3) {
-    const avg = rows.reduce((acc, r) => acc + Number(r.processing_seconds || 0), 0) / rows.length;
+    const avg =
+      rows.reduce((acc, r) => acc + Number(r.processing_seconds || 0), 0) / rows.length;
     return Math.round(avg);
   }
 
-  return estimateProcessingSecondsFromFallback(job);
+  return estimateProcessingSecondsFromInputs(photos, bytes);
 }
 
 function formatEtaSeconds(seconds) {
