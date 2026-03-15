@@ -186,7 +186,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v25-worker-receiving-list" })
+  res.json({ version: "v26-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -350,7 +350,8 @@ app.post("/jobs/:id/submit", async (req, res) => {
     const photosCount = inputs.length;
     const inputTotalBytes = getInputTotalBytes(id);
 
-    const estimatedSeconds = estimateProcessingSecondsFromInputs(
+    const estimatedSeconds = await estimateProcessingSecondsFromInputsHistorical(
+      pool,
       photosCount,
       inputTotalBytes
     );
