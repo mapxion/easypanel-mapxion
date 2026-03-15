@@ -17,7 +17,6 @@ app.use(cors());
 // =====================
 // CONFIG
 // =====================
-const PRICE_PER_PHOTO = Number(process.env.PRICE_PER_PHOTO ?? 0.07); // €/foto
 const DATA_ROOT = process.env.DATA_ROOT || "/data/mapxion";
 const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 
@@ -110,6 +109,30 @@ function getInputTotalBytes(jobId) {
   }, 0);
 }
 
+function estimateProcessingSecondsFromInputs(photosCount, totalBytes) {
+  const photos = Number(photosCount || 0);
+  const bytes = Number(totalBytes || 0);
+  const gb = bytes / (1024 * 1024 * 1024);
+
+  return Math.round(
+    120 + (photos * 18) + (gb * 420)
+  );
+}
+
+function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds) {
+  const photos = Number(photosCount || 0);
+  const bytes = Number(totalBytes || 0);
+  const gb = bytes / (1024 * 1024 * 1024);
+  const hours = Number(estimatedSeconds || 0) / 3600;
+
+  const base = 3;
+  const byPhoto = photos * 0.03;
+  const byGb = gb * 1.5;
+  const byTime = hours * 6;
+
+  return Math.ceil(base + byPhoto + byGb + byTime);
+}
+
 // ✅ helper: status “bloqueado” (no permitir más uploads)
 function isLockedStatus(status) {
   return ["queued", "running", "done"].includes(
@@ -163,7 +186,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v23-worker-receiving-list" })
+  res.json({ version: "v24-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -180,6 +203,47 @@ app.get("/queue", async (_req, res) => {
   } catch (e) {
     console.error("queue error", e);
     res.status(500).json({ ok: false, error: "queue error" });
+  }
+});
+
+// =====================
+// PRICING PREVIEW
+// =====================
+app.post("/pricing/preview", async (req, res) => {
+  try {
+    const photosCount = Number(req.body?.photos_count || 0);
+    const totalBytes = Number(req.body?.total_bytes || 0);
+
+    if (!Number.isFinite(photosCount) || photosCount < 0) {
+      return res.status(400).json({ ok: false, error: "invalid photos_count" });
+    }
+
+    if (!Number.isFinite(totalBytes) || totalBytes < 0) {
+      return res.status(400).json({ ok: false, error: "invalid total_bytes" });
+    }
+
+    const estimatedSeconds = estimateProcessingSecondsFromInputs(
+      photosCount,
+      totalBytes
+    );
+
+    const price = calculatePriceFromInputs(
+      photosCount,
+      totalBytes,
+      estimatedSeconds
+    );
+
+    return res.json({
+      ok: true,
+      photos_count: photosCount,
+      total_bytes: totalBytes,
+      price,
+      estimated_seconds: estimatedSeconds,
+      estimated_human: formatEtaSeconds(estimatedSeconds)
+    });
+  } catch (e) {
+    console.error("pricing preview error", e);
+    res.status(500).json({ ok: false, error: "pricing preview error" });
   }
 });
 
@@ -283,8 +347,18 @@ app.post("/jobs/:id/submit", async (req, res) => {
     }
 
     const photosCount = inputs.length;
-    const price = Number((photosCount * PRICE_PER_PHOTO).toFixed(2));
     const inputTotalBytes = getInputTotalBytes(id);
+
+    const estimatedSeconds = estimateProcessingSecondsFromInputs(
+      photosCount,
+      inputTotalBytes
+    );
+
+    const price = calculatePriceFromInputs(
+      photosCount,
+      inputTotalBytes,
+      estimatedSeconds
+    );
 
     // Guardamos conteo real + precio real y ponemos en cola
     await pool.query(
@@ -314,8 +388,10 @@ app.post("/jobs/:id/submit", async (req, res) => {
       enqueued: true,
       jobId: id,
       inputs: photosCount,
+      input_total_bytes: inputTotalBytes,
       price,
-      price_per_photo: PRICE_PER_PHOTO,
+      estimated_seconds: estimatedSeconds,
+      estimated_human: formatEtaSeconds(estimatedSeconds)
     });
   } catch (e) {
     console.error("submit error", e);
