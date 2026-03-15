@@ -151,7 +151,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v21-worker-receiving-list" })
+  res.json({ version: "v22-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -499,7 +499,7 @@ app.get("/jobs/:id/download", async (req, res) => {
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Content-Length", stat.size);
 
-    return res.download(zipPath, `mapxion-${id}.zip`);
+    return res.download(zipPath, `xproces-${id}.zip`);
 
   } catch (e) {
     console.error("download error", e);
