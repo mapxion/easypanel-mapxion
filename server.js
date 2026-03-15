@@ -6,6 +6,8 @@ import IORedis from "ioredis";
 import { Queue } from "bullmq";
 import pkg from "pg";
 import archiver from "archiver";
+import cors from "cors";
+
 
 const { Pool } = pkg;
 
