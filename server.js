@@ -184,7 +184,6 @@ const uploadOutput = multer({
 // BASIC
 // =====================
 app.get("/", (_req, res) => res.send("mapxion api ok"));
-app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
