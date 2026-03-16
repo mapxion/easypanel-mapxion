@@ -186,7 +186,7 @@ const uploadOutput = multer({
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/version", (_req, res) =>
-  res.json({ version: "v26-worker-receiving-list" })
+  res.json({ version: "v27-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -607,6 +607,7 @@ app.patch("/jobs/:id", async (req, res) => {
     const { id } = req.params;
     const {
       status,
+      stage,
       progress,
       message,
       error,
@@ -623,12 +624,13 @@ app.patch("/jobs/:id", async (req, res) => {
     const { rows } = await pool.query(
       `update jobs
          set status = coalesce($2, status),
-             progress = coalesce($3, progress),
-             message = coalesce($4, message),
-             error = coalesce($5, error),
-             download_seconds = coalesce($6, download_seconds),
-             processing_seconds = coalesce($7, processing_seconds),
-             total_seconds = coalesce($8, total_seconds),
+             stage = coalesce($3, stage),
+             progress = coalesce($4, progress),
+             message = coalesce($5, message),
+             error = coalesce($6, error),
+             download_seconds = coalesce($7, download_seconds),
+             processing_seconds = coalesce($8, processing_seconds),
+             total_seconds = coalesce($9, total_seconds),
              updated_at = now(),
              started_at = case when $2 = 'running' and started_at is null then now() else started_at end,
              finished_at = case when $2 in ('done','failed') then now() else finished_at end
@@ -637,6 +639,7 @@ app.patch("/jobs/:id", async (req, res) => {
       [
         id,
         status ?? null,
+        stage ?? null,
         p,
         message ?? null,
         error ?? null,
