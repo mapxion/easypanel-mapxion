@@ -185,8 +185,51 @@ const uploadOutput = multer({
 // =====================
 app.get("/", (_req, res) => res.send("mapxion api ok"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+
+app.get("/admin/jobs", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      select
+        id,
+        status,
+        stage,
+        photos_count,
+        price,
+        progress,
+        message,
+        error,
+        created_at,
+        started_at,
+        finished_at,
+        download_seconds,
+        processing_seconds,
+        total_seconds
+      from jobs
+      order by created_at desc
+      limit 100
+    `);
+
+    res.json({
+      ok: true,
+      jobs: rows
+    });
+
+  } catch (e) {
+    console.error("admin jobs error", e);
+    res.status(500).json({
+      ok: false,
+      error: "admin jobs error"
+    });
+  }
+});
+
 app.get("/version", (_req, res) =>
-  res.json({ version: "v27-worker-receiving-list" })
+  res.json({ version: "v28-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
