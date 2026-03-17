@@ -228,7 +228,7 @@ app.get("/admin/jobs", async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v28-worker-receiving-list" })
+  res.json({ version: "v29-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -925,6 +925,23 @@ async function estimateProcessingSecondsFromInputsHistorical(pool, photosCount, 
   }
 
   return estimateProcessingSecondsFromInputs(photos, bytes);
+}
+
+async function estimateProcessingSeconds(pool, job) {
+  if (!job) return 0;
+
+  const photos = Number(job.photos_count || 0);
+  const bytes = Number(job.input_total_bytes || 0);
+
+  if (photos > 0 || bytes > 0) {
+    return await estimateProcessingSecondsFromInputsHistorical(
+      pool,
+      photos,
+      bytes
+    );
+  }
+
+  return estimateProcessingSecondsFromFallback(job);
 }
 
 function formatEtaSeconds(seconds) {
