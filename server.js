@@ -230,7 +230,7 @@ app.get("/admin/jobs", async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v30-worker-receiving-list" })
+  res.json({ version: "v31-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -255,8 +255,13 @@ app.get("/queue", async (_req, res) => {
 // =====================
 app.post("/pricing/preview", async (req, res) => {
   try {
+    console.log("PRICING PREVIEW origin:", req.headers.origin);
+    console.log("PRICING PREVIEW body:", req.body);
+
     const photosCount = Number(req.body?.photos_count || 0);
     const totalBytes = Number(req.body?.total_bytes || 0);
+
+    console.log("PRICING PREVIEW parsed:", { photosCount, totalBytes });
 
     if (!Number.isFinite(photosCount) || photosCount < 0) {
       return res.status(400).json({ ok: false, error: "invalid photos_count" });
@@ -272,11 +277,15 @@ app.post("/pricing/preview", async (req, res) => {
       totalBytes
     );
 
+    console.log("PRICING PREVIEW estimatedSeconds:", estimatedSeconds);
+
     const price = calculatePriceFromInputs(
       photosCount,
       totalBytes,
       estimatedSeconds
     );
+
+    console.log("PRICING PREVIEW price:", price);
 
     return res.json({
       ok: true,
