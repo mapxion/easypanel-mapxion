@@ -12,37 +12,10 @@ import cors from "cors";
 const { Pool } = pkg;
 
 const app = express();
-
-const allowedOrigins = [
-  "https://xproces.com",
-  "https://www.xproces.com",
-  "http://localhost:3000",
-  "http://127.0.0.1:3000",
-  "http://localhost:5500",
-  "http://127.0.0.1:5500"
-];
-
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error("CORS no permitido para este origen: " + origin));
-  },
-  methods: ["GET", "POST", "PATCH", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
-
-app.options("*", cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error("CORS no permitido para este origen: " + origin));
-  },
-  methods: ["GET", "POST", "PATCH", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
-
 app.use(express.json());
+app.use(cors());
+
+
 // =====================
 // CONFIG
 // =====================
