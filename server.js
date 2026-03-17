@@ -330,13 +330,15 @@ app.get("/jobs/:id", async (req, res) => {
 
 // ✅ OPCION A: crear job (NO ENCOLA AQUI)
 // 🔥 v13: ya NO exige photos_count. Crea job “created” con 0 fotos y precio 0.
-app.post("/jobs", async (_req, res) => {
+app.post("/jobs", async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `insert into jobs (status, photos_count, price)
-       values ($1, $2, $3)
+    const exifSummary = req.body?.exif_summary || null;
+    const { rows } = 
+    await pool.query(
+      `insert into jobs (status, photos_count, price, exif_summary)
+       values ($1, $2, $3, $4)
        returning *`,
-      ["created", 0, 0]
+      ["created", 0, 0, exifSummary]
     );
 
     const jobRow = rows[0];
