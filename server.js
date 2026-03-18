@@ -716,6 +716,30 @@ app.post("/jobs/:id/cancel", async (req, res) => {
   }
 });
 
+app.post("/jobs/:id/priority", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(
+      `update jobs
+         set priority = coalesce(priority, 0) + 1,
+             updated_at = now()
+       where id = $1
+       returning *`,
+      [id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: "job not found" });
+    }
+
+    res.json({ ok: true, job: rows[0] });
+  } catch (e) {
+    console.error("priority error", e);
+    res.status(500).json({ ok: false, error: "priority error" });
+  }
+});
+
 // =====================
 // PATCH TRACKING
 // =====================
