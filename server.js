@@ -8,6 +8,7 @@ import pkg from "pg";
 import archiver from "archiver";
 import cors from "cors";
 import bcrypt from "bcryptjs";
+import { randomBytes } from "crypto";
 
 
 const { Pool } = pkg;
@@ -29,6 +30,10 @@ const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 function isValidEmail(email) {
   const value = String(email || "").trim();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function generateInviteCode() {
+  return randomBytes(4).toString("hex").toUpperCase();
 }
 
 function requireWorkerAuth(req, res, next) {
@@ -427,6 +432,186 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
+app.post("/auth/invite-login", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const name = String(req.body?.name || "").trim();
+    const code = String(req.body?.code || "").trim().toUpperCase();
+
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_email",
+        message: "Email no válido"
+      });
+    }
+
+    if (!name) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_name",
+        message: "Debe indicar nombre o empresa"
+      });
+    }
+
+    if (!code) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_code",
+        message: "Debe indicar un código"
+      });
+    }
+
+    const invite = await pool.query(
+      `select *
+       from invite_codes
+       where code = $1
+       limit 1`,
+      [code]
+    );
+
+    if (!invite.rows.length) {
+      return res.status(404).json({
+        ok: false,
+        error: "invalid_code",
+        message: "Código no válido"
+      });
+    }
+
+    const inviteRow = invite.rows[0];
+
+    if (inviteRow.is_used) {
+      return res.status(409).json({
+        ok: false,
+        error: "code_already_used",
+        message: "Ese código ya ha sido utilizado"
+      });
+    }
+
+    let userRow = null;
+
+    const existingUser = await pool.query(
+      `select id, email, name
+       from users
+       where email = $1
+       limit 1`,
+      [email]
+    );
+
+    if (existingUser.rows.length) {
+      userRow = existingUser.rows[0];
+    } else {
+      const guestPasswordHash = await bcrypt.hash(`guest:${code}:${Date.now()}`, 10);
+
+      const createdUser = await pool.query(
+        `insert into users (email, password_hash, name)
+         values ($1, $2, $3)
+         returning id, email, name`,
+        [email, guestPasswordHash, name]
+      );
+
+      userRow = createdUser.rows[0];
+    }
+
+    await pool.query(
+      `update invite_codes
+          set is_used = true,
+              used_at = now(),
+              used_by_email = $2,
+              used_by_name = $3
+        where id = $1`,
+      [inviteRow.id, email, name]
+    );
+
+    return res.json({
+      ok: true,
+      user: {
+        id: userRow.id,
+        email: userRow.email,
+        name: userRow.name,
+        auth_type: "invite"
+      }
+    });
+  } catch (e) {
+    console.error("invite login error", e);
+    res.status(500).json({
+      ok: false,
+      error: "invite_login_error"
+    });
+  }
+});
+
+app.post("/admin/invite-codes/generate", async (req, res) => {
+  try {
+    const count = Number(req.body?.count || 50);
+    const rowsCreated = [];
+
+    for (let i = 0; i < count; i++) {
+      let code;
+      let inserted = false;
+
+      while (!inserted) {
+        code = generateInviteCode();
+
+        try {
+          const { rows } = await pool.query(
+            `insert into invite_codes (code)
+             values ($1)
+             returning *`,
+            [code]
+          );
+          rowsCreated.push(rows[0]);
+          inserted = true;
+        } catch (e) {
+          if (!String(e.message || "").toLowerCase().includes("duplicate")) {
+            throw e;
+          }
+        }
+      }
+    }
+
+    res.json({
+      ok: true,
+      created: rowsCreated.length,
+      codes: rowsCreated
+    });
+  } catch (e) {
+    console.error("generate invite codes error", e);
+    res.status(500).json({
+      ok: false,
+      error: "generate_invite_codes_error"
+    });
+  }
+});
+
+app.get("/admin/invite-codes", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `select
+         id,
+         code,
+         is_used,
+         used_at,
+         used_by_email,
+         used_by_name,
+         created_at
+       from invite_codes
+       order by created_at desc
+       limit 500`
+    );
+
+    res.json({
+      ok: true,
+      codes: rows
+    });
+  } catch (e) {
+    console.error("list invite codes error", e);
+    res.status(500).json({
+      ok: false,
+      error: "list_invite_codes_error"
+    });
+  }
+});
 // =====================
 // JOBS
 // =====================
@@ -462,6 +647,8 @@ app.post("/jobs", async (req, res) => {
     const clientEmail = req.body?.client_email || null;
     const projectName = req.body?.project_name || null;
     const clientName = req.body?.client_name || null;
+    const userId = req.body?.user_id || null;
+    
 
     if (!clientEmail || !isValidEmail(clientEmail)) {
       return res.status(400).json({
@@ -472,27 +659,29 @@ app.post("/jobs", async (req, res) => {
     }
 
     const { rows } = await pool.query(
-      `insert into jobs (
-        status,
-        photos_count,
-        price,
-        exif_summary,
-        client_email,
-        project_name,
-        client_name
-      )
-      values ($1, $2, $3, $4, $5, $6, $7)
-      returning *`,
-      [
-        "created",
-        0,
-        0,
-        exifSummary,
-        clientEmail,
-        projectName,
-        clientName
-      ]
-    );
+  `insert into jobs (
+    status,
+    photos_count,
+    price,
+    exif_summary,
+    client_email,
+    project_name,
+    client_name,
+    user_id
+  )
+  values ($1, $2, $3, $4, $5, $6, $7, $8)
+  returning *`,
+  [
+    "created",
+    0,
+    0,
+    exifSummary,
+    clientEmail,
+    projectName,
+    clientName,
+    userId
+  ]
+);
 
     const jobRow = rows[0];
     ensureJobDirs(jobRow.id);
