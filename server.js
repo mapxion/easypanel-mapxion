@@ -230,7 +230,7 @@ app.get("/admin/jobs", async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v32-worker-receiving-list" })
+  res.json({ version: "v33-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -738,6 +738,25 @@ app.patch("/jobs/:id", async (req, res) => {
       return res.status(400).json({ error: "progress must be 0..100" });
     }
 
+    const currentJobResult = await pool.query(
+      `select id, status from jobs where id = $1`,
+      [id]
+    );
+
+    if (!currentJobResult.rows.length) {
+      return res.status(404).json({ error: "not found" });
+    }
+
+    const currentStatus = String(currentJobResult.rows[0].status || "").toLowerCase();
+
+    if (currentStatus === "cancelled") {
+      return res.json({
+        ok: true,
+        ignored: true,
+        message: "Job cancelado; actualización ignorada"
+      });
+    }
+    
     const { rows } = await pool.query(
       `update jobs
          set status = coalesce($2, status),
@@ -790,7 +809,7 @@ app.post("/worker/claim", requireWorkerAuth, async (_req, res) => {
           select id
           from jobs
           where status='queued'
-          order by created_at asc
+          order by coalesce(priority, 0) desc, created_at asc
           limit 1
           for update skip locked
         )
