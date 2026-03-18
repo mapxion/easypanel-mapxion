@@ -7,6 +7,7 @@ import { Queue } from "bullmq";
 import pkg from "pg";
 import archiver from "archiver";
 import cors from "cors";
+import bcrypt from "bcryptjs";
 
 
 const { Pool } = pkg;
@@ -306,6 +307,123 @@ app.post("/pricing/preview", async (req, res) => {
   } catch (e) {
     console.error("pricing preview error", e);
     res.status(500).json({ ok: false, error: "pricing preview error" });
+  }
+});
+
+// =====================
+// AUTH
+// =====================
+app.post("/auth/register", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
+    const name = String(req.body?.name || "").trim();
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_email",
+        message: "Email no válido"
+      });
+    }
+
+    if (!password || password.length < 6) {
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_password",
+        message: "La contraseña debe tener al menos 6 caracteres"
+      });
+    }
+
+    const existing = await pool.query(
+      `select id from users where email = $1 limit 1`,
+      [email]
+    );
+
+    if (existing.rows.length) {
+      return res.status(409).json({
+        ok: false,
+        error: "email_exists",
+        message: "Ese email ya está registrado"
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const { rows } = await pool.query(
+      `insert into users (email, password_hash, name)
+       values ($1, $2, $3)
+       returning id, email, name, created_at`,
+      [email, passwordHash, name || null]
+    );
+
+    return res.json({
+      ok: true,
+      user: rows[0]
+    });
+  } catch (e) {
+    console.error("register error", e);
+    res.status(500).json({
+      ok: false,
+      error: "register_error"
+    });
+  }
+});
+
+app.post("/auth/login", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
+
+    if (!email || !password) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_credentials",
+        message: "Faltan credenciales"
+      });
+    }
+
+    const { rows } = await pool.query(
+      `select id, email, name, password_hash
+       from users
+       where email = $1
+       limit 1`,
+      [email]
+    );
+
+    if (!rows.length) {
+      return res.status(401).json({
+        ok: false,
+        error: "invalid_credentials",
+        message: "Credenciales incorrectas"
+      });
+    }
+
+    const user = rows[0];
+    const valid = await bcrypt.compare(password, user.password_hash);
+
+    if (!valid) {
+      return res.status(401).json({
+        ok: false,
+        error: "invalid_credentials",
+        message: "Credenciales incorrectas"
+      });
+    }
+
+    return res.json({
+      ok: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name
+      }
+    });
+  } catch (e) {
+    console.error("login error", e);
+    res.status(500).json({
+      ok: false,
+      error: "login_error"
+    });
   }
 });
 
