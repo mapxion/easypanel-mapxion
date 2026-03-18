@@ -230,7 +230,7 @@ app.get("/admin/jobs", async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v31-worker-receiving-list" })
+  res.json({ version: "v32-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -653,7 +653,69 @@ app.get("/jobs/:id/download", async (req, res) => {
     res.status(500).json({ error: "download error" });
   }
 });
-   
+
+app.post("/jobs/:id/cancel", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(
+      `select id, status
+       from jobs
+       where id = $1`,
+      [id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: "job not found" });
+    }
+
+    const job = rows[0];
+    const status = String(job.status || "").toLowerCase();
+
+    if (status === "done") {
+      return res.status(409).json({
+        ok: false,
+        error: "job_already_done",
+        message: "No se puede cancelar un trabajo completado"
+      });
+    }
+
+    if (status === "failed") {
+      return res.status(409).json({
+        ok: false,
+        error: "job_already_failed",
+        message: "El trabajo ya está en estado failed"
+      });
+    }
+
+    if (status === "cancelled") {
+      return res.json({
+        ok: true,
+        alreadyCancelled: true
+      });
+    }
+
+    const updated = await pool.query(
+      `update jobs
+          set status = 'cancelled',
+              message = 'Cancelado manualmente desde admin',
+              updated_at = now(),
+              finished_at = now()
+        where id = $1
+        returning *`,
+      [id]
+    );
+
+    return res.json({
+      ok: true,
+      job: updated.rows[0]
+    });
+  } catch (e) {
+    console.error("cancel job error", e);
+    res.status(500).json({ ok: false, error: "cancel job error" });
+  }
+});
+
 // =====================
 // PATCH TRACKING
 // =====================
