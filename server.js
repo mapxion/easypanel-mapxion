@@ -25,6 +25,11 @@ const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 // =====================
 // AUTH WORKER
 // =====================
+function isValidEmail(email) {
+  const value = String(email || "").trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
 function requireWorkerAuth(req, res, next) {
   const auth = req.headers.authorization || "";
 
@@ -339,6 +344,14 @@ app.post("/jobs", async (req, res) => {
     const clientEmail = req.body?.client_email || null;
     const projectName = req.body?.project_name || null;
     const clientName = req.body?.client_name || null;
+
+    if (!clientEmail || !isValidEmail(clientEmail)) {
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_client_email",
+        message: "El email del cliente no es válido"
+      });
+    }
 
     const { rows } = await pool.query(
       `insert into jobs (
