@@ -197,6 +197,9 @@ app.get("/admin/jobs", async (_req, res) => {
     const { rows } = await pool.query(`
       select
         id,
+        client_email,
+        project_name,
+        client_name,
         status,
         stage,
         photos_count,
@@ -333,12 +336,31 @@ app.get("/jobs/:id", async (req, res) => {
 app.post("/jobs", async (req, res) => {
   try {
     const exifSummary = req.body?.exif_summary || null;
-    const { rows } = 
-    await pool.query(
-      `insert into jobs (status, photos_count, price, exif_summary)
-       values ($1, $2, $3, $4)
-       returning *`,
-      ["created", 0, 0, exifSummary]
+    const clientEmail = req.body?.client_email || null;
+    const projectName = req.body?.project_name || null;
+    const clientName = req.body?.client_name || null;
+
+    const { rows } = await pool.query(
+      `insert into jobs (
+        status,
+        photos_count,
+        price,
+        exif_summary,
+        client_email,
+        project_name,
+        client_name
+      )
+      values ($1, $2, $3, $4, $5, $6, $7)
+      returning *`,
+      [
+        "created",
+        0,
+        0,
+        exifSummary,
+        clientEmail,
+        projectName,
+        clientName
+      ]
     );
 
     const jobRow = rows[0];
