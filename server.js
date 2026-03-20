@@ -1040,7 +1040,9 @@ app.post("/jobs/:id/cancel", async (req, res) => {
     const updated = await pool.query(
       `update jobs
           set status = 'cancelled',
+              stage = 'failed',
               message = 'Cancelado manualmente desde admin',
+              error = 'cancelled_by_admin',
               updated_at = now(),
               finished_at = now()
         where id = $1
