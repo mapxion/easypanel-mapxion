@@ -24,6 +24,58 @@ app.use(cors());
 const DATA_ROOT = process.env.DATA_ROOT || "/data/mapxion";
 const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 
+let jobsHasQualityMode = false;
+
+async function refreshSchemaFlags() {
+  try {
+    const result = await pool.query(
+      `select exists (
+         select 1
+         from information_schema.columns
+         where table_name = 'jobs'
+           and column_name = 'quality_mode'
+       ) as exists`
+    );
+    jobsHasQualityMode = !!result.rows?.[0]?.exists;
+    console.log("Schema jobs.quality_mode:", jobsHasQualityMode ? "sí" : "no");
+  } catch (e) {
+    jobsHasQualityMode = false;
+    console.error("No se pudo comprobar jobs.quality_mode", e?.message || e);
+  }
+}
+
+function normalizeQualityMode(value) {
+  const raw = String(value || "").trim().toLowerCase();
+
+  if (!raw) return "normal";
+  if (["rapido", "rápido", "fast"].includes(raw)) return "fast";
+  if (["normal", "standard", "estandar", "estándar"].includes(raw)) return "normal";
+  if (["max", "maximum", "maxima", "máxima", "ultra"].includes(raw)) return "max";
+
+  return "normal";
+}
+
+function getQualityModeLabel(mode) {
+  const normalized = normalizeQualityMode(mode);
+  if (normalized === "fast") return "Rápido";
+  if (normalized === "max") return "Máxima calidad";
+  return "Normal";
+}
+
+function getQualityModeTimeFactor(mode) {
+  const normalized = normalizeQualityMode(mode);
+  if (normalized === "fast") return 0.65;
+  if (normalized === "max") return 2.2;
+  return 1;
+}
+
+function getQualityModePriceFactor(mode) {
+  const normalized = normalizeQualityMode(mode);
+  if (normalized === "fast") return 0.85;
+  if (normalized === "max") return 1.75;
+  return 1;
+}
+
 // =====================
 // AUTH WORKER
 // =====================
@@ -59,7 +111,10 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 pool
   .query("select 1")
-  .then(() => console.log("Postgres conectado"))
+  .then(async () => {
+    console.log("Postgres conectado");
+    await refreshSchemaFlags();
+  })
   .catch((err) => console.error("Error Postgres", err));
 
 // =====================
@@ -122,28 +177,30 @@ function getInputTotalBytes(jobId) {
   }, 0);
 }
 
-function estimateProcessingSecondsFromInputs(photosCount, totalBytes) {
+function estimateProcessingSecondsFromInputs(photosCount, totalBytes, qualityMode = "normal") {
   const photos = Number(photosCount || 0);
   const bytes = Number(totalBytes || 0);
   const gb = bytes / (1024 * 1024 * 1024);
+  const factor = getQualityModeTimeFactor(qualityMode);
 
   return Math.round(
-    120 + (photos * 18) + (gb * 420)
+    (120 + (photos * 18) + (gb * 420)) * factor
   );
 }
 
-function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds) {
+function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qualityMode = "normal") {
   const photos = Number(photosCount || 0);
   const bytes = Number(totalBytes || 0);
   const gb = bytes / (1024 * 1024 * 1024);
   const hours = Number(estimatedSeconds || 0) / 3600;
+  const factor = getQualityModePriceFactor(qualityMode);
 
   const base = 3;
   const byPhoto = photos * 0.03;
   const byGb = gb * 1.5;
   const byTime = hours * 6;
 
-  return Math.ceil(base + byPhoto + byGb + byTime);
+  return Math.ceil((base + byPhoto + byGb + byTime) * factor);
 }
 
 // ✅ helper: status “bloqueado” (no permitir más uploads)
@@ -224,6 +281,7 @@ app.get("/admin/jobs", async (_req, res) => {
         download_seconds,
         processing_seconds,
         total_seconds
+        ${jobsHasQualityMode ? ", quality_mode" : ""}
       from jobs
       order by created_at desc
       limit 100
@@ -274,8 +332,9 @@ app.post("/pricing/preview", async (req, res) => {
 
     const photosCount = Number(req.body?.photos_count || 0);
     const totalBytes = Number(req.body?.total_bytes || 0);
+    const qualityMode = normalizeQualityMode(req.body?.quality_mode);
 
-    console.log("PRICING PREVIEW parsed:", { photosCount, totalBytes });
+    console.log("PRICING PREVIEW parsed:", { photosCount, totalBytes, qualityMode });
 
     if (!Number.isFinite(photosCount) || photosCount < 0) {
       return res.status(400).json({ ok: false, error: "invalid photos_count" });
@@ -288,7 +347,8 @@ app.post("/pricing/preview", async (req, res) => {
     const estimatedSeconds = await estimateProcessingSecondsFromInputsHistorical(
       pool,
       photosCount,
-      totalBytes
+      totalBytes,
+      qualityMode
     );
 
     console.log("PRICING PREVIEW estimatedSeconds:", estimatedSeconds);
@@ -296,7 +356,8 @@ app.post("/pricing/preview", async (req, res) => {
     const price = calculatePriceFromInputs(
       photosCount,
       totalBytes,
-      estimatedSeconds
+      estimatedSeconds,
+      qualityMode
     );
 
     console.log("PRICING PREVIEW price:", price);
@@ -305,6 +366,8 @@ app.post("/pricing/preview", async (req, res) => {
       ok: true,
       photos_count: photosCount,
       total_bytes: totalBytes,
+      quality_mode: qualityMode,
+      quality_mode_label: getQualityModeLabel(qualityMode),
       price,
       estimated_seconds: estimatedSeconds,
       estimated_human: formatEtaSeconds(estimatedSeconds)
@@ -658,30 +721,57 @@ app.post("/jobs", async (req, res) => {
       });
     }
 
-    const { rows } = await pool.query(
-  `insert into jobs (
-    status,
-    photos_count,
-    price,
-    exif_summary,
-    client_email,
-    project_name,
-    client_name,
-    user_id
-  )
-  values ($1, $2, $3, $4, $5, $6, $7, $8)
-  returning *`,
-  [
-    "created",
-    0,
-    0,
-    exifSummary,
-    clientEmail,
-    projectName,
-    clientName,
-    userId
-  ]
-);
+    const insertSql = jobsHasQualityMode
+      ? `insert into jobs (
+          status,
+          photos_count,
+          price,
+          exif_summary,
+          client_email,
+          project_name,
+          client_name,
+          user_id,
+          quality_mode
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        returning *`
+      : `insert into jobs (
+          status,
+          photos_count,
+          price,
+          exif_summary,
+          client_email,
+          project_name,
+          client_name,
+          user_id
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, $8)
+        returning *`;
+
+    const insertParams = jobsHasQualityMode
+      ? [
+          "created",
+          0,
+          0,
+          exifSummary,
+          clientEmail,
+          projectName,
+          clientName,
+          userId,
+          qualityMode
+        ]
+      : [
+          "created",
+          0,
+          0,
+          exifSummary,
+          clientEmail,
+          projectName,
+          clientName,
+          userId
+        ];
+
+    const { rows } = await pool.query(insertSql, insertParams);
 
     const jobRow = rows[0];
     ensureJobDirs(jobRow.id);
@@ -699,13 +789,17 @@ app.post("/jobs/:id/submit", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { rows } = await pool.query(
-      "select id, status from jobs where id = $1",
-      [id]
-    );
+    const selectJobSql = jobsHasQualityMode
+      ? "select id, status, quality_mode from jobs where id = $1"
+      : "select id, status from jobs where id = $1";
+
+    const { rows } = await pool.query(selectJobSql, [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     const job = rows[0];
+    const qualityMode = normalizeQualityMode(
+      req.body?.quality_mode || job.quality_mode
+    );
 
     if (isLockedStatus(job.status)) {
       return res.status(409).json({
@@ -750,35 +844,53 @@ app.post("/jobs/:id/submit", async (req, res) => {
     const estimatedSeconds = await estimateProcessingSecondsFromInputsHistorical(
       pool,
       photosCount,
-      inputTotalBytes
+      inputTotalBytes,
+      qualityMode
     );
 
     const price = calculatePriceFromInputs(
       photosCount,
       inputTotalBytes,
-      estimatedSeconds
+      estimatedSeconds,
+      qualityMode
     );
 
     // Guardamos conteo real + precio real y ponemos en cola
-    await pool.query(
-      `update jobs
-         set status='queued',
-             photos_count=$2,
-             price=$3,
-             input_total_bytes=$4,
-             progress=0,
-             message='En cola',
-             error=null,
-             updated_at=now(),
-             started_at = case when started_at is null then now() else started_at end
-       where id=$1`,
-      [id, photosCount, price, inputTotalBytes]
-    );
+    const submitUpdateSql = jobsHasQualityMode
+      ? `update jobs
+           set status='queued',
+               photos_count=$2,
+               price=$3,
+               input_total_bytes=$4,
+               quality_mode=$5,
+               progress=0,
+               message='En cola',
+               error=null,
+               updated_at=now(),
+               started_at = case when started_at is null then now() else started_at end
+         where id=$1`
+      : `update jobs
+           set status='queued',
+               photos_count=$2,
+               price=$3,
+               input_total_bytes=$4,
+               progress=0,
+               message='En cola',
+               error=null,
+               updated_at=now(),
+               started_at = case when started_at is null then now() else started_at end
+         where id=$1`;
+
+    const submitUpdateParams = jobsHasQualityMode
+      ? [id, photosCount, price, inputTotalBytes, qualityMode]
+      : [id, photosCount, price, inputTotalBytes];
+
+    await pool.query(submitUpdateSql, submitUpdateParams);
 
     // encolar
     await processQueue.add(
       "process_job",
-      { jobId: id },
+      { jobId: id, qualityMode },
       { attempts: 3, backoff: { type: "exponential", delay: 5000 } }
     );
 
@@ -788,6 +900,8 @@ app.post("/jobs/:id/submit", async (req, res) => {
       jobId: id,
       inputs: photosCount,
       input_total_bytes: inputTotalBytes,
+      quality_mode: qualityMode,
+      quality_mode_label: getQualityModeLabel(qualityMode),
       price,
       estimated_seconds: estimatedSeconds,
       estimated_human: formatEtaSeconds(estimatedSeconds)
@@ -1198,6 +1312,7 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `select id, status, photos_count, price, created_at, updated_at, message
+       ${jobsHasQualityMode ? ", quality_mode" : ""}
        from jobs
        where status = 'receiving'
        order by created_at asc
@@ -1352,15 +1467,17 @@ function estimateProcessingSecondsFromFallback(job) {
   const photos = Number(job.photos_count || 0);
   const bytes = Number(job.input_total_bytes || 0);
   const gb = bytes / (1024 * 1024 * 1024);
+  const qualityMode = normalizeQualityMode(job?.quality_mode);
 
   return Math.round(
-    120 + (photos * 18) + (gb * 420)
+    (120 + (photos * 18) + (gb * 420)) * getQualityModeTimeFactor(qualityMode)
   );
 }
 
-async function estimateProcessingSecondsFromInputsHistorical(pool, photosCount, totalBytes) {
+async function estimateProcessingSecondsFromInputsHistorical(pool, photosCount, totalBytes, qualityMode = "normal") {
   const photos = Number(photosCount || 0);
   const bytes = Number(totalBytes || 0);
+  const normalizedQualityMode = normalizeQualityMode(qualityMode);
 
   const minPhotos = Math.max(0, photos - 200);
   const maxPhotos = photos + 200;
@@ -1368,17 +1485,30 @@ async function estimateProcessingSecondsFromInputsHistorical(pool, photosCount, 
   const minBytes = Math.max(0, Math.round(bytes * 0.5));
   const maxBytes = Math.round(bytes * 1.5);
 
-  const { rows } = await pool.query(
-    `select processing_seconds
-     from jobs
-     where status = 'done'
-       and processing_seconds is not null
-       and photos_count between $1 and $2
-       and input_total_bytes between $3 and $4
-     order by created_at desc
-     limit 20`,
-    [minPhotos, maxPhotos, minBytes, maxBytes]
-  );
+  const historicalSql = jobsHasQualityMode
+    ? `select processing_seconds
+       from jobs
+       where status = 'done'
+         and processing_seconds is not null
+         and quality_mode = $5
+         and photos_count between $1 and $2
+         and input_total_bytes between $3 and $4
+       order by created_at desc
+       limit 20`
+    : `select processing_seconds
+       from jobs
+       where status = 'done'
+         and processing_seconds is not null
+         and photos_count between $1 and $2
+         and input_total_bytes between $3 and $4
+       order by created_at desc
+       limit 20`;
+
+  const historicalParams = jobsHasQualityMode
+    ? [minPhotos, maxPhotos, minBytes, maxBytes, normalizedQualityMode]
+    : [minPhotos, maxPhotos, minBytes, maxBytes];
+
+  const { rows } = await pool.query(historicalSql, historicalParams);
 
   if (rows.length >= 3) {
     const avg =
@@ -1386,7 +1516,7 @@ async function estimateProcessingSecondsFromInputsHistorical(pool, photosCount, 
     return Math.round(avg);
   }
 
-  return estimateProcessingSecondsFromInputs(photos, bytes);
+  return estimateProcessingSecondsFromInputs(photos, bytes, normalizedQualityMode);
 }
 
 async function estimateProcessingSeconds(pool, job) {
@@ -1394,12 +1524,14 @@ async function estimateProcessingSeconds(pool, job) {
 
   const photos = Number(job.photos_count || 0);
   const bytes = Number(job.input_total_bytes || 0);
+  const qualityMode = normalizeQualityMode(job?.quality_mode);
 
   if (photos > 0 || bytes > 0) {
     return await estimateProcessingSecondsFromInputsHistorical(
       pool,
       photos,
-      bytes
+      bytes,
+      qualityMode
     );
   }
 
@@ -1421,6 +1553,7 @@ app.get("/jobs/:id/eta", async (req, res) => {
 
     const { rows } = await pool.query(
       `select id, status, progress, photos_count, input_total_bytes, created_at
+       ${jobsHasQualityMode ? ", quality_mode" : ""}
        from jobs
        where id = $1`,
       [id]
@@ -1434,6 +1567,7 @@ app.get("/jobs/:id/eta", async (req, res) => {
 
     const allRows = await pool.query(
       `select id, status, progress, photos_count, input_total_bytes, created_at
+       ${jobsHasQualityMode ? ", quality_mode" : ""}
        from jobs
        where status in ('queued', 'running')
        order by created_at asc`
@@ -1464,6 +1598,8 @@ app.get("/jobs/:id/eta", async (req, res) => {
       ok: true,
       job_id: id,
       status: targetJob.status,
+      quality_mode: normalizeQualityMode(targetJob.quality_mode),
+      quality_mode_label: getQualityModeLabel(targetJob.quality_mode),
       queue_wait_seconds: waitSeconds,
       own_processing_seconds: ownProcessingSeconds,
       total_estimated_seconds: totalSeconds,
