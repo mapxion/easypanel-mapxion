@@ -690,6 +690,46 @@ app.get("/jobs", async (_req, res) => {
   }
 });
 
+app.get("/jobs/mine", async (req, res) => {
+  try {
+    const userId = req.headers["x-user-id"];
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error: "missing_user",
+        message: "Falta user_id"
+      });
+    }
+
+    const { rows } = await pool.query(
+      `select
+        id,
+        project_name,
+        status,
+        stage,
+        progress,
+        price,
+        created_at
+      from jobs
+      where user_id = $1
+      order by created_at desc`,
+      [userId]
+    );
+
+    res.json({
+      ok: true,
+      jobs: rows
+    });
+  } catch (e) {
+    console.error("jobs/mine error", e);
+    res.status(500).json({
+      ok: false,
+      error: "jobs_mine_error"
+    });
+  }
+});
+
 app.get("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -706,11 +746,13 @@ app.get("/jobs/:id", async (req, res) => {
 // 🔥 v13: ya NO exige photos_count. Crea job “created” con 0 fotos y precio 0.
 app.post("/jobs", async (req, res) => {
   try {
-    const exifSummary = req.body?.exif_summary || null;
-    const clientEmail = req.body?.client_email || null;
-    const projectName = req.body?.project_name || null;
-    const clientName = req.body?.client_name || null;
-    const userId = req.body?.user_id || null;
+   
+const exifSummary = req.body?.exif_summary || null;
+const clientEmail = req.body?.client_email || null;
+const projectName = req.body?.project_name || null;
+const clientName = req.body?.client_name || null;
+const userId = req.body?.user_id || null;
+const qualityMode = normalizeQualityMode(req.body?.quality_mode);
     
 
     if (!clientEmail || !isValidEmail(clientEmail)) {
@@ -1110,46 +1152,6 @@ app.get("/jobs/:id/download", async (req, res) => {
   }
 });
 
-app.get("/jobs/mine", async (req, res) => {
-  try {
-    const userId = req.headers["x-user-id"];
-
-    if (!userId) {
-      return res.status(401).json({
-        ok: false,
-        error: "missing_user",
-        message: "Falta user_id"
-      });
-    }
-
-    const { rows } = await pool.query(
-      `select
-        id,
-        project_name,
-        status,
-        stage,
-        progress,
-        price,
-        created_at
-      from jobs
-      where user_id = $1
-      order by created_at desc`,
-      [userId]
-    );
-
-    res.json({
-      ok: true,
-      jobs: rows
-    });
-
-  } catch (e) {
-    console.error("jobs/mine error", e);
-    res.status(500).json({
-      ok: false,
-      error: "jobs_mine_error"
-    });
-  }
-});
 
 app.post("/jobs/:id/cancel", async (req, res) => {
   try {
