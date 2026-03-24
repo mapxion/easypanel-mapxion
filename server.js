@@ -747,7 +747,15 @@ app.get("/jobs/:id", async (req, res) => {
 app.post("/jobs", async (req, res) => {
   try {
    
-const exifSummary = req.body?.exif_summary || null;
+const exifSummaryRaw = req.body?.exif_summary || null;
+const outputsRequested = req.body?.outputs_requested || [];
+
+const exifSummary = {
+  ...(exifSummaryRaw || {}),
+  _xproces: {
+    outputs_requested: outputsRequested
+  }
+};
 const clientEmail = req.body?.client_email || null;
 const projectName = req.body?.project_name || null;
 const clientName = req.body?.client_name || null;
