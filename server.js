@@ -1150,6 +1150,35 @@ app.get("/jobs/:id/log", async (req, res) => {
   }
 });
 
+app.get("/jobs/:id/log", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(
+      "select id from jobs where id = $1",
+      [id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: "job not found" });
+    }
+
+    const logPath = path.join(outputDir(id), "metashape-python-log.txt");
+
+    if (!fs.existsSync(logPath)) {
+      return res.status(404).json({ ok: false, error: "log not found" });
+    }
+
+    const text = fs.readFileSync(logPath, "utf8");
+
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    return res.send(text);
+  } catch (e) {
+    console.error("log error", e);
+    return res.status(500).json({ ok: false, error: "log error" });
+  }
+});
+
 app.get("/jobs/:id/download", async (req, res) => {
   try {
     const { id } = req.params;
