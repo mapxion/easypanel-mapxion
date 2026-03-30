@@ -749,11 +749,17 @@ app.post("/jobs", async (req, res) => {
    
 const exifSummaryRaw = req.body?.exif_summary || null;
 const outputsRequested = req.body?.outputs_requested || [];
+const presetKey = req.body?.preset_key || null;
+const outputMode = req.body?.output_mode || null;
+const tamsExport = !!req.body?.tams_export;
 
 const exifSummary = {
   ...(exifSummaryRaw || {}),
   _xproces: {
-    outputs_requested: outputsRequested
+    outputs_requested: outputsRequested,
+    preset_key: presetKey,
+    output_mode: outputMode,
+    tams_export: tamsExport
   }
 };
 const clientEmail = req.body?.client_email || null;
