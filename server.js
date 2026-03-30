@@ -756,12 +756,30 @@ const tamsExport = !!req.body?.tams_export;
 const exifSummary = {
   ...(exifSummaryRaw || {}),
   _xproces: {
+    // 🔹 conserva lo que venga del frontend (CLAVE)
+    ...((exifSummaryRaw && exifSummaryRaw._xproces) || {}),
+
+    // 🔹 siempre actualiza outputs (esto ya lo hacías bien)
     outputs_requested: outputsRequested,
-    preset_key: presetKey,
-    output_mode: outputMode,
-    tams_export: tamsExport
+
+    // 🔹 si viene en body lo usa, si no usa lo del frontend
+    preset_key:
+      req.body?.preset_key ??
+      exifSummaryRaw?._xproces?.preset_key ??
+      null,
+
+    output_mode:
+      req.body?.output_mode ??
+      exifSummaryRaw?._xproces?.output_mode ??
+      null,
+
+    tams_export: !!(
+      req.body?.tams_export ??
+      exifSummaryRaw?._xproces?.tams_export
+    )
   }
 };
+
 const clientEmail = req.body?.client_email || null;
 const projectName = req.body?.project_name || null;
 const clientName = req.body?.client_name || null;
