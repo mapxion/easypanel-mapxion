@@ -88,6 +88,28 @@ function generateInviteCode() {
   return randomBytes(4).toString("hex").toUpperCase();
 }
 
+
+function stripNullCharsDeep(value) {
+  if (typeof value === "string") {
+    return value.replace(/\u0000/g, "").replace(/\x00/g, "").replace(/\0/g, "");
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(stripNullCharsDeep);
+  }
+
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [key, val] of Object.entries(value)) {
+      out[key] = stripNullCharsDeep(val);
+    }
+    return out;
+  }
+
+  return value;
+}
+
+
 function requireWorkerAuth(req, res, next) {
   const auth = req.headers.authorization || "";
 
@@ -747,13 +769,13 @@ app.get("/jobs/:id", async (req, res) => {
 app.post("/jobs", async (req, res) => {
   try {
    
-const exifSummaryRaw = req.body?.exif_summary || null;
-const outputsRequested = req.body?.outputs_requested || [];
-const presetKey = req.body?.preset_key || null;
-const outputMode = req.body?.output_mode || null;
+const exifSummaryRaw = stripNullCharsDeep(req.body?.exif_summary || null);
+const outputsRequested = stripNullCharsDeep(req.body?.outputs_requested || []);
+const presetKey = stripNullCharsDeep(req.body?.preset_key || null);
+const outputMode = stripNullCharsDeep(req.body?.output_mode || null);
 const tamsExport = !!req.body?.tams_export;
 
-const exifSummary = {
+const exifSummary = stripNullCharsDeep({
   ...(exifSummaryRaw || {}),
   _xproces: {
     // 🔹 conserva lo que venga del frontend (CLAVE)
@@ -778,7 +800,7 @@ const exifSummary = {
       exifSummaryRaw?._xproces?.tams_export
     )
   }
-};
+});
 
 const clientEmail = req.body?.client_email || null;
 const projectName = req.body?.project_name || null;
