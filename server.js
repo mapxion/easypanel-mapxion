@@ -302,7 +302,7 @@ app.get("/admin/jobs", async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v34-worker-receiving-list" })
+  res.json({ version: "v33-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -1745,6 +1745,5 @@ const port = Number(process.env.PORT) || 3000;
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
-
 
 
