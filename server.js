@@ -76,6 +76,27 @@ function getQualityModePriceFactor(mode) {
   return 1;
 }
 
+
+function stripNullCharsDeep(value) {
+  if (typeof value === "string") {
+    return value.replace(/\u0000/g, "");
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(stripNullCharsDeep);
+  }
+
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [key, val] of Object.entries(value)) {
+      out[key] = stripNullCharsDeep(val);
+    }
+    return out;
+  }
+
+  return value;
+}
+
 // =====================
 // AUTH WORKER
 // =====================
@@ -747,13 +768,13 @@ app.get("/jobs/:id", async (req, res) => {
 app.post("/jobs", async (req, res) => {
   try {
    
-const exifSummaryRaw = req.body?.exif_summary || null;
-const outputsRequested = req.body?.outputs_requested || [];
-const presetKey = req.body?.preset_key || null;
-const outputMode = req.body?.output_mode || null;
+const exifSummaryRaw = stripNullCharsDeep(req.body?.exif_summary || null);
+const outputsRequested = stripNullCharsDeep(req.body?.outputs_requested || []);
+const presetKey = stripNullCharsDeep(req.body?.preset_key || null);
+const outputMode = stripNullCharsDeep(req.body?.output_mode || null);
 const tamsExport = !!req.body?.tams_export;
 
-const exifSummary = {
+const exifSummary = stripNullCharsDeep({
   ...(exifSummaryRaw || {}),
   _xproces: {
     // 🔹 conserva lo que venga del frontend (CLAVE)
@@ -764,12 +785,12 @@ const exifSummary = {
 
     // 🔹 si viene en body lo usa, si no usa lo del frontend
     preset_key:
-      req.body?.preset_key ??
+      presetKey ??
       exifSummaryRaw?._xproces?.preset_key ??
       null,
 
     output_mode:
-      req.body?.output_mode ??
+      outputMode ??
       exifSummaryRaw?._xproces?.output_mode ??
       null,
 
@@ -778,7 +799,7 @@ const exifSummary = {
       exifSummaryRaw?._xproces?.tams_export
     )
   }
-};
+});
 
 const clientEmail = req.body?.client_email || null;
 const projectName = req.body?.project_name || null;
