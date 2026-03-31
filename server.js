@@ -323,7 +323,7 @@ app.get("/admin/jobs", async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v34-worker-receiving-list" })
+  res.json({ version: "v35-worker-receiving-list" })
 );
 
 app.get("/redis", (_req, res) =>
