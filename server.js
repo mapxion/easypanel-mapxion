@@ -1516,6 +1516,73 @@ app.get("/worker/jobs/:id/input.zip", requireWorkerAuth, async (req, res) => {
   }
 });
 
+
+app.post("/worker/jobs/:id/confirm-files", requireWorkerAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const filenames = Array.isArray(req.body?.filenames)
+      ? req.body.filenames
+          .filter((name) => typeof name === "string")
+          .map((name) => path.basename(name))
+          .filter(Boolean)
+      : [];
+
+    if (!filenames.length) {
+      return res.status(400).json({ ok: false, error: "filenames required" });
+    }
+
+    const { rows } = await pool.query(
+      "select id, input_purged from jobs where id = $1",
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: "job not found" });
+
+    const job = rows[0];
+    if (job.input_purged) {
+      return res.json({ ok: true, alreadyPurged: true, deletedCount: 0 });
+    }
+
+    const dir = inputDir(id);
+    let deletedCount = 0;
+
+    if (fs.existsSync(dir)) {
+      for (const filename of filenames) {
+        const filePath = path.join(dir, filename);
+        if (!filePath.startsWith(dir + path.sep)) continue;
+        if (fs.existsSync(filePath)) {
+          fs.rmSync(filePath, { force: true });
+          deletedCount += 1;
+        }
+      }
+    }
+
+    let purged = false;
+    if (!fs.existsSync(dir)) {
+      purged = true;
+    } else {
+      const remaining = fs.readdirSync(dir).length;
+      if (remaining === 0) {
+        fs.rmSync(dir, { recursive: true, force: true });
+        purged = true;
+      }
+    }
+
+    await pool.query(
+      `update jobs
+          set input_purged = $2,
+              input_purged_at = case when $2 then now() else input_purged_at end,
+              updated_at = now()
+        where id = $1`,
+      [id, purged]
+    );
+
+    res.json({ ok: true, deletedCount, purged });
+  } catch (e) {
+    console.error("confirm-files error", e);
+    res.status(500).json({ ok: false, error: "confirm-files error" });
+  }
+});
+
 app.post("/worker/jobs/:id/confirm-download", requireWorkerAuth, async (req, res) => {
   try {
     const { id } = req.params;
