@@ -1600,9 +1600,17 @@ app.post("/worker/jobs/:id/confirm-download", requireWorkerAuth, async (req, res
     }
 
     const dir = inputDir(id);
-    if (fs.existsSync(dir)) {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+
+if (fs.existsSync(dir)) {
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// 🔥 verificación real
+if (fs.existsSync(dir)) {
+  console.error("ERROR: input no se borró completamente:", dir);
+} else {
+  console.log("Input eliminado correctamente:", id);
+}
 
     await pool.query(
      `update jobs
