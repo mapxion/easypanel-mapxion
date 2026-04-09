@@ -177,12 +177,28 @@ function ensureJobDirs(jobId) {
 
 function safeRemoveDir(dir) {
   try {
-    if (fs.existsSync(dir)) {
-      fs.rmSync(dir, { recursive: true, force: true });
+    if (!fs.existsSync(dir)) return true;
+
+    // 🔥 intento 1
+    fs.rmSync(dir, { recursive: true, force: true });
+
+    // 🔥 comprobación
+    if (!fs.existsSync(dir)) return true;
+
+    // 🔥 intento 2 (muy importante)
+    fs.rmSync(dir, { recursive: true, force: true });
+
+    // 🔥 comprobación final
+    if (!fs.existsSync(dir)) {
+      console.log("✅ eliminado:", dir);
+      return true;
     }
-    return !fs.existsSync(dir);
+
+    console.error("❌ NO se pudo eliminar:", dir);
+    return false;
+
   } catch (e) {
-    console.error("safeRemoveDir error", dir, e);
+    console.error("❌ safeRemoveDir error", dir, e);
     return false;
   }
 }
