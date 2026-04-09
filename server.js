@@ -175,6 +175,25 @@ function ensureJobDirs(jobId) {
   fs.mkdirSync(outputDir(jobId), { recursive: true });
 }
 
+function safeRemoveDir(dir) {
+  try {
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    return !fs.existsSync(dir);
+  } catch (e) {
+    console.error("safeRemoveDir error", dir, e);
+    return false;
+  }
+}
+
+function cleanupJobStorage(jobId, opts = { input: true, output: true }) {
+  const result = { inputRemoved: false, outputRemoved: false };
+  if (opts.input) result.inputRemoved = safeRemoveDir(inputDir(jobId));
+  if (opts.output) result.outputRemoved = safeRemoveDir(outputDir(jobId));
+  return result;
+}
+
 // ✅ helper: lista SOLO imágenes (evita mezclar txt, etc.)
 function listInputImages(jobId) {
   const dir = inputDir(jobId);
@@ -1145,9 +1164,26 @@ app.post("/jobs/:id/output", uploadOutput.single("file"), async (req, res) => {
     if (!req.file)
       return res.status(400).json({ error: "missing file field (file)" });
 
+    // Red de seguridad: si aún quedaba input en el VPS, lo purgamos al recibir el ZIP final.
+    const inputCleanupOk = safeRemoveDir(inputDir(id));
+    if (inputCleanupOk) {
+      await pool.query(
+        `update jobs
+            set input_purged = true,
+                input_purged_at = coalesce(input_purged_at, now()),
+                updated_at = now()
+          where id = $1`,
+        [id]
+      );
+      console.log("Input purgado al recibir output:", id);
+    } else {
+      console.error("No se pudo purgar input al recibir output:", id);
+    }
+
     res.json({
       ok: true,
       saved: { filename: req.file.filename, size: req.file.size },
+      inputPurged: inputCleanupOk,
     });
   } catch (e) {
     console.error("upload output error", e);
@@ -1246,6 +1282,13 @@ app.get("/jobs/:id/download", async (req, res) => {
 
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Content-Length", stat.size);
+
+    res.on("finish", () => {
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        const cleanup = cleanupJobStorage(id, { input: true, output: true });
+        console.log("Cleanup tras descarga:", id, cleanup);
+      }
+    });
 
     return res.download(zipPath, `xproces-${id}.zip`);
 
@@ -1600,28 +1643,24 @@ app.post("/worker/jobs/:id/confirm-download", requireWorkerAuth, async (req, res
     }
 
     const dir = inputDir(id);
+    const purged = safeRemoveDir(dir);
 
-if (fs.existsSync(dir)) {
-  fs.rmSync(dir, { recursive: true, force: true });
-}
-
-// 🔥 verificación real
-if (fs.existsSync(dir)) {
-  console.error("ERROR: input no se borró completamente:", dir);
-} else {
-  console.log("Input eliminado correctamente:", id);
-}
+    if (!purged) {
+      console.error("ERROR: input no se borró completamente:", dir);
+    } else {
+      console.log("Input eliminado correctamente:", id);
+    }
 
     await pool.query(
      `update jobs
-         set input_purged = true,
-             input_purged_at = now(),
+         set input_purged = $2,
+             input_purged_at = case when $2 then now() else input_purged_at end,
              updated_at = now()
        where id = $1`,
-     [id]
+     [id, purged]
    );
 
-    res.json({ ok: true, purged: true });
+    res.json({ ok: true, purged });
   } catch (e) {
     console.error("confirm-download error", e);
     res.status(500).json({ ok: false, error: "confirm-download error" });
@@ -1838,6 +1877,26 @@ app.get("/jobs/:id/eta", async (req, res) => {
 // LISTEN
 // =====================
 const port = Number(process.env.PORT) || 3000;
+
+// Limpieza de seguridad: elimina storage de jobs terminales con más de 24h.
+setInterval(async () => {
+  try {
+    const { rows } = await pool.query(
+      `select id
+         from jobs
+        where status in ('done', 'failed', 'cancelled')
+          and updated_at < now() - interval '24 hours'`
+    );
+
+    for (const row of rows) {
+      const cleanup = cleanupJobStorage(row.id, { input: true, output: true });
+      console.log("Cleanup periódico:", row.id, cleanup);
+    }
+  } catch (e) {
+    console.error("cleanup interval error", e);
+  }
+}, 60 * 60 * 1000);
+
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
