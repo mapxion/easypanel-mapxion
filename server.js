@@ -1066,7 +1066,26 @@ if (isLockedStatus(job.status)) {
     message: `No se pueden subir más fotos: estado ${job.status}`,
   });
 }
+// 🔥 CONTAR archivos reales en disco
+const dir = inputDir(id);
+let totalPhotos = 0;
 
+try {
+  if (fs.existsSync(dir)) {
+    totalPhotos = fs.readdirSync(dir).length;
+  }
+} catch (e) {
+  console.error("count files error", e);
+}
+
+// 🔥 ACTUALIZAR BD
+await pool.query(
+  `update jobs
+     set photos_count = $1,
+         updated_at = now()
+   where id = $2`,
+  [totalPhotos, id]
+);
 // Si entra la primera foto y el job aún está recién creado,
 // lo pasamos a "receiving"
 if (job.status === "created") {
