@@ -389,8 +389,9 @@ app.post("/pricing/preview", async (req, res) => {
     const photosCount = Number(req.body?.photos_count || 0);
     const totalBytes = Number(req.body?.total_bytes || 0);
     const qualityMode = normalizeQualityMode(req.body?.quality_mode);
+    const tamsExport = !!req.body?.tams_export;
 
-    console.log("PRICING PREVIEW parsed:", { photosCount, totalBytes, qualityMode });
+    console.log("PRICING PREVIEW parsed:", { photosCount, totalBytes, qualityMode, tamsExport });
 
     if (!Number.isFinite(photosCount) || photosCount < 0) {
       return res.status(400).json({ ok: false, error: "invalid photos_count" });
@@ -404,7 +405,8 @@ app.post("/pricing/preview", async (req, res) => {
       pool,
       photosCount,
       totalBytes,
-      qualityMode
+      qualityMode,
+      tamsExport
     );
 
     console.log("PRICING PREVIEW estimatedSeconds:", estimatedSeconds);
@@ -424,6 +426,7 @@ app.post("/pricing/preview", async (req, res) => {
       total_bytes: totalBytes,
       quality_mode: qualityMode,
       quality_mode_label: getQualityModeLabel(qualityMode),
+      tams_export: tamsExport,
       price,
       estimated_seconds: estimatedSeconds,
       estimated_human: formatEtaSeconds(estimatedSeconds)
@@ -970,12 +973,14 @@ app.post("/jobs/:id/submit", async (req, res) => {
 
     const photosCount = inputs.length;
     const inputTotalBytes = getInputTotalBytes(id);
+    const tamsExport = !!job.exif_summary?._xproces?.tams_export;
 
     const estimatedSeconds = await estimateProcessingSecondsFromInputsHistorical(
       pool,
       photosCount,
       inputTotalBytes,
-      qualityMode
+      qualityMode,
+      tamsExport
     );
 
     const price = calculatePriceFromInputs(
@@ -1032,6 +1037,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
       input_total_bytes: inputTotalBytes,
       quality_mode: qualityMode,
       quality_mode_label: getQualityModeLabel(qualityMode),
+      tams_export: tamsExport,
       price,
       estimated_seconds: estimatedSeconds,
       estimated_human: formatEtaSeconds(estimatedSeconds)
@@ -1405,6 +1411,23 @@ app.post("/jobs/:id/priority", async (req, res) => {
   try {
     const { id } = req.params;
 
+    if (stage && stage !== currentStage) {
+      try {
+        if (currentStage) {
+          await pool.query(
+            `insert into job_stage_events (job_id, stage, event_type) values ($1, $2, 'end')`,
+            [id, currentStage]
+          );
+        }
+        await pool.query(
+          `insert into job_stage_events (job_id, stage, event_type) values ($1, $2, 'start')`,
+          [id, stage]
+        );
+      } catch (stageErr) {
+        console.error("job_stage_events error", stageErr);
+      }
+    }
+
     const { rows } = await pool.query(
       `update jobs
          set priority = coalesce(priority, 0) + 1,
@@ -1448,7 +1471,7 @@ app.patch("/jobs/:id", async (req, res) => {
     }
 
     const currentJobResult = await pool.query(
-      `select id, status from jobs where id = $1`,
+      `select id, status, stage from jobs where id = $1`,
       [id]
     );
 
@@ -1457,6 +1480,7 @@ app.patch("/jobs/:id", async (req, res) => {
     }
 
     const currentStatus = String(currentJobResult.rows[0].status || "").toLowerCase();
+    const currentStage = String(currentJobResult.rows[0].stage || "");
 
     if (currentStatus === "cancelled") {
       return res.json({
@@ -1814,46 +1838,65 @@ function estimateProcessingSecondsFromFallback(job) {
   );
 }
 
-async function estimateProcessingSecondsFromInputsHistorical(pool, photosCount, totalBytes, qualityMode = "normal") {
+async function estimateProcessingSecondsFromInputsHistorical(pool, photosCount, totalBytes, qualityMode = "normal", tamsExport = false) {
   const photos = Number(photosCount || 0);
   const bytes = Number(totalBytes || 0);
   const normalizedQualityMode = normalizeQualityMode(qualityMode);
+  const startDate = "2026-04-05";
 
-  const minPhotos = Math.max(0, photos - 200);
-  const maxPhotos = photos + 200;
+  const tryQueries = [];
 
-  const minBytes = Math.max(0, Math.round(bytes * 0.5));
-  const maxBytes = Math.round(bytes * 1.5);
+  if (jobsHasQualityMode) {
+    tryQueries.push({
+      sql: `select processing_seconds, photos_count
+            from jobs
+            where status = 'done'
+              and processing_seconds is not null
+              and photos_count > 0
+              and created_at >= $1
+              and quality_mode = $2
+              and coalesce((exif_summary->'_xproces'->>'tams_export')::boolean, false) = $3
+            order by created_at desc
+            limit 50`,
+      params: [startDate, normalizedQualityMode, !!tamsExport]
+    });
+  }
 
-  const historicalSql = jobsHasQualityMode
-    ? `select processing_seconds
-       from jobs
-       where status = 'done'
-         and processing_seconds is not null
-         and quality_mode = $5
-         and photos_count between $1 and $2
-         and input_total_bytes between $3 and $4
-       order by created_at desc
-       limit 20`
-    : `select processing_seconds
-       from jobs
-       where status = 'done'
-         and processing_seconds is not null
-         and photos_count between $1 and $2
-         and input_total_bytes between $3 and $4
-       order by created_at desc
-       limit 20`;
+  tryQueries.push({
+    sql: `select processing_seconds, photos_count
+          from jobs
+          where status = 'done'
+            and processing_seconds is not null
+            and photos_count > 0
+            and created_at >= $1
+            and coalesce((exif_summary->'_xproces'->>'tams_export')::boolean, false) = $2
+          order by created_at desc
+          limit 50`,
+    params: [startDate, !!tamsExport]
+  });
 
-  const historicalParams = jobsHasQualityMode
-    ? [minPhotos, maxPhotos, minBytes, maxBytes, normalizedQualityMode]
-    : [minPhotos, maxPhotos, minBytes, maxBytes];
+  tryQueries.push({
+    sql: `select processing_seconds, photos_count
+          from jobs
+          where status = 'done'
+            and processing_seconds is not null
+            and photos_count > 0
+            and created_at >= $1
+          order by created_at desc
+          limit 50`,
+    params: [startDate]
+  });
 
-  const { rows } = await pool.query(historicalSql, historicalParams);
-
-  if (rows.length >= 3) {
-    const avg =
-      rows.reduce((acc, r) => acc + Number(r.processing_seconds || 0), 0) / rows.length;
-    return Math.round(avg);
+  for (const q of tryQueries) {
+    const { rows } = await pool.query(q.sql, q.params);
+    if (rows.length >= 3) {
+      const totalPhotos = rows.reduce((acc, r) => acc + Number(r.photos_count || 0), 0);
+      const totalSeconds = rows.reduce((acc, r) => acc + Number(r.processing_seconds || 0), 0);
+      if (totalPhotos > 0) {
+        const secPerPhoto = totalSeconds / totalPhotos;
+        return Math.round(photos * secPerPhoto * 1.25);
+      }
+    }
   }
 
   return estimateProcessingSecondsFromInputs(photos, bytes, normalizedQualityMode);
@@ -1865,13 +1908,15 @@ async function estimateProcessingSeconds(pool, job) {
   const photos = Number(job.photos_count || 0);
   const bytes = Number(job.input_total_bytes || 0);
   const qualityMode = normalizeQualityMode(job?.quality_mode);
+  const tamsExport = !!job?.exif_summary?._xproces?.tams_export;
 
   if (photos > 0 || bytes > 0) {
     return await estimateProcessingSecondsFromInputsHistorical(
       pool,
       photos,
       bytes,
-      qualityMode
+      qualityMode,
+      tamsExport
     );
   }
 
@@ -1980,7 +2025,6 @@ setInterval(async () => {
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
-
 
 
 
