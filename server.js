@@ -1126,6 +1126,34 @@ if (expectedPhotos && totalPhotos >= expectedPhotos) {
 
   console.log("🚀 Job listo para procesar:", id);
 }   
+ // 🔥 fallback: si no crece en X tiempo, forzar queued
+const MAX_WAIT_MINUTES = 5;
+
+try {
+  const r = await pool.query(
+    `select created_at, photos_count from jobs where id = $1`,
+    [id]
+  );
+
+  const job = r.rows[0];
+  const minutes = (Date.now() - new Date(job.created_at).getTime()) / 60000;
+
+  if (minutes > MAX_WAIT_MINUTES && job.photos_count > 0) {
+    await pool.query(
+      `update jobs
+         set status = 'queued',
+             message = 'Forzado a cola (timeout subida)',
+             updated_at = now()
+       where id = $1`,
+      [id]
+    );
+
+    console.log("⚠️ Job forzado a queued por timeout:", id);
+  }
+
+} catch (e) {
+  console.error("timeout fallback error", e);
+}   
 // Si entra la primera foto y el job aún está recién creado,
 // lo pasamos a "receiving"
 if (job.status === "created") {
