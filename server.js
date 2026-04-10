@@ -1097,6 +1097,8 @@ app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
       console.log("🚀 Job listo para procesar:", id, `${totalPhotos}/${expectedPhotos}`);
     } else if (nextStatus === "created") {
       nextStatus = "receiving";
+    } else if (!nextStatus) {
+      nextStatus = "receiving";
     }
 
     await pool.query(
@@ -1537,48 +1539,47 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
   try {
     const MAX_IDLE_MINUTES = 15;
 
-    const { rows } = await pool.query(
-      `select id, status, photos_count, price, created_at, updated_at, message, exif_summary
-       ${jobsHasQualityMode ? ", quality_mode" : ""}
+    const staleResult = await pool.query(
+      `select id, photos_count, updated_at, exif_summary
        from jobs
-       where status = 'receiving'
-       order by created_at asc
-       limit 10`
+       where status = 'receiving'`
     );
 
-    for (const job of rows) {
+    for (const job of staleResult.rows) {
       const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || null;
+      const totalPhotos = Number(job.photos_count || 0);
+      const updatedAtMs = job.updated_at ? new Date(job.updated_at).getTime() : null;
+      const idleMinutes = updatedAtMs ? (Date.now() - updatedAtMs) / 60000 : 0;
 
-      if (expectedPhotos && Number(job.photos_count || 0) >= expectedPhotos) {
+      if (expectedPhotos && totalPhotos >= expectedPhotos) {
         await pool.query(
           `update jobs
              set status = 'queued',
                  message = 'En cola para procesado',
                  updated_at = now()
-           where id = $1`,
+           where id = $1 and status = 'receiving'`,
           [job.id]
         );
-        console.log("🚀 Job promovido a queued por total completo:", job.id, `${job.photos_count}/${expectedPhotos}`);
+        console.log("🚀 Job promovido a queued por total completo:", job.id, `${totalPhotos}/${expectedPhotos}`);
         continue;
       }
 
-      const updatedAtMs = job.updated_at ? new Date(job.updated_at).getTime() : null;
-      const idleMinutes = updatedAtMs ? (Date.now() - updatedAtMs) / 60000 : 0;
-
-      if (Number(job.photos_count || 0) > 0 && idleMinutes > MAX_IDLE_MINUTES) {
+      if (expectedPhotos && totalPhotos > 0 && totalPhotos < expectedPhotos && idleMinutes > MAX_IDLE_MINUTES) {
         await pool.query(
           `update jobs
-             set status = 'queued',
-                 message = 'En cola para procesado (subida detenida)',
+             set status = 'failed',
+                 message = 'Subida incompleta',
+                 error = 'La subida se interrumpió antes de completarse',
+                 finished_at = now(),
                  updated_at = now()
-           where id = $1`,
+           where id = $1 and status = 'receiving'`,
           [job.id]
         );
-        console.log("⚠️ Job promovido a queued por inactividad:", job.id, `${job.photos_count}/${expectedPhotos || "?"}`);
+        console.log("❌ Job marcado como failed por subida incompleta:", job.id, `${totalPhotos}/${expectedPhotos}`);
       }
     }
 
-    const refreshed = await pool.query(
+    const { rows } = await pool.query(
       `select id, status, photos_count, price, created_at, updated_at, message
        ${jobsHasQualityMode ? ", quality_mode" : ""}
        from jobs
@@ -1587,7 +1588,7 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
        limit 10`
     );
 
-    res.json({ ok: true, jobs: refreshed.rows });
+    res.json({ ok: true, jobs: rows });
   } catch (e) {
     console.error("worker receiving error", e);
     res.status(500).json({ ok: false, error: "worker receiving error" });
