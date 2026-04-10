@@ -1097,6 +1097,34 @@ if (expected && totalPhotos >= expected) {
      where id = $1`,
     [id]
   );
+}  
+ // 🔥 leer esperado desde exif_summary
+let expectedPhotos = null;
+
+try {
+  const r = await pool.query(
+    `select exif_summary from jobs where id = $1`,
+    [id]
+  );
+
+  expectedPhotos = r.rows[0]?.exif_summary?._xproces?.totalPhotos || null;
+
+} catch (e) {
+  console.error("error leyendo expectedPhotos", e);
+}
+
+// 🔥 si ya están todas → pasar a queued
+if (expectedPhotos && totalPhotos >= expectedPhotos) {
+  await pool.query(
+    `update jobs
+       set status = 'queued',
+           message = 'En cola para procesado',
+           updated_at = now()
+     where id = $1`,
+    [id]
+  );
+
+  console.log("🚀 Job listo para procesar:", id);
 }   
 // Si entra la primera foto y el job aún está recién creado,
 // lo pasamos a "receiving"
