@@ -1095,18 +1095,8 @@ app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
       nextStatus = "queued";
       nextMessage = "En cola para procesado";
       console.log("🚀 Job listo para procesar:", id, `${totalPhotos}/${expectedPhotos}`);
-    } else {
-      const MAX_WAIT_MINUTES = 5;
-      const createdAtMs = job.created_at ? new Date(job.created_at).getTime() : null;
-      const ageMinutes = createdAtMs ? (Date.now() - createdAtMs) / 60000 : 0;
-
-      if (totalPhotos > 0 && ageMinutes > MAX_WAIT_MINUTES) {
-        nextStatus = "queued";
-        nextMessage = "En cola para procesado (timeout de subida)";
-        console.log("⚠️ Job forzado a queued por timeout:", id, `${totalPhotos}/${expectedPhotos || "?"}`);
-      } else if (nextStatus === "created") {
-        nextStatus = "receiving";
-      }
+    } else if (nextStatus === "created") {
+      nextStatus = "receiving";
     }
 
     await pool.query(
@@ -1545,7 +1535,50 @@ app.post("/worker/claim", requireWorkerAuth, async (_req, res) => {
 });
 app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
   try {
+    const MAX_IDLE_MINUTES = 15;
+
     const { rows } = await pool.query(
+      `select id, status, photos_count, price, created_at, updated_at, message, exif_summary
+       ${jobsHasQualityMode ? ", quality_mode" : ""}
+       from jobs
+       where status = 'receiving'
+       order by created_at asc
+       limit 10`
+    );
+
+    for (const job of rows) {
+      const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || null;
+
+      if (expectedPhotos && Number(job.photos_count || 0) >= expectedPhotos) {
+        await pool.query(
+          `update jobs
+             set status = 'queued',
+                 message = 'En cola para procesado',
+                 updated_at = now()
+           where id = $1`,
+          [job.id]
+        );
+        console.log("🚀 Job promovido a queued por total completo:", job.id, `${job.photos_count}/${expectedPhotos}`);
+        continue;
+      }
+
+      const updatedAtMs = job.updated_at ? new Date(job.updated_at).getTime() : null;
+      const idleMinutes = updatedAtMs ? (Date.now() - updatedAtMs) / 60000 : 0;
+
+      if (Number(job.photos_count || 0) > 0 && idleMinutes > MAX_IDLE_MINUTES) {
+        await pool.query(
+          `update jobs
+             set status = 'queued',
+                 message = 'En cola para procesado (subida detenida)',
+                 updated_at = now()
+           where id = $1`,
+          [job.id]
+        );
+        console.log("⚠️ Job promovido a queued por inactividad:", job.id, `${job.photos_count}/${expectedPhotos || "?"}`);
+      }
+    }
+
+    const refreshed = await pool.query(
       `select id, status, photos_count, price, created_at, updated_at, message
        ${jobsHasQualityMode ? ", quality_mode" : ""}
        from jobs
@@ -1554,7 +1587,7 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
        limit 10`
     );
 
-    res.json({ ok: true, jobs: rows });
+    res.json({ ok: true, jobs: refreshed.rows });
   } catch (e) {
     console.error("worker receiving error", e);
     res.status(500).json({ ok: false, error: "worker receiving error" });
@@ -1946,6 +1979,7 @@ setInterval(async () => {
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
+
 
 
 
