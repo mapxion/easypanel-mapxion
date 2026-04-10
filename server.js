@@ -1200,20 +1200,6 @@ app.post("/jobs/:id/output", uploadOutput.single("file"), async (req, res) => {
   try {
     const { id } = req.params;
 
-    // 🔴 CHECK TAMS MODE
-    const jobCheck = await pool.query("select exif_summary from jobs where id = $1", [id]);
-    const job = jobCheck.rows[0];
-
-    const isTams = job?.exif_summary?._xproces?.tams_export === true;
-
-    if (isTams) {
-      console.log("[TAMS] Output upload skipped for job", id);
-      return res.json({ ok: true, skipped: true });
-    }
-
-  try {
-    const { id } = req.params;
-
     const { rows } = await pool.query("select id from jobs where id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
@@ -2039,7 +2025,6 @@ setInterval(async () => {
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
-
 
 
 
