@@ -1052,122 +1052,22 @@ app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
     const { id } = req.params;
 
     const { rows } = await pool.query(
-      "select id, status from jobs where id = $1",
+      "select id, status, created_at, exif_summary from jobs where id = $1",
       [id]
     );
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     const job = rows[0];
 
-if (isLockedStatus(job.status)) {
-  return res.status(409).json({
-    ok: false,
-    error: "job_locked",
-    message: `No se pueden subir más fotos: estado ${job.status}`,
-  });
-}
-// 🔥 CONTAR archivos reales en disco
-const dir = inputDir(id);
-let totalPhotos = 0;
+    if (isLockedStatus(job.status)) {
+      return res.status(409).json({
+        ok: false,
+        error: "job_locked",
+        message: `No se pueden subir más fotos: estado ${job.status}`,
+      });
+    }
 
-try {
-  if (fs.existsSync(dir)) {
-    totalPhotos = fs.readdirSync(dir).length;
-  }
-} catch (e) {
-  console.error("count files error", e);
-}
-
-// 🔥 ACTUALIZAR BD
-await pool.query(
-  `update jobs
-     set photos_count = $1,
-         updated_at = now()
-   where id = $2`,
-  [totalPhotos, id]
-);
- const expected = req.body.totalPhotos || null;
-
-if (expected && totalPhotos >= expected) {
-  await pool.query(
-    `update jobs
-       set status = 'queued',
-           message = 'En cola para procesado',
-           updated_at = now()
-     where id = $1`,
-    [id]
-  );
-}  
- // 🔥 leer esperado desde exif_summary
-let expectedPhotos = null;
-
-try {
-  const r = await pool.query(
-    `select exif_summary from jobs where id = $1`,
-    [id]
-  );
-
-  expectedPhotos = r.rows[0]?.exif_summary?._xproces?.totalPhotos || null;
-
-} catch (e) {
-  console.error("error leyendo expectedPhotos", e);
-}
-
-// 🔥 si ya están todas → pasar a queued
-if (expectedPhotos && totalPhotos >= expectedPhotos) {
-  await pool.query(
-    `update jobs
-       set status = 'queued',
-           message = 'En cola para procesado',
-           updated_at = now()
-     where id = $1`,
-    [id]
-  );
-
-  console.log("🚀 Job listo para procesar:", id);
-}   
- // 🔥 fallback: si no crece en X tiempo, forzar queued
-const MAX_WAIT_MINUTES = 5;
-
-try {
-  const r = await pool.query(
-    `select created_at, photos_count from jobs where id = $1`,
-    [id]
-  );
-
-  const job = r.rows[0];
-  const minutes = (Date.now() - new Date(job.created_at).getTime()) / 60000;
-
-  if (minutes > MAX_WAIT_MINUTES && job.photos_count > 0) {
-    await pool.query(
-      `update jobs
-         set status = 'queued',
-             message = 'Forzado a cola (timeout subida)',
-             updated_at = now()
-       where id = $1`,
-      [id]
-    );
-
-    console.log("⚠️ Job forzado a queued por timeout:", id);
-  }
-
-} catch (e) {
-  console.error("timeout fallback error", e);
-}   
-// Si entra la primera foto y el job aún está recién creado,
-// lo pasamos a "receiving"
-if (job.status === "created") {
-  await pool.query(
-    `update jobs
-        set status='receiving',
-            message='Recibiendo fotos',
-            updated_at=now()
-      where id=$1`,
-    [id]
-  );
-}
-
-ensureJobDirs(id);
+    ensureJobDirs(id);
 
     const files = (req.files || [])
       .filter((f) => f.fieldname === "photos" || f.fieldname === "photos[]")
@@ -1184,7 +1084,50 @@ ensureJobDirs(id);
       });
     }
 
-    res.json({ ok: true, uploaded: files.length, files });
+    const totalPhotos = listInputImages(id).length;
+    const totalBytes = getInputTotalBytes(id);
+    const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || null;
+
+    let nextStatus = String(job.status || "").toLowerCase();
+    let nextMessage = "Recibiendo fotos";
+
+    if (expectedPhotos && totalPhotos >= expectedPhotos) {
+      nextStatus = "queued";
+      nextMessage = "En cola para procesado";
+      console.log("🚀 Job listo para procesar:", id, `${totalPhotos}/${expectedPhotos}`);
+    } else {
+      const MAX_WAIT_MINUTES = 5;
+      const createdAtMs = job.created_at ? new Date(job.created_at).getTime() : null;
+      const ageMinutes = createdAtMs ? (Date.now() - createdAtMs) / 60000 : 0;
+
+      if (totalPhotos > 0 && ageMinutes > MAX_WAIT_MINUTES) {
+        nextStatus = "queued";
+        nextMessage = "En cola para procesado (timeout de subida)";
+        console.log("⚠️ Job forzado a queued por timeout:", id, `${totalPhotos}/${expectedPhotos || "?"}`);
+      } else if (nextStatus === "created") {
+        nextStatus = "receiving";
+      }
+    }
+
+    await pool.query(
+      `update jobs
+         set photos_count = $1,
+             input_total_bytes = $2,
+             status = $3,
+             message = $4,
+             updated_at = now()
+       where id = $5`,
+      [totalPhotos, totalBytes, nextStatus, nextMessage, id]
+    );
+
+    res.json({
+      ok: true,
+      uploaded: files.length,
+      totalPhotos,
+      expectedPhotos,
+      status: nextStatus,
+      files,
+    });
   } catch (e) {
     console.error("upload error", e);
     res.status(500).json({ ok: false, error: "upload error" });
@@ -2003,6 +1946,7 @@ setInterval(async () => {
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
+
 
 
 
