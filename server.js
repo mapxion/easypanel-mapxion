@@ -1086,6 +1086,18 @@ await pool.query(
    where id = $2`,
   [totalPhotos, id]
 );
+ const expected = req.body.totalPhotos || null;
+
+if (expected && totalPhotos >= expected) {
+  await pool.query(
+    `update jobs
+       set status = 'queued',
+           message = 'En cola para procesado',
+           updated_at = now()
+     where id = $1`,
+    [id]
+  );
+}   
 // Si entra la primera foto y el job aún está recién creado,
 // lo pasamos a "receiving"
 if (job.status === "created") {
