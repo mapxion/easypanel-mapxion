@@ -1097,14 +1097,14 @@ app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
     let nextStatus = String(job.status || "").toLowerCase();
     let nextMessage = "Recibiendo fotos";
 
-    if (expectedPhotos && totalPhotos >= expectedPhotos) {
-      nextStatus = "queued";
-      nextMessage = "En cola para procesado";
-      console.log("🚀 Job listo para procesar:", id, `${totalPhotos}/${expectedPhotos}`);
-    } else if (nextStatus === "created") {
+    if (nextStatus === "created") {
       nextStatus = "receiving";
     } else if (!nextStatus) {
       nextStatus = "receiving";
+    }
+
+    if (expectedPhotos && totalPhotos >= expectedPhotos) {
+      console.log("📥 Upload completo detectado en servidor:", id, `${totalPhotos}/${expectedPhotos}`);
     }
 
     await pool.query(
@@ -1129,6 +1129,78 @@ app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
   } catch (e) {
     console.error("upload error", e);
     res.status(500).json({ ok: false, error: "upload error" });
+  }
+});
+
+app.post("/jobs/:id/complete-upload", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(
+      "select id, status, photos_count, input_total_bytes, exif_summary from jobs where id = $1",
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: "job not found" });
+
+    const job = rows[0];
+    const serverFiles = listInputImages(id);
+    const realCount = serverFiles.length;
+    const realBytes = getInputTotalBytes(id);
+    const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || Number(job.photos_count || 0) || 0;
+    const expectedBytes = Number(job.input_total_bytes || 0) || 0;
+
+    if (expectedPhotos > 0 && realCount < expectedPhotos) {
+      return res.json({
+        ok: false,
+        ready: false,
+        error: "upload_incomplete",
+        realCount,
+        expectedPhotos,
+        realBytes,
+        expectedBytes
+      });
+    }
+
+    if (expectedBytes > 0 && realBytes < expectedBytes) {
+      return res.json({
+        ok: false,
+        ready: false,
+        error: "upload_bytes_incomplete",
+        realCount,
+        expectedPhotos,
+        realBytes,
+        expectedBytes
+      });
+    }
+
+    const nextStatus = isLockedStatus(job.status) ? job.status : "queued";
+    const nextMessage = nextStatus === "queued" ? "En cola para procesado" : job.status;
+
+    if (nextStatus === "queued") {
+      await pool.query(
+        `update jobs
+           set status = 'queued',
+               photos_count = $1,
+               input_total_bytes = $2,
+               message = $3,
+               updated_at = now()
+         where id = $4`,
+        [realCount, realBytes, nextMessage, id]
+      );
+    }
+
+    return res.json({
+      ok: true,
+      ready: true,
+      status: nextStatus,
+      realCount,
+      expectedPhotos,
+      realBytes,
+      expectedBytes
+    });
+  } catch (e) {
+    console.error("complete-upload error", e);
+    res.status(500).json({ ok: false, error: "complete-upload error" });
   }
 });
 
@@ -1577,16 +1649,20 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
       const updatedAtMs = job.updated_at ? new Date(job.updated_at).getTime() : null;
       const idleMinutes = updatedAtMs ? (Date.now() - updatedAtMs) / 60000 : 0;
 
-      if (expectedPhotos && totalPhotos >= expectedPhotos) {
+      const serverBytes = getInputTotalBytes(job.id);
+
+      if (expectedPhotos && totalPhotos >= expectedPhotos && serverFilesCount >= expectedPhotos) {
         await pool.query(
           `update jobs
              set status = 'queued',
+                 photos_count = $2,
+                 input_total_bytes = $3,
                  message = 'En cola para procesado',
                  updated_at = now()
            where id = $1 and status = 'receiving'`,
-          [job.id]
+          [job.id, serverFilesCount, serverBytes]
         );
-        console.log("🚀 Job promovido a queued por total completo:", job.id, `${totalPhotos}/${expectedPhotos}`);
+        console.log("🚀 Job promovido a queued por total completo:", job.id, `${serverFilesCount}/${expectedPhotos}`);
         continue;
       }
 
