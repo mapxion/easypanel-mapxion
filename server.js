@@ -1562,6 +1562,7 @@ app.post("/worker/claim", requireWorkerAuth, async (_req, res) => {
 app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
   try {
     const MAX_IDLE_MINUTES = 15;
+    const MAX_STUCK_RECEIVING_MINUTES = 5;
 
     const staleResult = await pool.query(
       `select id, photos_count, updated_at, exif_summary
@@ -1572,6 +1573,7 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
     for (const job of staleResult.rows) {
       const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || null;
       const totalPhotos = Number(job.photos_count || 0);
+      const serverFilesCount = listInputImages(job.id).length;
       const updatedAtMs = job.updated_at ? new Date(job.updated_at).getTime() : null;
       const idleMinutes = updatedAtMs ? (Date.now() - updatedAtMs) / 60000 : 0;
 
@@ -1585,6 +1587,19 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
           [job.id]
         );
         console.log("🚀 Job promovido a queued por total completo:", job.id, `${totalPhotos}/${expectedPhotos}`);
+        continue;
+      }
+
+      if (!expectedPhotos && totalPhotos > 0 && serverFilesCount >= totalPhotos && idleMinutes > MAX_STUCK_RECEIVING_MINUTES) {
+        await pool.query(
+          `update jobs
+             set status = 'queued',
+                 message = 'En cola para procesado',
+                 updated_at = now()
+           where id = $1 and status = 'receiving'`,
+          [job.id]
+        );
+        console.log("🟡 Job receiving atascado promovido a queued:", job.id, `${totalPhotos} fotos, idle ${idleMinutes.toFixed(1)} min`);
         continue;
       }
 
