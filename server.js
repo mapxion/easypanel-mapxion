@@ -1170,11 +1170,11 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
         `update jobs
            set status = 'queued',
                photos_count = $1,
-               input_total_bytes = $2,
-               message = $3,
+               input_total_bytes = 0,
+               message = $2,
                updated_at = now()
-         where id = $4`,
-        [realCount, 0, nextMessage, id]
+         where id = $3`,
+        [realCount, nextMessage, id]
       );
     }
 
@@ -1638,18 +1638,18 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
       const updatedAtMs = job.updated_at ? new Date(job.updated_at).getTime() : null;
       const idleMinutes = updatedAtMs ? (Date.now() - updatedAtMs) / 60000 : 0;
 
-      const serverBytes = getInputTotalBytes(job.id);
+      const serverBytes = 0;
 
       if (expectedPhotos && totalPhotos >= expectedPhotos && serverFilesCount >= expectedPhotos) {
         await pool.query(
           `update jobs
              set status = 'queued',
                  photos_count = $2,
-                 input_total_bytes = $3,
+                 input_total_bytes = 0,
                  message = 'En cola para procesado',
                  updated_at = now()
            where id = $1 and status = 'receiving'`,
-          [job.id, serverFilesCount, serverBytes]
+          [job.id, serverFilesCount]
         );
         console.log("🚀 Job promovido a queued por total completo:", job.id, `${serverFilesCount}/${expectedPhotos}`);
         continue;
