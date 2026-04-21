@@ -358,7 +358,7 @@ app.get("/admin/jobs", async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v35-worker-receiving-list" })
+  res.json({ version: "v36-photos-only-validation" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -1017,8 +1017,8 @@ app.post("/jobs/:id/submit", async (req, res) => {
          where id=$1`;
 
     const submitUpdateParams = jobsHasQualityMode
-      ? [id, photosCount, price, inputTotalBytes, qualityMode]
-      : [id, photosCount, price, inputTotalBytes];
+      ? [id, photosCount, price, 0, qualityMode]
+      : [id, photosCount, price, 0];
 
     await pool.query(submitUpdateSql, submitUpdateParams);
 
@@ -1034,7 +1034,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
       enqueued: true,
       jobId: id,
       inputs: photosCount,
-      input_total_bytes: inputTotalBytes,
+      input_total_bytes: 0,
       quality_mode: qualityMode,
       quality_mode_label: getQualityModeLabel(qualityMode),
       tams_export: tamsExport,
@@ -1093,6 +1093,7 @@ app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
     const totalPhotos = listInputImages(id).length;
     const totalBytes = getInputTotalBytes(id);
     const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || null;
+    const persistedTotalBytes = 0;
 
     let nextStatus = String(job.status || "").toLowerCase();
     let nextMessage = "Recibiendo fotos";
@@ -1115,7 +1116,7 @@ app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
              message = $4,
              updated_at = now()
        where id = $5`,
-      [totalPhotos, totalBytes, nextStatus, nextMessage, id]
+      [totalPhotos, persistedTotalBytes, nextStatus, nextMessage, id]
     );
 
     res.json({
@@ -1147,25 +1148,13 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
     const realCount = serverFiles.length;
     const realBytes = getInputTotalBytes(id);
     const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || Number(job.photos_count || 0) || 0;
-    const expectedBytes = Number(job.input_total_bytes || 0) || 0;
+    const expectedBytes = 0;
 
     if (expectedPhotos > 0 && realCount < expectedPhotos) {
       return res.json({
         ok: false,
         ready: false,
         error: "upload_incomplete",
-        realCount,
-        expectedPhotos,
-        realBytes,
-        expectedBytes
-      });
-    }
-
-    if (expectedBytes > 0 && realBytes < expectedBytes) {
-      return res.json({
-        ok: false,
-        ready: false,
-        error: "upload_bytes_incomplete",
         realCount,
         expectedPhotos,
         realBytes,
@@ -1185,7 +1174,7 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
                message = $3,
                updated_at = now()
          where id = $4`,
-        [realCount, realBytes, nextMessage, id]
+        [realCount, 0, nextMessage, id]
       );
     }
 
@@ -1694,11 +1683,16 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
       }
     }
 
-    // IMPORTANTE:
-    // no devolvemos jobs "receiving" al worker para predescarga incremental.
-    // La web sube por lotes y devolverlos aquí provoca descargas parciales
-    // (42/372, etc.) mientras el upload sigue en curso.
-    res.json({ ok: true, jobs: [] });
+    const { rows } = await pool.query(
+      `select id, status, photos_count, price, created_at, updated_at, message
+       ${jobsHasQualityMode ? ", quality_mode" : ""}
+       from jobs
+       where status = 'receiving'
+       order by created_at asc
+       limit 10`
+    );
+
+    res.json({ ok: true, jobs: rows });
   } catch (e) {
     console.error("worker receiving error", e);
     res.status(500).json({ ok: false, error: "worker receiving error" });
