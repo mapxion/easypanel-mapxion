@@ -1694,16 +1694,11 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
       }
     }
 
-    const { rows } = await pool.query(
-      `select id, status, photos_count, price, created_at, updated_at, message
-       ${jobsHasQualityMode ? ", quality_mode" : ""}
-       from jobs
-       where status = 'receiving'
-       order by created_at asc
-       limit 10`
-    );
-
-    res.json({ ok: true, jobs: rows });
+    // IMPORTANTE:
+    // no devolvemos jobs "receiving" al worker para predescarga incremental.
+    // La web sube por lotes y devolverlos aquí provoca descargas parciales
+    // (42/372, etc.) mientras el upload sigue en curso.
+    res.json({ ok: true, jobs: [] });
   } catch (e) {
     console.error("worker receiving error", e);
     res.status(500).json({ ok: false, error: "worker receiving error" });
