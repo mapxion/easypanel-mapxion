@@ -345,7 +345,10 @@ app.get("/admin/jobs", async (_req, res) => {
 
     res.json({
       ok: true,
-      jobs: rows
+      jobs: rows.map((job) => ({
+        ...job,
+        quality_mode: normalizeQualityMode(job.quality_mode || job?.exif_summary?._xproces?.quality_mode || "normal")
+      }))
     });
 
   } catch (e) {
@@ -769,7 +772,9 @@ app.get("/jobs/mine", async (req, res) => {
         stage,
         progress,
         price,
-        created_at
+        created_at,
+        quality_mode,
+        exif_summary
       from jobs
       where user_id = $1
       order by created_at desc`,
@@ -778,7 +783,10 @@ app.get("/jobs/mine", async (req, res) => {
 
     res.json({
       ok: true,
-      jobs: rows
+      jobs: rows.map((job) => ({
+        ...job,
+        quality_mode: normalizeQualityMode(job.quality_mode || job?.exif_summary?._xproces?.quality_mode || "normal")
+      }))
     });
   } catch (e) {
     console.error("jobs/mine error", e);
@@ -794,7 +802,11 @@ app.get("/jobs/:id", async (req, res) => {
     const { id } = req.params;
     const { rows } = await pool.query("select * from jobs where id = $1", [id]);
     if (!rows.length) return res.status(404).json({ error: "not found" });
-    res.json(rows[0]);
+    const job = rows[0];
+    res.json({
+      ...job,
+      quality_mode: normalizeQualityMode(job.quality_mode || job?.exif_summary?._xproces?.quality_mode || "normal")
+    });
   } catch (e) {
     console.error("get job error", e);
     res.status(500).json({ error: "db error" });
@@ -811,6 +823,7 @@ const outputsRequested = stripNullCharsDeep(req.body?.outputs_requested || []);
 const presetKey = stripNullCharsDeep(req.body?.preset_key || null);
 const outputMode = stripNullCharsDeep(req.body?.output_mode || null);
 const tamsExport = !!req.body?.tams_export;
+const qualityMode = normalizeQualityMode(req.body?.quality_mode);
 
 const exifSummary = stripNullCharsDeep({
   ...(exifSummaryRaw || {}),
@@ -835,7 +848,11 @@ const exifSummary = stripNullCharsDeep({
     tams_export: !!(
       req.body?.tams_export ??
       exifSummaryRaw?._xproces?.tams_export
-    )
+    ),
+    quality_mode:
+      qualityMode ??
+      exifSummaryRaw?._xproces?.quality_mode ??
+      "normal" 
   }
 });
 
@@ -843,7 +860,6 @@ const clientEmail = req.body?.client_email || null;
 const projectName = req.body?.project_name || null;
 const clientName = req.body?.client_name || null;
 const userId = req.body?.user_id || null;
-const qualityMode = normalizeQualityMode(req.body?.quality_mode);
     
 
     if (!clientEmail || !isValidEmail(clientEmail)) {
@@ -923,16 +939,27 @@ app.post("/jobs/:id/submit", async (req, res) => {
     const { id } = req.params;
 
     const selectJobSql = jobsHasQualityMode
-      ? "select id, status, quality_mode from jobs where id = $1"
-      : "select id, status from jobs where id = $1";
+      ? "select id, status, quality_mode, exif_summary from jobs where id = $1"
+      : "select id, status, exif_summary from jobs where id = $1";
 
     const { rows } = await pool.query(selectJobSql, [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     const job = rows[0];
     const qualityMode = normalizeQualityMode(
-      req.body?.quality_mode || job.quality_mode
+      req.body?.quality_mode ||
+      job.quality_mode ||
+      job?.exif_summary?._xproces?.quality_mode ||
+      "normal"
     );
+
+    const updatedExifSummary = stripNullCharsDeep({
+      ...(job.exif_summary || {}),
+      _xproces: {
+        ...((job.exif_summary && job.exif_summary._xproces) || {}),
+        quality_mode: qualityMode
+      }
+    });
 
     if (isLockedStatus(job.status)) {
       return res.status(409).json({
@@ -998,6 +1025,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
                price=$3,
                input_total_bytes=$4,
                quality_mode=$5,
+               exif_summary=$6,
                progress=0,
                message='En cola',
                error=null,
@@ -1009,6 +1037,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
                photos_count=$2,
                price=$3,
                input_total_bytes=$4,
+               exif_summary=$5,
                progress=0,
                message='En cola',
                error=null,
@@ -1614,7 +1643,14 @@ app.post("/worker/claim", requireWorkerAuth, async (_req, res) => {
       return res.json({ ok: true, job: null });
     }
 
-    res.json({ ok: true, job: rows[0] });
+    const job = rows[0];
+    res.json({
+      ok: true,
+      job: {
+        ...job,
+        quality_mode: normalizeQualityMode(job.quality_mode || job?.exif_summary?._xproces?.quality_mode || "normal")
+      }
+    });
   } catch (e) {
     console.error("worker claim error", e);
     res.status(500).json({ ok: false, error: "worker claim error" });
