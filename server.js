@@ -1571,7 +1571,10 @@ app.patch("/jobs/:id", async (req, res) => {
       error,
       download_seconds,
       processing_seconds,
-      total_seconds
+      total_seconds,
+      process_log,
+      log_line,
+      log
     } = req.body;
 
     const p = progress === undefined ? null : Number(progress);
@@ -1599,6 +1602,20 @@ app.patch("/jobs/:id", async (req, res) => {
       });
     }
     
+    if (process_log !== undefined || log_line !== undefined || log !== undefined) {
+      try {
+        ensureJobDirs(id);
+        const rawLiveLog = process_log ?? log_line ?? log;
+        const liveText = String(rawLiveLog ?? "").replace(/\u0000/g, "").slice(0, 20000);
+        if (liveText.trim()) {
+          const liveLogPath = path.join(outputDir(id), "metashape-python-log.txt");
+          fs.appendFileSync(liveLogPath, liveText.endsWith("\n") ? liveText : liveText + "\n", "utf8");
+        }
+      } catch (logError) {
+        console.error("live log append error", logError?.message || logError);
+      }
+    }
+
     const { rows } = await pool.query(
       `update jobs
          set status = coalesce($2, status),
