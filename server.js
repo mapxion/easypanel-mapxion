@@ -361,7 +361,7 @@ app.get("/admin/jobs", async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v36-photos-only-validation" })
+  res.json({ version: "v37-photos-only-validation" })
 );
 
 app.get("/redis", (_req, res) =>
