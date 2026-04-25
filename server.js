@@ -361,7 +361,7 @@ app.get("/admin/jobs", async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v37-photos-only-validation" })
+  res.json({ version: "v38-photos-only-validation" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -758,8 +758,6 @@ app.get("/jobs/mine", async (req, res) => {
       req.headers["x-user-id"] ||
       req.query.user_id ||
       req.query.userId ||
-      req.body?.user_id ||
-      req.body?.userId ||
       "";
 
     const userId = String(userIdRaw || "").trim();
@@ -772,22 +770,34 @@ app.get("/jobs/mine", async (req, res) => {
       });
     }
 
-    const { rows } = await pool.query(
-      `select
-        id,
-        project_name,
-        status,
-        stage,
-        progress,
-        price,
-        created_at,
-        quality_mode,
-        exif_summary
-      from jobs
-      where user_id = $1
-      order by created_at desc`,
-      [userId]
-    );
+    const selectSql = jobsHasQualityMode
+      ? `select
+          id,
+          project_name,
+          status,
+          stage,
+          progress,
+          price,
+          created_at,
+          quality_mode,
+          exif_summary
+        from jobs
+        where user_id = $1
+        order by created_at desc`
+      : `select
+          id,
+          project_name,
+          status,
+          stage,
+          progress,
+          price,
+          created_at,
+          exif_summary
+        from jobs
+        where user_id = $1
+        order by created_at desc`;
+
+    const { rows } = await pool.query(selectSql, [userId]);
 
     res.json({
       ok: true,
@@ -800,7 +810,8 @@ app.get("/jobs/mine", async (req, res) => {
     console.error("jobs/mine error", e);
     res.status(500).json({
       ok: false,
-      error: "jobs_mine_error"
+      error: "jobs_mine_error",
+      message: e?.message || String(e)
     });
   }
 });
