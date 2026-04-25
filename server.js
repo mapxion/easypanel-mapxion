@@ -754,9 +754,17 @@ app.get("/jobs", async (_req, res) => {
 
 app.get("/jobs/mine", async (req, res) => {
   try {
-    const userId = req.headers["x-user-id"];
+    const userIdRaw =
+      req.headers["x-user-id"] ||
+      req.query.user_id ||
+      req.query.userId ||
+      req.body?.user_id ||
+      req.body?.userId ||
+      "";
 
-    if (!userId) {
+    const userId = String(userIdRaw || "").trim();
+
+    if (!userId || userId === "null" || userId === "undefined") {
       return res.status(401).json({
         ok: false,
         error: "missing_user",
