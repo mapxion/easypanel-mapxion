@@ -50,7 +50,7 @@ function normalizeQualityMode(value) {
   if (!raw) return "normal";
   if (["rapido", "rápido", "fast"].includes(raw)) return "fast";
   if (["normal", "standard", "estandar", "estándar"].includes(raw)) return "normal";
-  if (["max", "maximum", "maxima", "máxima", "maxima calidad", "máxima calidad", "maxima_calidad", "máxima_calidad", "maximum_quality", "ultra", "high", "highest", "best"].includes(raw)) return "max";
+  if (["max", "maximum", "maxima", "máxima", "ultra"].includes(raw)) return "max";
 
   return "normal";
 }
@@ -361,7 +361,7 @@ app.get("/admin/jobs", async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v40-photos-only-validation" })
+  res.json({ version: "v39-photos-only-validation" })
 );
 
 app.get("/redis", (_req, res) =>
@@ -1065,8 +1065,8 @@ app.post("/jobs/:id/submit", async (req, res) => {
          where id=$1`;
 
     const submitUpdateParams = jobsHasQualityMode
-      ? [id, photosCount, price, 0, qualityMode]
-      : [id, photosCount, price, 0];
+      ? [id, photosCount, price, inputTotalBytes, qualityMode, updatedExifSummary]
+      : [id, photosCount, price, inputTotalBytes, updatedExifSummary];
 
     await pool.query(submitUpdateSql, submitUpdateParams);
 
@@ -1082,7 +1082,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
       enqueued: true,
       jobId: id,
       inputs: photosCount,
-      input_total_bytes: 0,
+      input_total_bytes: inputTotalBytes,
       quality_mode: qualityMode,
       quality_mode_label: getQualityModeLabel(qualityMode),
       tams_export: tamsExport,
