@@ -104,6 +104,10 @@ function isValidEmail(email) {
   const value = String(email || "").trim();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
+function isValidUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(value || ""));
+}
+
 
 function generateInviteCode() {
   return randomBytes(4).toString("hex").toUpperCase();
@@ -819,16 +823,22 @@ app.get("/jobs/mine", async (req, res) => {
 app.get("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ ok: false, error: "invalid job id" });
+    }
+
     const { rows } = await pool.query("select * from jobs where id = $1", [id]);
-    if (!rows.length) return res.status(404).json({ error: "not found" });
+    if (!rows.length) return res.status(404).json({ ok: false, error: "not found" });
+
     const job = rows[0];
     res.json({
       ...job,
+      ok: true,
       quality_mode: normalizeQualityMode(job.quality_mode || job?.exif_summary?._xproces?.quality_mode || "normal")
     });
   } catch (e) {
     console.error("get job error", e);
-    res.status(500).json({ error: "db error" });
+    res.status(500).json({ ok: false, error: "db error", message: e?.message || String(e) });
   }
 });
 
@@ -1366,50 +1376,40 @@ app.get("/jobs/:id/outputs", async (req, res) => {
 app.get("/jobs/:id/log", async (req, res) => {
   try {
     const { id } = req.params;
-
-    const logPath = path.join(outputDir(id), "metashape-python-log.txt");
-
-    if (!fs.existsSync(logPath)) {
-      return res.status(404).json({ ok: false, error: "log not found" });
+    if (!isValidUuid(id)) {
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      return res.status(400).send("XPROCES_PROGRESS|0|ID de job no válido\n");
     }
 
-    const text = fs.readFileSync(logPath, "utf8");
-
-    res.setHeader("Content-Type", "text/plain");
-    res.send(text);
-
-  } catch (e) {
-    console.error("log error", e);
-    res.status(500).json({ ok: false, error: "log error" });
-  }
-});
-
-app.get("/jobs/:id/log", async (req, res) => {
-  try {
-    const { id } = req.params;
-
     const { rows } = await pool.query(
-      "select id from jobs where id = $1",
+      "select id, status, stage, progress, message, error from jobs where id = $1",
       [id]
     );
 
     if (!rows.length) {
-      return res.status(404).json({ ok: false, error: "job not found" });
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      return res.status(404).send("XPROCES_PROGRESS|0|Job no encontrado\n");
     }
 
+    const job = rows[0];
     const logPath = path.join(outputDir(id), "metashape-python-log.txt");
 
-    if (!fs.existsSync(logPath)) {
-      return res.status(404).json({ ok: false, error: "log not found" });
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+
+    if (fs.existsSync(logPath)) {
+      return res.send(fs.readFileSync(logPath, "utf8"));
     }
 
-    const text = fs.readFileSync(logPath, "utf8");
-
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    return res.send(text);
+    // Fallback: si todavía no existe el log físico, devolver el progreso guardado en DB.
+    // Así la web no recibe 404 y puede pintar algo real.
+    const progress = Number.isFinite(Number(job.progress)) ? Number(job.progress) : 0;
+    const message = String(job.message || job.stage || job.status || "Procesando").replace(/\r?\n/g, " ");
+    return res.send(`XPROCES_PROGRESS|${progress}|${message}\n`);
   } catch (e) {
     console.error("log error", e);
-    return res.status(500).json({ ok: false, error: "log error" });
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    return res.status(500).send("XPROCES_PROGRESS|0|Error leyendo progreso\n");
   }
 });
 
