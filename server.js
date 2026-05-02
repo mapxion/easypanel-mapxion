@@ -97,6 +97,86 @@ function stripNullCharsDeep(value) {
   return value;
 }
 
+
+function normalizeProcessingStage(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return null;
+
+  if (["created", "receiving", "queued", "running", "done", "failed", "cancelled"].includes(raw)) return raw;
+  if (["prepare", "preparing", "preparando"].includes(raw)) return "preparing";
+  if (["import", "importing", "importando"].includes(raw)) return "importing";
+  if (["match", "matching", "detecting", "detectando", "detectando_puntos"].includes(raw)) return "matching";
+  if (["align", "aligning", "alineando", "alineacion", "alineación"].includes(raw)) return "aligning";
+  if (["clean", "cleaning", "limpiando", "optimizando", "optimization", "optimizing"].includes(raw)) return "cleaning";
+  if (["depth", "depthmaps", "depth_maps", "profundidad", "mapas_profundidad"].includes(raw)) return "depth_maps";
+  if (["pointcloud", "point_cloud", "cloud", "nube", "nube_puntos"].includes(raw)) return "point_cloud";
+  if (["dem", "dtm", "terreno"].includes(raw)) return "dem";
+  if (["model", "modelo", "mesh", "malla"].includes(raw)) return "model";
+  if (["uv", "texture", "texturing", "textura", "texturizando"].includes(raw)) return "texture";
+  if (["export", "exporting", "exportando"].includes(raw)) return "exporting";
+  if (["report", "pdf", "informe"].includes(raw)) return "report";
+
+  return raw.replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || null;
+}
+
+function inferProcessingStage({ status, stage, progress, message }) {
+  const direct = normalizeProcessingStage(stage);
+  if (direct) return direct;
+
+  const st = String(status || "").toLowerCase();
+  if (["done", "failed", "cancelled", "queued", "receiving", "created"].includes(st)) return st;
+
+  const text = String(message || "").toLowerCase();
+  if (text.includes("prepar")) return "preparing";
+  if (text.includes("import")) return "importing";
+  if (text.includes("detect") || text.includes("puntos clave") || text.includes("match")) return "matching";
+  if (text.includes("aline")) return "aligning";
+  if (text.includes("limpi") || text.includes("optim")) return "cleaning";
+  if (text.includes("profundidad") || text.includes("depth")) return "depth_maps";
+  if (text.includes("nube") || text.includes("point cloud")) return "point_cloud";
+  if (text.includes("dem") || text.includes("terreno") || text.includes("dtm")) return "dem";
+  if (text.includes("modelo") || text.includes("model") || text.includes("malla")) return "model";
+  if (text.includes("textura") || text.includes("texture") || text.includes("uv")) return "texture";
+  if (text.includes("export")) return "exporting";
+  if (text.includes("informe") || text.includes("pdf")) return "report";
+
+  const p = Number(progress);
+  if (Number.isFinite(p)) {
+    if (p >= 100) return "done";
+    if (p >= 96) return "report";
+    if (p >= 92) return "exporting";
+    if (p >= 86) return "texture";
+    if (p >= 84) return "model";
+    if (p >= 82) return "dem";
+    if (p >= 78) return "point_cloud";
+    if (p >= 65) return "depth_maps";
+    if (p >= 50) return "cleaning";
+    if (p >= 45) return "aligning";
+    if (p >= 30) return "matching";
+    if (p >= 15) return "importing";
+    if (p >= 10) return "preparing";
+  }
+
+  return null;
+}
+
+async function recordJobStageEvent(pool, jobId, stage, eventType) {
+  const normalizedStage = normalizeProcessingStage(stage);
+  const normalizedType = String(eventType || "progress").trim().toLowerCase();
+  if (!normalizedStage || !["start", "end", "progress"].includes(normalizedType)) return;
+
+  try {
+    await pool.query(
+      `insert into job_stage_events (job_id, stage, event_type, created_at)
+       values ($1, $2, $3, now())`,
+      [jobId, normalizedStage, normalizedType]
+    );
+  } catch (e) {
+    // No paramos el proceso por métricas: si falla el histórico, el job debe seguir.
+    console.error("job_stage_events insert error", e?.message || e);
+  }
+}
+
 // =====================
 // AUTH WORKER
 // =====================
@@ -1050,11 +1130,13 @@ app.post("/jobs/:id/submit", async (req, res) => {
     const submitUpdateSql = jobsHasQualityMode
       ? `update jobs
            set status='queued',
+               stage='queued',
                photos_count=$2,
                price=$3,
                input_total_bytes=$4,
                quality_mode=$5,
                exif_summary=$6,
+               estimated_processing_seconds=$7,
                progress=0,
                message='En cola',
                error=null,
@@ -1063,10 +1145,12 @@ app.post("/jobs/:id/submit", async (req, res) => {
          where id=$1`
       : `update jobs
            set status='queued',
+               stage='queued',
                photos_count=$2,
                price=$3,
                input_total_bytes=$4,
                exif_summary=$5,
+               estimated_processing_seconds=$6,
                progress=0,
                message='En cola',
                error=null,
@@ -1075,8 +1159,8 @@ app.post("/jobs/:id/submit", async (req, res) => {
          where id=$1`;
 
     const submitUpdateParams = jobsHasQualityMode
-      ? [id, photosCount, price, 0, qualityMode]
-      : [id, photosCount, price, 0];
+      ? [id, photosCount, price, inputTotalBytes, qualityMode, updatedExifSummary, estimatedSeconds]
+      : [id, photosCount, price, inputTotalBytes, updatedExifSummary, estimatedSeconds];
 
     await pool.query(submitUpdateSql, submitUpdateParams);
 
@@ -1092,7 +1176,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
       enqueued: true,
       jobId: id,
       inputs: photosCount,
-      input_total_bytes: 0,
+      input_total_bytes: inputTotalBytes,
       quality_mode: qualityMode,
       quality_mode_label: getQualityModeLabel(qualityMode),
       tams_export: tamsExport,
@@ -1151,7 +1235,7 @@ app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
     const totalPhotos = listInputImages(id).length;
     const totalBytes = getInputTotalBytes(id);
     const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || null;
-    const persistedTotalBytes = 0;
+    const persistedTotalBytes = totalBytes;
 
     let nextStatus = String(job.status || "").toLowerCase();
     let nextMessage = "Recibiendo fotos";
@@ -1228,11 +1312,11 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
         `update jobs
            set status = 'queued',
                photos_count = $1,
-               input_total_bytes = 0,
-               message = $2,
+               input_total_bytes = $2,
+               message = $3,
                updated_at = now()
-         where id = $3`,
-        [realCount, nextMessage, id]
+         where id = $4`,
+        [realCount, realBytes, nextMessage, id]
       );
     }
 
@@ -1520,23 +1604,6 @@ app.post("/jobs/:id/priority", async (req, res) => {
   try {
     const { id } = req.params;
 
-    if (stage && stage !== currentStage) {
-      try {
-        if (currentStage) {
-          await pool.query(
-            `insert into job_stage_events (job_id, stage, event_type) values ($1, $2, 'end')`,
-            [id, currentStage]
-          );
-        }
-        await pool.query(
-          `insert into job_stage_events (job_id, stage, event_type) values ($1, $2, 'start')`,
-          [id, stage]
-        );
-      } catch (stageErr) {
-        console.error("job_stage_events error", stageErr);
-      }
-    }
-
     const { rows } = await pool.query(
       `update jobs
          set priority = coalesce(priority, 0) + 1,
@@ -1572,6 +1639,7 @@ app.patch("/jobs/:id", async (req, res) => {
       download_seconds,
       processing_seconds,
       total_seconds,
+      estimated_processing_seconds,
       process_log,
       log_line,
       log
@@ -1583,7 +1651,9 @@ app.patch("/jobs/:id", async (req, res) => {
     }
 
     const currentJobResult = await pool.query(
-      `select id, status, stage from jobs where id = $1`,
+      `select id, status, stage, progress, started_at, finished_at, created_at, processing_started_at, processing_finished_at
+       from jobs
+       where id = $1`,
       [id]
     );
 
@@ -1591,8 +1661,13 @@ app.patch("/jobs/:id", async (req, res) => {
       return res.status(404).json({ error: "not found" });
     }
 
-    const currentStatus = String(currentJobResult.rows[0].status || "").toLowerCase();
-    const currentStage = String(currentJobResult.rows[0].stage || "");
+    const currentJob = currentJobResult.rows[0];
+    const currentStatus = String(currentJob.status || "").toLowerCase();
+    const currentStage = normalizeProcessingStage(currentJob.stage);
+    const currentProgress = Number(currentJob.progress || 0);
+    const incomingStatus = status === undefined ? null : String(status || "").toLowerCase();
+    const nextStage = inferProcessingStage({ status: incomingStatus || currentStatus, stage, progress: p, message });
+    const terminalStatus = incomingStatus && ["done", "failed", "cancelled"].includes(incomingStatus);
 
     if (currentStatus === "cancelled") {
       return res.json({
@@ -1601,7 +1676,7 @@ app.patch("/jobs/:id", async (req, res) => {
         message: "Job cancelado; actualización ignorada"
       });
     }
-    
+
     if (process_log !== undefined || log_line !== undefined || log !== undefined) {
       try {
         ensureJobDirs(id);
@@ -1616,6 +1691,21 @@ app.patch("/jobs/:id", async (req, res) => {
       }
     }
 
+    if (nextStage && nextStage !== currentStage) {
+      if (currentStage) await recordJobStageEvent(pool, id, currentStage, "end");
+      await recordJobStageEvent(pool, id, nextStage, "start");
+    } else if (nextStage && p !== null && p !== currentProgress) {
+      await recordJobStageEvent(pool, id, nextStage, "progress");
+    }
+
+    if (terminalStatus && currentStage && currentStage !== nextStage) {
+      await recordJobStageEvent(pool, id, currentStage, "end");
+    }
+    if (terminalStatus && nextStage) {
+      await recordJobStageEvent(pool, id, nextStage, "start");
+      await recordJobStageEvent(pool, id, nextStage, "end");
+    }
+
     const { rows } = await pool.query(
       `update jobs
          set status = coalesce($2, status),
@@ -1624,23 +1714,39 @@ app.patch("/jobs/:id", async (req, res) => {
              message = coalesce($5, message),
              error = coalesce($6, error),
              download_seconds = coalesce($7, download_seconds),
-             processing_seconds = coalesce($8, processing_seconds),
-             total_seconds = coalesce($9, total_seconds),
+             processing_seconds = coalesce(
+               $8,
+               case
+                 when $2 in ('done','failed','cancelled') then greatest(0, extract(epoch from (now() - coalesce(processing_started_at, started_at, created_at)))::int)
+                 else processing_seconds
+               end
+             ),
+             total_seconds = coalesce(
+               $9,
+               case
+                 when $2 in ('done','failed','cancelled') then greatest(0, extract(epoch from (now() - created_at))::int)
+                 else total_seconds
+               end
+             ),
+             estimated_processing_seconds = coalesce($10, estimated_processing_seconds),
              updated_at = now(),
              started_at = case when $2 = 'running' and started_at is null then now() else started_at end,
-             finished_at = case when $2 in ('done','failed') then now() else finished_at end
+             processing_started_at = case when $2 = 'running' and processing_started_at is null then now() else processing_started_at end,
+             processing_finished_at = case when $2 in ('done','failed','cancelled') then now() else processing_finished_at end,
+             finished_at = case when $2 in ('done','failed','cancelled') then now() else finished_at end
        where id = $1
        returning *`,
       [
         id,
         status ?? null,
-        stage ?? null,
+        nextStage ?? null,
         p,
         message ?? null,
         error ?? null,
         download_seconds ?? null,
         processing_seconds ?? null,
-        total_seconds ?? null
+        total_seconds ?? null,
+        estimated_processing_seconds ?? null
       ]
     );
 
@@ -1660,10 +1766,12 @@ app.post("/worker/claim", requireWorkerAuth, async (_req, res) => {
     const { rows } = await pool.query(
       `update jobs
           set status='running',
+              stage='running',
               progress=0,
               message='Worker claimed',
               updated_at=now(),
-              started_at=case when started_at is null then now() else started_at end
+              started_at=case when started_at is null then now() else started_at end,
+              processing_started_at=case when processing_started_at is null then now() else processing_started_at end
         where id = (
           select id
           from jobs
@@ -1680,6 +1788,7 @@ app.post("/worker/claim", requireWorkerAuth, async (_req, res) => {
     }
 
     const job = rows[0];
+    await recordJobStageEvent(pool, job.id, "running", "start");
     res.json({
       ok: true,
       job: {
@@ -1747,6 +1856,7 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
                  message = 'Subida incompleta',
                  error = 'La subida se interrumpió antes de completarse',
                  finished_at = now(),
+                 total_seconds = greatest(0, extract(epoch from (now() - created_at))::int),
                  updated_at = now()
            where id = $1 and status = 'receiving'`,
           [job.id]
