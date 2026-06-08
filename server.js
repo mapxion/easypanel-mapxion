@@ -362,7 +362,7 @@ function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qua
 
 // ✅ helper: status “bloqueado” (no permitir más uploads)
 function isLockedStatus(status) {
-  return ["queued", "running", "done"].includes(
+  return ["queued", "running", "done", "tams_pending_download", "tams_downloaded"].includes(
     String(status || "").toLowerCase()
   );
 }
@@ -1102,12 +1102,6 @@ app.post("/jobs/:id/submit", async (req, res) => {
       });
     }
 
-    if (!processQueue || !redisReady) {
-      return res
-        .status(503)
-        .json({ error: "queue unavailable (redis not ready)" });
-    }
-
     ensureJobDirs(id);
 
     const inputs = listInputImages(id);
@@ -1154,7 +1148,65 @@ app.post("/jobs/:id/submit", async (req, res) => {
       projectType
     );
 
-    // Guardamos conteo real + precio real y ponemos en cola
+    // TAMS: solo recepción/descarga al PC. NO entra en Redis/BullMQ ni en procesado.
+    if (projectType === "tams") {
+      const tamsUpdateSql = jobsHasQualityMode
+        ? `update jobs
+             set status='tams_pending_download',
+                 stage='download_pending',
+                 photos_count=$2,
+                 price=0,
+                 input_total_bytes=$3,
+                 quality_mode=$4,
+                 exif_summary=$5,
+                 estimated_processing_seconds=0,
+                 progress=100,
+                 message='TAMS pendiente de descarga al PC',
+                 error=null,
+                 updated_at=now()
+           where id=$1`
+        : `update jobs
+             set status='tams_pending_download',
+                 stage='download_pending',
+                 photos_count=$2,
+                 price=0,
+                 input_total_bytes=$3,
+                 exif_summary=$4,
+                 estimated_processing_seconds=0,
+                 progress=100,
+                 message='TAMS pendiente de descarga al PC',
+                 error=null,
+                 updated_at=now()
+           where id=$1`;
+
+      const tamsUpdateParams = jobsHasQualityMode
+        ? [id, photosCount, inputTotalBytes, qualityMode, updatedExifSummary]
+        : [id, photosCount, inputTotalBytes, updatedExifSummary];
+
+      await pool.query(tamsUpdateSql, tamsUpdateParams);
+
+      return res.json({
+        ok: true,
+        enqueued: false,
+        download_pending: true,
+        jobId: id,
+        inputs: photosCount,
+        input_total_bytes: inputTotalBytes,
+        project_type: projectType,
+        tams_export: true,
+        price: 0,
+        estimated_seconds: 0,
+        estimated_human: "Pendiente de descarga"
+      });
+    }
+
+    if (!processQueue || !redisReady) {
+      return res
+        .status(503)
+        .json({ error: "queue unavailable (redis not ready)" });
+    }
+
+    // Fotogrametría / 3D: guardar conteo real + precio real y poner en cola.
     const submitUpdateSql = jobsHasQualityMode
       ? `update jobs
            set status='queued',
@@ -1192,7 +1244,6 @@ app.post("/jobs/:id/submit", async (req, res) => {
 
     await pool.query(submitUpdateSql, submitUpdateParams);
 
-    // encolar
     await processQueue.add(
       "process_job",
       { jobId: id, qualityMode },
@@ -1319,6 +1370,8 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
     const realBytes = getInputTotalBytes(id);
     const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || Number(job.photos_count || 0) || 0;
     const expectedBytes = 0;
+    const projectType = String(job.exif_summary?._xproces?.project_type || "fotogrametria").toLowerCase();
+    const isTams = projectType === "tams" || !!job.exif_summary?._xproces?.tams_export;
 
     if (expectedPhotos > 0 && realCount < expectedPhotos) {
       return res.json({
@@ -1332,15 +1385,36 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
       });
     }
 
-    const nextStatus = isLockedStatus(job.status) ? job.status : "queued";
-    const nextMessage = nextStatus === "queued" ? "En cola para procesado" : job.status;
+    const nextStatus = isLockedStatus(job.status)
+      ? job.status
+      : (isTams ? "tams_pending_download" : "queued");
+
+    const nextMessage = isTams
+      ? "TAMS pendiente de descarga al PC"
+      : (nextStatus === "queued" ? "En cola para procesado" : job.status);
 
     if (nextStatus === "queued") {
       await pool.query(
         `update jobs
            set status = 'queued',
+               stage = 'queued',
                photos_count = $1,
                input_total_bytes = $2,
+               message = $3,
+               updated_at = now()
+         where id = $4`,
+        [realCount, realBytes, nextMessage, id]
+      );
+    } else if (nextStatus === "tams_pending_download") {
+      await pool.query(
+        `update jobs
+           set status = 'tams_pending_download',
+               stage = 'download_pending',
+               photos_count = $1,
+               input_total_bytes = $2,
+               price = 0,
+               estimated_processing_seconds = 0,
+               progress = 100,
                message = $3,
                updated_at = now()
          where id = $4`,
@@ -1355,7 +1429,9 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
       realCount,
       expectedPhotos,
       realBytes,
-      expectedBytes
+      expectedBytes,
+      project_type: projectType,
+      download_pending: isTams
     });
   } catch (e) {
     console.error("complete-upload error", e);
@@ -1844,36 +1920,46 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
       const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || null;
       const totalPhotos = Number(job.photos_count || 0);
       const serverFilesCount = listInputImages(job.id).length;
+      const serverBytes = getInputTotalBytes(job.id);
       const updatedAtMs = job.updated_at ? new Date(job.updated_at).getTime() : null;
       const idleMinutes = updatedAtMs ? (Date.now() - updatedAtMs) / 60000 : 0;
+      const projectType = String(job.exif_summary?._xproces?.project_type || "fotogrametria").toLowerCase();
+      const isTams = projectType === "tams" || !!job.exif_summary?._xproces?.tams_export;
 
-      const serverBytes = 0;
+      const readyByExpected = expectedPhotos && totalPhotos >= expectedPhotos && serverFilesCount >= expectedPhotos;
+      const readyByIdle = !expectedPhotos && totalPhotos > 0 && serverFilesCount >= totalPhotos && idleMinutes > MAX_STUCK_RECEIVING_MINUTES;
 
-      if (expectedPhotos && totalPhotos >= expectedPhotos && serverFilesCount >= expectedPhotos) {
-        await pool.query(
-          `update jobs
-             set status = 'queued',
-                 photos_count = $2,
-                 input_total_bytes = 0,
-                 message = 'En cola para procesado',
-                 updated_at = now()
-           where id = $1 and status = 'receiving'`,
-          [job.id, serverFilesCount]
-        );
-        console.log("🚀 Job promovido a queued por total completo:", job.id, `${serverFilesCount}/${expectedPhotos}`);
-        continue;
-      }
-
-      if (!expectedPhotos && totalPhotos > 0 && serverFilesCount >= totalPhotos && idleMinutes > MAX_STUCK_RECEIVING_MINUTES) {
-        await pool.query(
-          `update jobs
-             set status = 'queued',
-                 message = 'En cola para procesado',
-                 updated_at = now()
-           where id = $1 and status = 'receiving'`,
-          [job.id]
-        );
-        console.log("🟡 Job receiving atascado promovido a queued:", job.id, `${totalPhotos} fotos, idle ${idleMinutes.toFixed(1)} min`);
+      if (readyByExpected || readyByIdle) {
+        if (isTams) {
+          await pool.query(
+            `update jobs
+               set status = 'tams_pending_download',
+                   stage = 'download_pending',
+                   photos_count = $2,
+                   input_total_bytes = $3,
+                   price = 0,
+                   estimated_processing_seconds = 0,
+                   progress = 100,
+                   message = 'TAMS pendiente de descarga al PC',
+                   updated_at = now()
+             where id = $1 and status = 'receiving'`,
+            [job.id, serverFilesCount, serverBytes]
+          );
+          console.log("📥 TAMS pendiente de descarga al PC:", job.id, `${serverFilesCount}/${expectedPhotos || totalPhotos}`);
+        } else {
+          await pool.query(
+            `update jobs
+               set status = 'queued',
+                   stage = 'queued',
+                   photos_count = $2,
+                   input_total_bytes = $3,
+                   message = 'En cola para procesado',
+                   updated_at = now()
+             where id = $1 and status = 'receiving'`,
+            [job.id, serverFilesCount, serverBytes]
+          );
+          console.log("🚀 Job promovido a queued:", job.id, `${serverFilesCount}/${expectedPhotos || totalPhotos}`);
+        }
         continue;
       }
 
@@ -1897,7 +1983,7 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
       `select id, status, photos_count, price, created_at, updated_at, message
        ${jobsHasQualityMode ? ", quality_mode" : ""}
        from jobs
-       where status = 'receiving'
+       where status in ('receiving', 'tams_pending_download')
        order by created_at asc
        limit 10`
     );
@@ -1908,6 +1994,27 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
     res.status(500).json({ ok: false, error: "worker receiving error" });
   }
 });
+
+// Lista de proyectos TAMS pendientes para que el PC los descargue.
+// El PC puede llamar a /worker/jobs/:id/input.zip para bajar cada ZIP,
+// y después a /worker/jobs/:id/confirm-download para confirmar descarga.
+app.get("/worker/tams/pending", requireWorkerAuth, async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `select id, status, photos_count, input_total_bytes, created_at, updated_at, message, client_email, project_name, client_name, exif_summary
+       from jobs
+       where status = 'tams_pending_download'
+       order by created_at asc
+       limit 20`
+    );
+
+    res.json({ ok: true, jobs: rows });
+  } catch (e) {
+    console.error("worker tams pending error", e);
+    res.status(500).json({ ok: false, error: "worker tams pending error" });
+  }
+});
+
 app.get("/worker/jobs/:id/input.zip", requireWorkerAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2049,6 +2156,9 @@ app.post("/worker/jobs/:id/confirm-download", requireWorkerAuth, async (req, res
      `update jobs
          set input_purged = $2,
              input_purged_at = case when $2 then now() else input_purged_at end,
+             status = case when status = 'tams_pending_download' and $2 then 'tams_downloaded' else status end,
+             stage = case when status = 'tams_pending_download' and $2 then 'downloaded_pc' else stage end,
+             message = case when status = 'tams_pending_download' and $2 then 'TAMS descargado en PC' else message end,
              updated_at = now()
        where id = $1`,
      [id, purged]
