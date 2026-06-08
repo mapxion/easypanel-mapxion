@@ -328,19 +328,36 @@ function estimateProcessingSecondsFromInputs(photosCount, totalBytes, qualityMod
   );
 }
 
-function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qualityMode = "normal") {
+function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qualityMode = "normal", outputsRequested = [], projectType = "fotogrametria") {
   const photos = Number(photosCount || 0);
-  const bytes = Number(totalBytes || 0);
-  const gb = bytes / (1024 * 1024 * 1024);
-  const hours = Number(estimatedSeconds || 0) / 3600;
-  const factor = getQualityModePriceFactor(qualityMode);
+  const type = String(projectType || "fotogrametria").toLowerCase();
+  const outputs = Array.isArray(outputsRequested) ? outputsRequested.map(String) : [];
 
-  const base = 3;
-  const byPhoto = photos * 0.03;
-  const byGb = gb * 1.5;
-  const byTime = hours * 6;
+  if (type === "tams") return 0;
 
-  return Math.ceil((base + byPhoto + byGb + byTime) * factor);
+  let price = 10;
+
+  if (photos > 1000) price += 40;
+  else if (photos > 500) price += 20;
+  else if (photos > 100) price += 10;
+
+  if (qualityMode === "max") price += 20;
+
+  const extras = {
+    dem_tif: 10,       // DSM
+    dtm_tif: 10,       // DTM
+    contours_dxf: 5,   // Curvas de nivel
+    mesh_obj: 10,
+    glb: 10,
+    mesh_fbx: 10,
+    textures: 5
+  };
+
+  for (const output of outputs) {
+    price += extras[output] || 0;
+  }
+
+  return Math.max(0, Math.ceil(price));
 }
 
 // ✅ helper: status “bloqueado” (no permitir más uploads)
@@ -476,7 +493,9 @@ app.post("/pricing/preview", async (req, res) => {
     const photosCount = Number(req.body?.photos_count || 0);
     const totalBytes = Number(req.body?.total_bytes || 0);
     const qualityMode = normalizeQualityMode(req.body?.quality_mode);
-    const tamsExport = !!req.body?.tams_export;
+    const outputsRequested = Array.isArray(req.body?.outputs_requested) ? req.body.outputs_requested : [];
+    const projectType = String(req.body?.project_type || req.body?.xproces_meta?.project_type || "fotogrametria").toLowerCase();
+    const tamsExport = !!req.body?.tams_export || projectType === "tams";
 
     console.log("PRICING PREVIEW parsed:", { photosCount, totalBytes, qualityMode, tamsExport });
 
@@ -502,7 +521,9 @@ app.post("/pricing/preview", async (req, res) => {
       photosCount,
       totalBytes,
       estimatedSeconds,
-      qualityMode
+      qualityMode,
+      outputsRequested,
+      projectType
     );
 
     console.log("PRICING PREVIEW price:", price);
@@ -931,7 +952,8 @@ const exifSummaryRaw = stripNullCharsDeep(req.body?.exif_summary || null);
 const outputsRequested = stripNullCharsDeep(req.body?.outputs_requested || []);
 const presetKey = stripNullCharsDeep(req.body?.preset_key || null);
 const outputMode = stripNullCharsDeep(req.body?.output_mode || null);
-const tamsExport = !!req.body?.tams_export;
+const projectType = String(req.body?.project_type || exifSummaryRaw?._xproces?.project_type || "fotogrametria").toLowerCase();
+const tamsExport = !!req.body?.tams_export || projectType === "tams";
 const qualityMode = normalizeQualityMode(req.body?.quality_mode);
 
 const exifSummary = stripNullCharsDeep({
@@ -939,6 +961,8 @@ const exifSummary = stripNullCharsDeep({
   _xproces: {
     // 🔹 conserva lo que venga del frontend (CLAVE)
     ...((exifSummaryRaw && exifSummaryRaw._xproces) || {}),
+
+    project_type: projectType,
 
     // 🔹 siempre actualiza outputs (esto ya lo hacías bien)
     outputs_requested: outputsRequested,
@@ -1109,7 +1133,9 @@ app.post("/jobs/:id/submit", async (req, res) => {
 
     const photosCount = inputs.length;
     const inputTotalBytes = getInputTotalBytes(id);
-    const tamsExport = !!job.exif_summary?._xproces?.tams_export;
+    const projectType = String(job.exif_summary?._xproces?.project_type || "fotogrametria").toLowerCase();
+    const outputsRequested = Array.isArray(job.exif_summary?._xproces?.outputs_requested) ? job.exif_summary._xproces.outputs_requested : [];
+    const tamsExport = !!job.exif_summary?._xproces?.tams_export || projectType === "tams";
 
     const estimatedSeconds = await estimateProcessingSecondsFromInputsHistorical(
       pool,
@@ -1123,7 +1149,9 @@ app.post("/jobs/:id/submit", async (req, res) => {
       photosCount,
       inputTotalBytes,
       estimatedSeconds,
-      qualityMode
+      qualityMode,
+      outputsRequested,
+      projectType
     );
 
     // Guardamos conteo real + precio real y ponemos en cola
@@ -2287,6 +2315,10 @@ setInterval(async () => {
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
+
+
+
+
 
 
 
