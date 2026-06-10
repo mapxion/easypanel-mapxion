@@ -1034,9 +1034,11 @@ const userId = req.body?.user_id || null;
           project_name,
           client_name,
           user_id,
-          quality_mode
+          quality_mode,
+          project_type,
+          outputs
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
         returning *`
       : `insert into jobs (
           status,
@@ -1046,9 +1048,11 @@ const userId = req.body?.user_id || null;
           client_email,
           project_name,
           client_name,
-          user_id
+          user_id,
+          project_type,
+          outputs
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
         returning *`;
 
     const insertParams = jobsHasQualityMode
@@ -1061,7 +1065,9 @@ const userId = req.body?.user_id || null;
           projectName,
           clientName,
           userId,
-          qualityMode
+          qualityMode,
+          projectType,
+          JSON.stringify(outputsRequested)
         ]
       : [
           "created",
@@ -1071,7 +1077,9 @@ const userId = req.body?.user_id || null;
           clientEmail,
           projectName,
           clientName,
-          userId
+          userId,
+          projectType,
+          JSON.stringify(outputsRequested)
         ];
 
     const { rows } = await pool.query(insertSql, insertParams);
@@ -1180,6 +1188,8 @@ app.post("/jobs/:id/submit", async (req, res) => {
                  input_total_bytes=$3,
                  quality_mode=$4,
                  exif_summary=$5,
+                 project_type=$6,
+                 outputs=$7::jsonb,
                  estimated_processing_seconds=0,
                  progress=100,
                  message='TAMS pendiente de descarga al PC',
@@ -1193,6 +1203,8 @@ app.post("/jobs/:id/submit", async (req, res) => {
                  price=0,
                  input_total_bytes=$3,
                  exif_summary=$4,
+                 project_type=$5,
+                 outputs=$6::jsonb,
                  estimated_processing_seconds=0,
                  progress=100,
                  message='TAMS pendiente de descarga al PC',
@@ -1201,8 +1213,8 @@ app.post("/jobs/:id/submit", async (req, res) => {
            where id=$1`;
 
       const tamsUpdateParams = jobsHasQualityMode
-        ? [id, photosCount, inputTotalBytes, qualityMode, updatedExifSummary]
-        : [id, photosCount, inputTotalBytes, updatedExifSummary];
+        ? [id, photosCount, inputTotalBytes, qualityMode, updatedExifSummary, projectType, JSON.stringify(outputsRequested)]
+        : [id, photosCount, inputTotalBytes, updatedExifSummary, projectType, JSON.stringify(outputsRequested)];
 
       await pool.query(tamsUpdateSql, tamsUpdateParams);
 
@@ -1237,7 +1249,9 @@ app.post("/jobs/:id/submit", async (req, res) => {
                input_total_bytes=$4,
                quality_mode=$5,
                exif_summary=$6,
-               estimated_processing_seconds=$7,
+               project_type=$7,
+               outputs=$8::jsonb,
+               estimated_processing_seconds=$9,
                progress=0,
                message='En cola',
                error=null,
@@ -1251,7 +1265,9 @@ app.post("/jobs/:id/submit", async (req, res) => {
                price=$3,
                input_total_bytes=$4,
                exif_summary=$5,
-               estimated_processing_seconds=$6,
+               project_type=$6,
+               outputs=$7::jsonb,
+               estimated_processing_seconds=$8,
                progress=0,
                message='En cola',
                error=null,
@@ -1260,8 +1276,8 @@ app.post("/jobs/:id/submit", async (req, res) => {
          where id=$1`;
 
     const submitUpdateParams = jobsHasQualityMode
-      ? [id, photosCount, price, inputTotalBytes, qualityMode, updatedExifSummary, estimatedSeconds]
-      : [id, photosCount, price, inputTotalBytes, updatedExifSummary, estimatedSeconds];
+      ? [id, photosCount, price, inputTotalBytes, qualityMode, updatedExifSummary, projectType, JSON.stringify(outputsRequested), estimatedSeconds]
+      : [id, photosCount, price, inputTotalBytes, updatedExifSummary, projectType, JSON.stringify(outputsRequested), estimatedSeconds];
 
     await pool.query(submitUpdateSql, submitUpdateParams);
 
