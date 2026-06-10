@@ -24,6 +24,27 @@ app.use(cors());
 const DATA_ROOT = process.env.DATA_ROOT || "/data/mapxion";
 const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "XprocesAdmin2026!";
+
+function requireAdmin(req, res, next) {
+  const token =
+    req.headers["x-admin-token"] ||
+    req.headers["authorization"]?.replace(/^Bearer\s+/i, "") ||
+    req.query?.admin_token ||
+    req.body?.admin_token;
+
+  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
+    return res.status(401).json({
+      ok: false,
+      error: "admin_unauthorized",
+      message: "Acceso administrador no autorizado"
+    });
+  }
+
+  return next();
+}
+
+
 let jobsHasQualityMode = false;
 
 async function refreshSchemaFlags() {
@@ -417,7 +438,7 @@ app.get("/health", (_req, res) => {
 });
 
 
-app.get("/admin/jobs", async (_req, res) => {
+app.get("/admin/jobs", requireAdmin, async (_req, res) => {
   try {
     const { rows } = await pool.query(`
       select
@@ -771,7 +792,7 @@ app.post("/auth/invite-login", async (req, res) => {
   }
 });
 
-app.post("/admin/invite-codes/generate", async (req, res) => {
+app.post("/admin/invite-codes/generate", requireAdmin, async (req, res) => {
   try {
     const count = Number(req.body?.count || 50);
     const rowsCreated = [];
@@ -814,7 +835,7 @@ app.post("/admin/invite-codes/generate", async (req, res) => {
   }
 });
 
-app.get("/admin/invite-codes", async (_req, res) => {
+app.get("/admin/invite-codes", requireAdmin, async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `select
@@ -1640,7 +1661,7 @@ app.get("/jobs/:id/download", async (req, res) => {
 });
 
 
-app.post("/jobs/:id/cancel", async (req, res) => {
+app.post("/jobs/:id/cancel", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -1704,7 +1725,7 @@ app.post("/jobs/:id/cancel", async (req, res) => {
   }
 });
 
-app.post("/jobs/:id/priority", async (req, res) => {
+app.post("/jobs/:id/priority", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
