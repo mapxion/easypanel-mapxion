@@ -1177,8 +1177,9 @@ app.post("/jobs/:id/submit", async (req, res) => {
       projectType
     );
 
-    // TAMS: solo recepción/descarga al PC. NO entra en Redis/BullMQ ni en procesado.
-    if (projectType === "tams") {
+    // TAMS 2026-06-12: ahora también entra en cola para procesado local del worker.
+    // Se conserva el bloque antiguo desactivado por seguridad.
+    if (false && projectType === "tams") {
       const tamsUpdateSql = jobsHasQualityMode
         ? `update jobs
              set status='tams_pending_download',
@@ -1424,11 +1425,9 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
 
     const nextStatus = isLockedStatus(job.status)
       ? job.status
-      : (isTams ? "tams_pending_download" : "queued");
+      : "queued";
 
-    const nextMessage = isTams
-      ? "TAMS pendiente de descarga al PC"
-      : (nextStatus === "queued" ? "En cola para procesado" : job.status);
+    const nextMessage = nextStatus === "queued" ? "En cola para procesado" : job.status;
 
     if (nextStatus === "queued") {
       await pool.query(
@@ -1468,7 +1467,7 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
       realBytes,
       expectedBytes,
       project_type: projectType,
-      download_pending: isTams
+      download_pending: false
     });
   } catch (e) {
     console.error("complete-upload error", e);
