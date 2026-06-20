@@ -348,7 +348,10 @@ async function ensureDownloadCleanupColumns() {
       add column if not exists download_verified boolean not null default false,
       add column if not exists output_purged boolean not null default false,
       add column if not exists output_purged_at timestamptz,
-      add column if not exists storage_purged_at timestamptz
+      add column if not exists storage_purged_at timestamptz,
+      add column if not exists archived_log text,
+      add column if not exists archived_outputs jsonb,
+      add column if not exists archived_summary_saved_at timestamptz
   `);
 }
 
@@ -378,16 +381,76 @@ async function markDownloadCompletedAndPurged(jobId, cleanup) {
               output_purged = $2,
               output_purged_at = case when $2 then coalesce(output_purged_at, now()) else output_purged_at end,
               storage_purged_at = case when $3 then coalesce(storage_purged_at, now()) else storage_purged_at end,
-              message = case
-                when status in ('done', 'completed') then 'Descargado. Archivos eliminados del servidor.'
-                else message
-              end,
+              status = case when status in ('done', 'completed', 'complete', 'success', 'processed') then 'downloaded' else status end,
+              stage = 'downloaded',
+              message = 'No disponible para descarga directa.',
               updated_at = now()
         where id = $1`,
       [jobId, !!cleanup?.outputRemoved, !!cleanup?.jobDirRemovedIfEmpty]
     );
   } catch (e) {
     console.error("No se pudo marcar descarga completada/purgada:", jobId, e?.message || e);
+  }
+}
+
+function listOutputFilesSnapshot(jobId) {
+  const dir = outputDir(jobId);
+  if (!fs.existsSync(dir)) return [];
+
+  try {
+    return fs.readdirSync(dir)
+      .map((name) => {
+        const full = path.join(dir, name);
+        const stat = fs.statSync(full);
+        if (!stat.isFile()) return null;
+        return { filename: name, size: stat.size };
+      })
+      .filter(Boolean)
+      .sort((a, b) => String(a.filename).localeCompare(String(b.filename)));
+  } catch (e) {
+    console.error("No se pudieron listar outputs para resumen:", jobId, e?.message || e);
+    return [];
+  }
+}
+
+function readJobLogSnapshot(jobId) {
+  const logPath = path.join(outputDir(jobId), "metashape-python-log.txt");
+  try {
+    if (fs.existsSync(logPath)) {
+      return fs.readFileSync(logPath, "utf8");
+    }
+  } catch (e) {
+    console.error("No se pudo leer log para resumen:", jobId, e?.message || e);
+  }
+  return "";
+}
+
+async function saveArchivedJobSummary(jobId) {
+  try {
+    await ensureDownloadCleanupColumns();
+
+    const archivedLog = readJobLogSnapshot(jobId);
+    const archivedOutputs = listOutputFilesSnapshot(jobId);
+
+    await pool.query(
+      `update jobs
+          set archived_log = coalesce(nullif($2, ''), archived_log),
+              archived_outputs = case
+                when $3::jsonb = '[]'::jsonb then archived_outputs
+                else $3::jsonb
+              end,
+              archived_summary_saved_at = now(),
+              updated_at = now()
+        where id = $1`,
+      [jobId, archivedLog, JSON.stringify(archivedOutputs)]
+    );
+
+    console.log("Resumen archivado del job:", jobId, {
+      logChars: archivedLog.length,
+      outputFiles: archivedOutputs.length
+    });
+  } catch (e) {
+    console.error("No se pudo guardar resumen archivado:", jobId, e?.message || e);
   }
 }
 
@@ -957,6 +1020,8 @@ app.get("/jobs", async (_req, res) => {
 
 app.get("/jobs/mine", async (req, res) => {
   try {
+    await ensureDownloadCleanupColumns();
+
     const userIdRaw =
       req.headers["x-user-id"] ||
       req.query.user_id ||
@@ -983,7 +1048,11 @@ app.get("/jobs/mine", async (req, res) => {
           price,
           created_at,
           quality_mode,
-          exif_summary
+          exif_summary,
+          download_verified,
+          output_purged,
+          archived_summary_saved_at,
+          archived_outputs
         from jobs
         where user_id = $1
         order by created_at desc`
@@ -995,7 +1064,11 @@ app.get("/jobs/mine", async (req, res) => {
           progress,
           price,
           created_at,
-          exif_summary
+          exif_summary,
+          download_verified,
+          output_purged,
+          archived_summary_saved_at,
+          archived_outputs
         from jobs
         where user_id = $1
         order by created_at desc`;
@@ -1682,8 +1755,10 @@ app.get("/jobs/:id/log", async (req, res) => {
       return res.status(400).send("XPROCES_PROGRESS|0|ID de job no válido\n");
     }
 
+    await ensureDownloadCleanupColumns();
+
     const { rows } = await pool.query(
-      "select id, status, stage, progress, message, error from jobs where id = $1",
+      "select id, status, stage, progress, message, error, archived_log from jobs where id = $1",
       [id]
     );
 
@@ -1702,6 +1777,10 @@ app.get("/jobs/:id/log", async (req, res) => {
       return res.send(fs.readFileSync(logPath, "utf8"));
     }
 
+    if (job.archived_log) {
+      return res.send(String(job.archived_log || ""));
+    }
+
     // Fallback: si todavía no existe el log físico, devolver el progreso guardado en DB.
     // Así la web no recibe 404 y puede pintar algo real.
     const progress = Number.isFinite(Number(job.progress)) ? Number(job.progress) : 0;
@@ -1717,6 +1796,8 @@ app.get("/jobs/:id/log", async (req, res) => {
 app.get("/jobs/:id/download", async (req, res) => {
   try {
     const { id } = req.params;
+
+    await ensureDownloadCleanupColumns();
 
     const { rows } = await pool.query(
       `select id,
@@ -1738,7 +1819,7 @@ app.get("/jobs/:id/download", async (req, res) => {
       return res.status(410).json({
         ok: false,
         error: "outputs_not_available",
-        message: "Los archivos de este trabajo ya no estan disponibles en el VPS. Contacte con soporte para recuperarlos."
+        message: "Este trabajo no esta disponible para descarga directa. Contacte con soporte para recuperarlo."
       });
     }
 
@@ -1759,6 +1840,9 @@ app.get("/jobs/:id/download", async (req, res) => {
       }
 
       try {
+        // Guardamos resumen/log/listado de outputs ANTES de borrar los archivos del VPS.
+        await saveArchivedJobSummary(id);
+
         const cleanup = cleanupJobStorage(id, { input: true, output: true });
         console.log("Cleanup tras descarga completada:", id, cleanup);
         await markDownloadCompletedAndPurged(id, cleanup);
