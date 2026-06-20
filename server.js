@@ -379,7 +379,7 @@ async function markDownloadCompletedAndPurged(jobId, cleanup) {
               output_purged_at = case when $2 then coalesce(output_purged_at, now()) else output_purged_at end,
               storage_purged_at = case when $3 then coalesce(storage_purged_at, now()) else storage_purged_at end,
               message = case
-                when status in ('done', 'completed') then 'Descargado. No disponible para descarga directa.'
+                when status in ('done', 'completed') then 'Descargado. Archivos eliminados del servidor.'
                 else message
               end,
               updated_at = now()
@@ -1718,11 +1718,6 @@ app.get("/jobs/:id/download", async (req, res) => {
   try {
     const { id } = req.params;
 
-    // IMPORTANTE:
-    // En instalaciones existentes estas columnas pueden no existir todavia.
-    // Si las consultamos antes de crearlas, PostgreSQL devuelve error y la descarga falla.
-    await ensureDownloadCleanupColumns();
-
     const { rows } = await pool.query(
       `select id,
               status,
@@ -1743,7 +1738,7 @@ app.get("/jobs/:id/download", async (req, res) => {
       return res.status(410).json({
         ok: false,
         error: "outputs_not_available",
-        message: "Este trabajo no esta disponible para descarga directa. Contacte con soporte para recuperarlo."
+        message: "Los archivos de este trabajo ya no estan disponibles en el VPS. Contacte con soporte para recuperarlos."
       });
     }
 
@@ -1778,6 +1773,54 @@ app.get("/jobs/:id/download", async (req, res) => {
   }
 });
 
+
+
+async function ensureRecoveryRequestTable() {
+  await pool.query(`
+    create table if not exists job_recovery_requests (
+      id uuid primary key default gen_random_uuid(),
+      job_id uuid not null,
+      user_name text,
+      user_email text,
+      message text,
+      support_email text not null default 'soportetams@intelsi.es',
+      status text not null default 'pending',
+      created_at timestamptz not null default now()
+    )
+  `);
+}
+
+app.post("/jobs/:id/recovery-request", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const body = req.body || {};
+
+    await ensureRecoveryRequestTable();
+
+    const userName = String(body.user || body.user_name || "").trim();
+    const userEmail = String(body.email || body.user_email || "").trim();
+    const message = String(body.message || "").trim();
+
+    await pool.query(
+      `insert into job_recovery_requests
+        (job_id, user_name, user_email, message, support_email, status)
+       values ($1, $2, $3, $4, 'soportetams@intelsi.es', 'pending')`,
+      [id, userName, userEmail, message]
+    );
+
+    return res.json({
+      ok: true,
+      message: "Petición enviada correctamente. En breve le enviaremos al correo el enlace de descarga."
+    });
+  } catch (e) {
+    console.error("recovery request error", e);
+    return res.status(500).json({
+      ok: false,
+      error: "recovery_request_error",
+      message: "No se pudo enviar la solicitud de recuperación."
+    });
+  }
+});
 
 app.post("/jobs/:id/cancel", requireAdmin, async (req, res) => {
   try {
