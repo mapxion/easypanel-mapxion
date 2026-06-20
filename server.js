@@ -309,11 +309,88 @@ function safeRemoveDir(dir) {
 }
 
 function cleanupJobStorage(jobId, opts = { input: true, output: true }) {
-  const result = { inputRemoved: false, outputRemoved: false };
+  const result = {
+    inputRemoved: false,
+    outputRemoved: false,
+    jobDirRemovedIfEmpty: false
+  };
+
   if (opts.input) result.inputRemoved = safeRemoveDir(inputDir(jobId));
   if (opts.output) result.outputRemoved = safeRemoveDir(outputDir(jobId));
+
+  // Si ya no queda nada dentro de /jobs/{id}, eliminamos tambien la carpeta raiz del job.
+  // Esto deja el VPS limpio y conserva solo el registro en PostgreSQL.
+  try {
+    const root = jobDir(jobId);
+    if (fs.existsSync(root)) {
+      const remaining = fs.readdirSync(root).filter(Boolean);
+      if (!remaining.length) {
+        result.jobDirRemovedIfEmpty = safeRemoveDir(root);
+      }
+    } else {
+      result.jobDirRemovedIfEmpty = true;
+    }
+  } catch (e) {
+    console.error("No se pudo comprobar carpeta raiz del job:", jobId, e?.message || e);
+  }
+
   return result;
 }
+
+async function ensureDownloadCleanupColumns() {
+  // Columnas ligeras para saber que el cliente ya descargó y que el VPS fue limpiado.
+  // IF NOT EXISTS evita romper instalaciones donde ya existan.
+  await pool.query(`
+    alter table jobs
+      add column if not exists download_started_at timestamptz,
+      add column if not exists download_completed_at timestamptz,
+      add column if not exists download_count integer not null default 0,
+      add column if not exists download_verified boolean not null default false,
+      add column if not exists output_purged boolean not null default false,
+      add column if not exists output_purged_at timestamptz,
+      add column if not exists storage_purged_at timestamptz
+  `);
+}
+
+async function markDownloadStarted(jobId) {
+  try {
+    await ensureDownloadCleanupColumns();
+    await pool.query(
+      `update jobs
+          set download_started_at = coalesce(download_started_at, now()),
+              updated_at = now()
+        where id = $1`,
+      [jobId]
+    );
+  } catch (e) {
+    console.error("No se pudo marcar inicio de descarga:", jobId, e?.message || e);
+  }
+}
+
+async function markDownloadCompletedAndPurged(jobId, cleanup) {
+  try {
+    await ensureDownloadCleanupColumns();
+    await pool.query(
+      `update jobs
+          set download_completed_at = now(),
+              download_count = coalesce(download_count, 0) + 1,
+              download_verified = true,
+              output_purged = $2,
+              output_purged_at = case when $2 then coalesce(output_purged_at, now()) else output_purged_at end,
+              storage_purged_at = case when $3 then coalesce(storage_purged_at, now()) else storage_purged_at end,
+              message = case
+                when status in ('done', 'completed') then 'Descargado. Archivos eliminados del servidor.'
+                else message
+              end,
+              updated_at = now()
+        where id = $1`,
+      [jobId, !!cleanup?.outputRemoved, !!cleanup?.jobDirRemovedIfEmpty]
+    );
+  } catch (e) {
+    console.error("No se pudo marcar descarga completada/purgada:", jobId, e?.message || e);
+  }
+}
+
 
 // ✅ helper: lista SOLO imágenes (evita mezclar txt, etc.)
 function listInputImages(jobId) {
@@ -1642,32 +1719,53 @@ app.get("/jobs/:id/download", async (req, res) => {
     const { id } = req.params;
 
     const { rows } = await pool.query(
-      "select id from jobs where id = $1",
+      `select id,
+              status,
+              coalesce(download_verified, false) as download_verified,
+              coalesce(output_purged, false) as output_purged
+         from jobs
+        where id = $1`,
       [id]
     );
 
-    if (!rows.length)
+    if (!rows.length) {
       return res.status(404).json({ error: "job not found" });
+    }
 
     const zipPath = path.join(outputDir(id), "outputs.zip");
 
     if (!fs.existsSync(zipPath)) {
-      return res.status(404).json({ error: "outputs.zip not found" });
+      return res.status(410).json({
+        ok: false,
+        error: "outputs_not_available",
+        message: "Los archivos de este trabajo ya no estan disponibles en el VPS. Contacte con soporte para recuperarlos."
+      });
     }
 
     const stat = fs.statSync(zipPath);
 
+    await markDownloadStarted(id);
+
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Content-Length", stat.size);
+    res.setHeader("Cache-Control", "no-store");
 
-    res.on("finish", () => {
-      if (res.statusCode >= 200 && res.statusCode < 300) {
+    // res.download(callback) se ejecuta cuando Express termina el envio o si hay error.
+    // Solo purgamos si no hay error y no se ha cortado la respuesta.
+    return res.download(zipPath, `xproces-${id}.zip`, async (err) => {
+      if (err) {
+        console.error("download transfer error", id, err?.message || err);
+        return;
+      }
+
+      try {
         const cleanup = cleanupJobStorage(id, { input: true, output: true });
-        console.log("Cleanup tras descarga:", id, cleanup);
+        console.log("Cleanup tras descarga completada:", id, cleanup);
+        await markDownloadCompletedAndPurged(id, cleanup);
+      } catch (cleanupError) {
+        console.error("cleanup tras descarga error", id, cleanupError?.message || cleanupError);
       }
     });
-
-    return res.download(zipPath, `xproces-${id}.zip`);
 
   } catch (e) {
     console.error("download error", e);
