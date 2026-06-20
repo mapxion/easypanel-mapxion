@@ -379,7 +379,7 @@ async function markDownloadCompletedAndPurged(jobId, cleanup) {
               output_purged_at = case when $2 then coalesce(output_purged_at, now()) else output_purged_at end,
               storage_purged_at = case when $3 then coalesce(storage_purged_at, now()) else storage_purged_at end,
               message = case
-                when status in ('done', 'completed') then 'Descargado. Archivos eliminados del servidor.'
+                when status in ('done', 'completed') then 'Descargado. No disponible para descarga directa.'
                 else message
               end,
               updated_at = now()
@@ -1718,6 +1718,11 @@ app.get("/jobs/:id/download", async (req, res) => {
   try {
     const { id } = req.params;
 
+    // IMPORTANTE:
+    // En instalaciones existentes estas columnas pueden no existir todavia.
+    // Si las consultamos antes de crearlas, PostgreSQL devuelve error y la descarga falla.
+    await ensureDownloadCleanupColumns();
+
     const { rows } = await pool.query(
       `select id,
               status,
@@ -1738,7 +1743,7 @@ app.get("/jobs/:id/download", async (req, res) => {
       return res.status(410).json({
         ok: false,
         error: "outputs_not_available",
-        message: "Los archivos de este trabajo ya no estan disponibles en el VPS. Contacte con soporte para recuperarlos."
+        message: "Este trabajo no esta disponible para descarga directa. Contacte con soporte para recuperarlo."
       });
     }
 
