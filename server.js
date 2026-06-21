@@ -1860,7 +1860,16 @@ app.get("/jobs/:id/download", async (req, res) => {
       return res.status(404).json({ error: "job not found" });
     }
 
+    const jobForDownload = rows[0];
     const zipPath = path.join(outputDir(id), "outputs.zip");
+
+    if (String(jobForDownload.status || "").toLowerCase() !== "done") {
+      return res.status(409).json({
+        ok: false,
+        error: "results_not_ready",
+        message: "Los resultados todavía se están subiendo al servidor. Espere a que finalice la entrega."
+      });
+    }
 
     if (!fs.existsSync(zipPath)) {
       return res.status(410).json({
@@ -2082,8 +2091,43 @@ app.patch("/jobs/:id", async (req, res) => {
     const currentStatus = String(currentJob.status || "").toLowerCase();
     const currentStage = normalizeProcessingStage(currentJob.stage);
     const currentProgress = Number(currentJob.progress || 0);
-    const incomingStatus = status === undefined ? null : String(status || "").toLowerCase();
-    const nextStage = inferProcessingStage({ status: incomingStatus || currentStatus, stage, progress: p, message });
+
+    let nextStatusParam = status ?? null;
+    let nextProgressParam = p;
+    let nextMessageParam = message ?? null;
+    let nextStageInput = stage;
+
+    const zipPathForJob = path.join(outputDir(id), "outputs.zip");
+    let zipReadyForClient = false;
+    try {
+      zipReadyForClient = fs.existsSync(zipPathForJob) && fs.statSync(zipPathForJob).size > 0;
+    } catch (_) {
+      zipReadyForClient = false;
+    }
+
+    let incomingStatus = nextStatusParam === null ? null : String(nextStatusParam || "").toLowerCase();
+    const msgForGuard = String(nextMessageParam || "").toLowerCase();
+
+    // El procesado local puede terminar antes de que el ZIP esté subido al servidor.
+    // No se permite status done ni botón de descarga hasta que outputs.zip exista en el VPS.
+    if (incomingStatus === "done" && !zipReadyForClient) {
+      nextStatusParam = "running";
+      nextStageInput = "export";
+      nextProgressParam = 99;
+      nextMessageParam = "Subiendo ZIP final al servidor";
+      incomingStatus = "running";
+    } else if (
+      zipReadyForClient &&
+      (incomingStatus === "done" || (Number(nextProgressParam) >= 99 && /subiendo zip|zip final|outputs\.zip|subiendo resultados/i.test(msgForGuard)))
+    ) {
+      nextStatusParam = "done";
+      nextStageInput = "final";
+      nextProgressParam = 100;
+      nextMessageParam = "Trabajo procesado correctamente";
+      incomingStatus = "done";
+    }
+
+    const nextStage = inferProcessingStage({ status: incomingStatus || currentStatus, stage: nextStageInput, progress: nextProgressParam, message: nextMessageParam });
     const terminalStatus = incomingStatus && ["done", "failed", "cancelled"].includes(incomingStatus);
 
     if (currentStatus === "cancelled") {
@@ -2155,10 +2199,10 @@ app.patch("/jobs/:id", async (req, res) => {
        returning *`,
       [
         id,
-        status ?? null,
+        nextStatusParam,
         nextStage ?? null,
-        p,
-        message ?? null,
+        nextProgressParam,
+        nextMessageParam,
         error ?? null,
         download_seconds ?? null,
         processing_seconds ?? null,
