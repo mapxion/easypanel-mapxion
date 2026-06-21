@@ -1126,6 +1126,8 @@ const outputMode = stripNullCharsDeep(req.body?.output_mode || null);
 const projectType = String(req.body?.project_type || exifSummaryRaw?._xproces?.project_type || "fotogrametria").toLowerCase();
 const tamsExport = !!req.body?.tams_export || projectType === "tams";
 const qualityMode = normalizeQualityMode(req.body?.quality_mode);
+const expectedPhotosCount = Number(req.body?.expected_photos_count || exifSummaryRaw?._xproces?.totalPhotos || 0) || 0;
+const expectedTotalBytes = Number(req.body?.expected_total_bytes || exifSummaryRaw?._xproces?.totalBytes || 0) || 0;
 
 const exifSummary = stripNullCharsDeep({
   ...(exifSummaryRaw || {}),
@@ -1156,7 +1158,9 @@ const exifSummary = stripNullCharsDeep({
     quality_mode:
       qualityMode ??
       exifSummaryRaw?._xproces?.quality_mode ??
-      "normal" 
+      "normal",
+    totalPhotos: expectedPhotosCount,
+    totalBytes: expectedTotalBytes
   }
 });
 
@@ -1251,8 +1255,8 @@ app.post("/jobs/:id/submit", async (req, res) => {
     const { id } = req.params;
 
     const selectJobSql = jobsHasQualityMode
-      ? "select id, status, quality_mode, exif_summary from jobs where id = $1"
-      : "select id, status, exif_summary from jobs where id = $1";
+      ? "select id, status, photos_count, quality_mode, exif_summary from jobs where id = $1"
+      : "select id, status, photos_count, exif_summary from jobs where id = $1";
 
     const { rows } = await pool.query(selectJobSql, [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
@@ -1306,6 +1310,33 @@ app.post("/jobs/:id/submit", async (req, res) => {
 
     const photosCount = inputs.length;
     const inputTotalBytes = getInputTotalBytes(id);
+    const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || 0;
+
+    if (expectedPhotos > 0 && photosCount !== expectedPhotos) {
+      const message = `Subida incompleta: esperadas ${expectedPhotos} fotos, recibidas ${photosCount}. El procesado no se iniciará.`;
+      await pool.query(
+        `update jobs
+           set status='failed',
+               stage='failed',
+               progress=100,
+               photos_count=$2,
+               input_total_bytes=$3,
+               message=$4,
+               error=$5,
+               updated_at=now(),
+               finished_at=now()
+         where id=$1`,
+        [id, photosCount, inputTotalBytes, message, 'upload_incomplete']
+      );
+      return res.status(409).json({
+        ok: false,
+        error: 'upload_incomplete',
+        message,
+        realCount: photosCount,
+        expectedPhotos
+      });
+    }
+
     const projectType = String(job.exif_summary?._xproces?.project_type || "fotogrametria").toLowerCase();
     const outputsRequested = Array.isArray(job.exif_summary?._xproces?.outputs_requested) ? job.exif_summary._xproces.outputs_requested : [];
     const tamsExport = !!job.exif_summary?._xproces?.tams_export || projectType === "tams";
@@ -1556,16 +1587,32 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
     const serverFiles = listInputImages(id);
     const realCount = serverFiles.length;
     const realBytes = getInputTotalBytes(id);
-    const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || Number(job.photos_count || 0) || 0;
-    const expectedBytes = 0;
+    const expectedPhotos = Number(req.body?.expected_photos_count || job.exif_summary?._xproces?.totalPhotos || 0) || Number(job.photos_count || 0) || 0;
+    const expectedBytes = Number(req.body?.expected_total_bytes || job.exif_summary?._xproces?.totalBytes || 0) || 0;
     const projectType = String(job.exif_summary?._xproces?.project_type || "fotogrametria").toLowerCase();
     const isTams = projectType === "tams" || !!job.exif_summary?._xproces?.tams_export;
 
-    if (expectedPhotos > 0 && realCount < expectedPhotos) {
-      return res.json({
+    if (expectedPhotos > 0 && realCount !== expectedPhotos) {
+      const message = `Subida incompleta: esperadas ${expectedPhotos} fotos, recibidas ${realCount}. El procesado no se iniciará.`;
+      await pool.query(
+        `update jobs
+           set status='failed',
+               stage='failed',
+               progress=100,
+               photos_count=$2,
+               input_total_bytes=$3,
+               message=$4,
+               error='upload_incomplete',
+               updated_at=now(),
+               finished_at=now()
+         where id=$1`,
+        [id, realCount, realBytes, message]
+      );
+      return res.status(409).json({
         ok: false,
         ready: false,
         error: "upload_incomplete",
+        message,
         realCount,
         expectedPhotos,
         realBytes,
@@ -2233,8 +2280,8 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
         await pool.query(
           `update jobs
              set status = 'failed',
-                 message = 'Subida incompleta',
-                 error = 'La subida se interrumpió antes de completarse',
+                 message = 'Subida incompleta: faltan fotografías',
+                 error = 'upload_incomplete',
                  finished_at = now(),
                  total_seconds = greatest(0, extract(epoch from (now() - created_at))::int),
                  updated_at = now()
