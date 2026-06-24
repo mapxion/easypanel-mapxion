@@ -1312,7 +1312,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
     const inputTotalBytes = getInputTotalBytes(id);
     const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || 0;
 
-    if (expectedPhotos > 0 && photosCount !== expectedPhotos) {
+    if (expectedPhotos > 0 && photosCount < expectedPhotos) {
       const message = `Subida incompleta: esperadas ${expectedPhotos} fotos, recibidas ${photosCount}. El procesado no se iniciará.`;
       await pool.query(
         `update jobs
@@ -1592,26 +1592,24 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
     const projectType = String(job.exif_summary?._xproces?.project_type || "fotogrametria").toLowerCase();
     const isTams = projectType === "tams" || !!job.exif_summary?._xproces?.tams_export;
 
-    if (expectedPhotos > 0 && realCount !== expectedPhotos) {
-      const message = `Subida incompleta: esperadas ${expectedPhotos} fotos, recibidas ${realCount}. El procesado no se iniciará.`;
+    if (expectedPhotos > 0 && realCount < expectedPhotos) {
+      const message = `Subida incompleta: esperadas ${expectedPhotos} fotos, recibidas ${realCount}. Esperando a que terminen de llegar todos los archivos.`;
       await pool.query(
         `update jobs
-           set status='failed',
-               stage='failed',
-               progress=100,
+           set status='receiving',
+               stage='upload_waiting',
                photos_count=$2,
                input_total_bytes=$3,
                message=$4,
-               error='upload_incomplete',
-               updated_at=now(),
-               finished_at=now()
+               error=null,
+               updated_at=now()
          where id=$1`,
         [id, realCount, realBytes, message]
       );
-      return res.status(409).json({
-        ok: false,
+      return res.status(202).json({
+        ok: true,
         ready: false,
-        error: "upload_incomplete",
+        error: "upload_waiting",
         message,
         realCount,
         expectedPhotos,
@@ -1622,18 +1620,19 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
 
     const nextStatus = isLockedStatus(job.status)
       ? job.status
-      : "queued";
+      : "receiving";
 
-    const nextMessage = nextStatus === "queued" ? "En cola para procesado" : job.status;
+    const nextMessage = nextStatus === "receiving" ? "Subida verificada" : job.status;
 
-    if (nextStatus === "queued") {
+    if (nextStatus === "receiving") {
       await pool.query(
         `update jobs
-           set status = 'queued',
-               stage = 'queued',
+           set status = 'receiving',
+               stage = 'upload_complete',
                photos_count = $1,
                input_total_bytes = $2,
                message = $3,
+               error = null,
                updated_at = now()
          where id = $4`,
         [realCount, realBytes, nextMessage, id]
