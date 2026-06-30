@@ -275,6 +275,16 @@ const jobDir = (jobId) => path.join(DATA_ROOT, "jobs", jobId);
 const inputDir = (jobId) => path.join(jobDir(jobId), "input");
 const outputDir = (jobId) => path.join(jobDir(jobId), "output");
 
+// XPROCES LIVE VIEWPORT: imagen en tiempo real del visor de Metashape.
+// Se guarda siempre una sola imagen por job: jobs/<id>/live/latest.jpg
+const liveDir = (jobId) => path.join(jobDir(jobId), "live");
+const liveImagePath = (jobId) => path.join(liveDir(jobId), "latest.jpg");
+const liveMetaPath = (jobId) => path.join(liveDir(jobId), "latest.json");
+
+function ensureLiveDir(jobId) {
+  fs.mkdirSync(liveDir(jobId), { recursive: true });
+}
+
 function ensureJobDirs(jobId) {
   fs.mkdirSync(inputDir(jobId), { recursive: true });
   fs.mkdirSync(outputDir(jobId), { recursive: true });
@@ -566,6 +576,12 @@ const outputStorage = multer.diskStorage({
 const uploadOutput = multer({
   storage: outputStorage,
   limits: { fileSize: 5 * 1024 * 1024 * 1024 }, // 5GB
+});
+
+// XPROCES LIVE VIEWPORT: upload pequeño en memoria, no crea históricos.
+const uploadLive = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 3 * 1024 * 1024 }, // 3MB por captura
 });
 
 // =====================
@@ -1729,6 +1745,124 @@ app.get("/jobs/:id/input.zip", async (req, res) => {
   } catch (e) {
     console.error("input.zip error", e);
     res.status(500).json({ error: "input.zip error" });
+  }
+});
+
+
+// =====================
+// XPROCES LIVE VIEWPORT
+// =====================
+// Worker Windows: sube una captura del visor de Metashape.
+// IMPORTANTE: se sobrescribe siempre latest.jpg, así no se llena el servidor.
+app.post("/worker/jobs/:id/live", requireWorkerAuth, uploadLive.single("image"), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ ok: false, error: "invalid_job_id" });
+    }
+
+    if (!req.file || !req.file.buffer || !req.file.buffer.length) {
+      return res.status(400).json({ ok: false, error: "missing_image_field" });
+    }
+
+    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: "job_not_found" });
+    }
+
+    ensureLiveDir(id);
+
+    const mime = String(req.file.mimetype || "").toLowerCase();
+    if (mime && !["image/jpeg", "image/jpg", "image/png"].includes(mime)) {
+      return res.status(415).json({ ok: false, error: "unsupported_image_type" });
+    }
+
+    const finalPath = liveImagePath(id);
+    const tmpPath = path.join(liveDir(id), `latest.${Date.now()}.tmp`);
+
+    fs.writeFileSync(tmpPath, req.file.buffer);
+    fs.renameSync(tmpPath, finalPath);
+
+    const now = new Date().toISOString();
+    const meta = {
+      ok: true,
+      jobId: id,
+      filename: "latest.jpg",
+      size: req.file.size,
+      mimetype: req.file.mimetype || "image/jpeg",
+      updatedAt: now,
+    };
+
+    fs.writeFileSync(liveMetaPath(id), JSON.stringify(meta, null, 2), "utf-8");
+
+    return res.json(meta);
+  } catch (e) {
+    console.error("live viewport upload error", e);
+    return res.status(500).json({ ok: false, error: "live_viewport_upload_error" });
+  }
+});
+
+// Web: consulta si existe captura live y cuándo se actualizó.
+app.get("/jobs/:id/live", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ ok: false, error: "invalid_job_id" });
+    }
+
+    const file = liveImagePath(id);
+    if (!fs.existsSync(file)) {
+      return res.json({ ok: true, exists: false });
+    }
+
+    let meta = null;
+    const metaFile = liveMetaPath(id);
+    if (fs.existsSync(metaFile)) {
+      try {
+        meta = JSON.parse(fs.readFileSync(metaFile, "utf-8"));
+      } catch (_) {
+        meta = null;
+      }
+    }
+
+    const stat = fs.statSync(file);
+    return res.json({
+      ok: true,
+      exists: true,
+      url: `/jobs/${id}/live.jpg`,
+      updatedAt: meta?.updatedAt || stat.mtime.toISOString(),
+      size: stat.size,
+    });
+  } catch (e) {
+    console.error("live viewport status error", e);
+    return res.status(500).json({ ok: false, error: "live_viewport_status_error" });
+  }
+});
+
+// Web: imagen actual del proceso. Usar ?t=Date.now() para evitar caché del navegador.
+app.get("/jobs/:id/live.jpg", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidUuid(id)) {
+      return res.status(400).send("invalid job id");
+    }
+
+    const file = liveImagePath(id);
+    if (!fs.existsSync(file)) {
+      return res.status(404).send("live image not available");
+    }
+
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.type("jpg");
+    return res.sendFile(file);
+  } catch (e) {
+    console.error("live viewport image error", e);
+    return res.status(500).send("live image error");
   }
 });
 
