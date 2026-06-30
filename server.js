@@ -215,7 +215,8 @@ function generateInviteCode() {
 }
 
 function requireWorkerAuth(req, res, next) {
-  const auth = req.headers.authorization || "";
+  const auth = String(req.headers.authorization || "").trim();
+  const workerHeader = String(req.headers["x-worker-token"] || "").trim();
 
   if (!WORKER_TOKEN) {
     return res
@@ -223,7 +224,11 @@ function requireWorkerAuth(req, res, next) {
       .json({ ok: false, error: "WORKER_TOKEN not configured" });
   }
 
-  if (auth !== `Bearer ${WORKER_TOKEN}`) {
+  const expectedBearer = `Bearer ${WORKER_TOKEN}`;
+
+  // Mantiene la autenticacion existente del worker: Authorization: Bearer <token>.
+  // Tambien acepta x-worker-token para pruebas manuales con curl sin tocar el flujo real.
+  if (auth !== expectedBearer && workerHeader !== WORKER_TOKEN) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
   }
 
@@ -283,6 +288,21 @@ const liveMetaPath = (jobId) => path.join(liveDir(jobId), "latest.json");
 
 function ensureLiveDir(jobId) {
   fs.mkdirSync(liveDir(jobId), { recursive: true });
+}
+
+function getPublicApiBase(req) {
+  const configured = String(process.env.PUBLIC_API_BASE || "").trim().replace(/\/+$/, "");
+  if (configured) return configured;
+
+  const host = req.get("host");
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+  let proto = forwardedProto || req.protocol || "https";
+
+  // En produccion Easypanel/nginx puede hablar con Node por http internamente,
+  // pero el navegador debe recibir https para evitar mixed content.
+  if (host && /xproces\.com$/i.test(host)) proto = "https";
+
+  return `${proto}://${host}`;
 }
 
 function ensureJobDirs(jobId) {
@@ -1831,7 +1851,8 @@ app.get("/jobs/:id/live", async (req, res) => {
     return res.json({
       ok: true,
       exists: true,
-      url: `/jobs/${id}/live.jpg`,
+      url: `${getPublicApiBase(req)}/jobs/${id}/live.jpg`,
+      relativeUrl: `/jobs/${id}/live.jpg`,
       updatedAt: meta?.updatedAt || stat.mtime.toISOString(),
       size: stat.size,
     });
