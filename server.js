@@ -71,7 +71,7 @@ function normalizeQualityMode(value) {
   if (!raw) return "normal";
   if (["rapido", "rápido", "fast"].includes(raw)) return "fast";
   if (["normal", "standard", "estandar", "estándar"].includes(raw)) return "normal";
-  if (["max", "maximum", "maxima", "máxima", "maxima calidad", "máxima calidad", "maxima_calidad", "máxima_calidad", "maximum_quality", "ultra", "high", "highest", "best"].includes(raw)) return "max";
+  if (["full", "max", "maximum", "maxima", "máxima", "maxima calidad", "máxima calidad", "maxima_calidad", "máxima_calidad", "maximum_quality", "ultra", "high", "highest", "best"].includes(raw)) return "full";
 
   return "normal";
 }
@@ -79,21 +79,21 @@ function normalizeQualityMode(value) {
 function getQualityModeLabel(mode) {
   const normalized = normalizeQualityMode(mode);
   if (normalized === "fast") return "Rápido";
-  if (normalized === "max") return "Máxima calidad";
+  if (normalized === "full") return "Máxima calidad";
   return "Normal";
 }
 
 function getQualityModeTimeFactor(mode) {
   const normalized = normalizeQualityMode(mode);
   if (normalized === "fast") return 0.65;
-  if (normalized === "max") return 2.2;
+  if (normalized === "full") return 2.2;
   return 1;
 }
 
 function getQualityModePriceFactor(mode) {
   const normalized = normalizeQualityMode(mode);
   if (normalized === "fast") return 0.85;
-  if (normalized === "max") return 1.75;
+  if (normalized === "full") return 1.75;
   return 1;
 }
 
@@ -532,7 +532,7 @@ function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qua
   else if (photos > 500) price += 20;
   else if (photos > 100) price += 10;
 
-  if (qualityMode === "max") price += 20;
+  if (qualityMode === "full") price += 20;
 
   const extras = {
     dem_tif: 10,       // DSM
