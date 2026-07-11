@@ -588,9 +588,7 @@ const outputStorage = multer.diskStorage({
     cb(null, outputDir(id));
   },
   filename: (_req, _file, cb) => {
-    // El resto del servidor (descarga y validacion de estado) busca siempre outputs.zip.
-    // El worker puede enviar resultado.zip o un nombre personalizado, pero en el VPS
-    // debe guardarse con este nombre canonico.
+    // Nombre interno fijo: toda la lógica de validación y descarga espera outputs.zip.
     cb(null, "outputs.zip");
   },
 });
