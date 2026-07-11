@@ -1609,6 +1609,132 @@ app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
   }
 });
 
+
+function validateUploadedImageFile(filePath) {
+  const filename = path.basename(filePath);
+  const ext = path.extname(filename).toLowerCase();
+
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch (e) {
+    return {
+      ok: false,
+      filename,
+      reason: "file_unreadable",
+      message: "No se puede leer el archivo en el servidor."
+    };
+  }
+
+  if (!stat.isFile()) {
+    return {
+      ok: false,
+      filename,
+      reason: "not_a_file",
+      message: "La entrada recibida no es un archivo válido."
+    };
+  }
+
+  if (stat.size <= 0) {
+    return {
+      ok: false,
+      filename,
+      reason: "empty_file",
+      message: "El archivo está vacío."
+    };
+  }
+
+  // Para JPEG exigimos cabecera SOI y marcador EOI.
+  // El EOI se busca en los últimos 64 KiB para tolerar metadatos residuales.
+  if (ext === ".jpg" || ext === ".jpeg") {
+    if (stat.size < 1024) {
+      return {
+        ok: false,
+        filename,
+        reason: "jpeg_too_small",
+        message: "El JPG es demasiado pequeño para ser una fotografía válida."
+      };
+    }
+
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const head = Buffer.alloc(2);
+      const headRead = fs.readSync(fd, head, 0, 2, 0);
+
+      if (headRead !== 2 || head[0] !== 0xff || head[1] !== 0xd8) {
+        return {
+          ok: false,
+          filename,
+          reason: "jpeg_missing_soi",
+          message: "El JPG no contiene una cabecera JPEG válida."
+        };
+      }
+
+      const tailLength = Math.min(stat.size, 64 * 1024);
+      const tail = Buffer.alloc(tailLength);
+      const tailRead = fs.readSync(fd, tail, 0, tailLength, stat.size - tailLength);
+
+      let hasEoi = false;
+      for (let i = tailRead - 2; i >= 0; i -= 1) {
+        if (tail[i] === 0xff && tail[i + 1] === 0xd9) {
+          hasEoi = true;
+          break;
+        }
+      }
+
+      if (!hasEoi) {
+        return {
+          ok: false,
+          filename,
+          reason: "jpeg_missing_eoi",
+          message: "El JPG está incompleto o truncado: falta el final JPEG."
+        };
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  return {
+    ok: true,
+    filename,
+    size: stat.size
+  };
+}
+
+function validateUploadedJobImages(jobId) {
+  const dir = inputDir(jobId);
+  const files = listInputImages(jobId);
+  const validFiles = [];
+  const invalidFiles = [];
+
+  for (const filename of files) {
+    const filePath = path.join(dir, filename);
+    const result = validateUploadedImageFile(filePath);
+
+    if (result.ok) {
+      validFiles.push(result);
+      continue;
+    }
+
+    invalidFiles.push(result);
+
+    // No conservar en el servidor archivos detectados como corruptos.
+    try {
+      fs.unlinkSync(filePath);
+    } catch (e) {
+      console.error("No se pudo eliminar archivo inválido", filePath, e);
+    }
+  }
+
+  return {
+    validFiles,
+    invalidFiles,
+    validCount: validFiles.length,
+    validBytes: validFiles.reduce((sum, item) => sum + Number(item.size || 0), 0)
+  };
+}
+
 app.post("/jobs/:id/complete-upload", async (req, res) => {
   try {
     const { id } = req.params;
@@ -1620,13 +1746,43 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
     if (!rows.length) return res.status(404).json({ ok: false, error: "job not found" });
 
     const job = rows[0];
-    const serverFiles = listInputImages(id);
-    const realCount = serverFiles.length;
-    const realBytes = getInputTotalBytes(id);
+    const validation = validateUploadedJobImages(id);
+    const realCount = validation.validCount;
+    const realBytes = validation.validBytes;
     const expectedPhotos = Number(req.body?.expected_photos_count || job.exif_summary?._xproces?.totalPhotos || 0) || Number(job.photos_count || 0) || 0;
     const expectedBytes = Number(req.body?.expected_total_bytes || job.exif_summary?._xproces?.totalBytes || 0) || 0;
     const projectType = String(job.exif_summary?._xproces?.project_type || "fotogrametria").toLowerCase();
     const isTams = projectType === "tams" || !!job.exif_summary?._xproces?.tams_export;
+
+    if (validation.invalidFiles.length > 0) {
+      const invalidNames = validation.invalidFiles.map((item) => item.filename);
+      const message = `Subida inválida: ${invalidNames.length} archivo(s) corrupto(s) o incompleto(s): ${invalidNames.join(", ")}. Se han eliminado del servidor y deben subirse de nuevo.`;
+
+      await pool.query(
+        `update jobs
+           set status='receiving',
+               stage='upload_invalid',
+               photos_count=$2,
+               input_total_bytes=$3,
+               message=$4,
+               error=$5,
+               updated_at=now()
+         where id=$1`,
+        [id, realCount, realBytes, message, JSON.stringify(validation.invalidFiles)]
+      );
+
+      return res.status(422).json({
+        ok: false,
+        ready: false,
+        error: "invalid_uploaded_files",
+        message,
+        invalidFiles: validation.invalidFiles,
+        realCount,
+        expectedPhotos,
+        realBytes,
+        expectedBytes
+      });
+    }
 
     if (expectedPhotos > 0 && realCount < expectedPhotos) {
       const message = `Subida incompleta: esperadas ${expectedPhotos} fotos, recibidas ${realCount}. Esperando a que terminen de llegar todos los archivos.`;
@@ -1646,6 +1802,34 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
         ok: true,
         ready: false,
         error: "upload_waiting",
+        message,
+        realCount,
+        expectedPhotos,
+        realBytes,
+        expectedBytes
+      });
+    }
+
+    if (expectedBytes > 0 && realBytes !== expectedBytes) {
+      const message = `Subida incompleta o alterada: esperados ${expectedBytes} bytes y recibidos ${realBytes}. El trabajo no se enviará a procesado.`;
+
+      await pool.query(
+        `update jobs
+           set status='receiving',
+               stage='upload_bytes_mismatch',
+               photos_count=$2,
+               input_total_bytes=$3,
+               message=$4,
+               error=$5,
+               updated_at=now()
+         where id=$1`,
+        [id, realCount, realBytes, message, "upload_bytes_mismatch"]
+      );
+
+      return res.status(409).json({
+        ok: false,
+        ready: false,
+        error: "upload_bytes_mismatch",
         message,
         realCount,
         expectedPhotos,
