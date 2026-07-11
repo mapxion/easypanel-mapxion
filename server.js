@@ -689,7 +689,10 @@ app.post("/pricing/preview", async (req, res) => {
 
     const photosCount = Number(req.body?.photos_count || 0);
     const totalBytes = Number(req.body?.total_bytes || 0);
-    const qualityMode = normalizeQualityMode(req.body?.quality_mode);
+    console.log("[XPROCES QUALITY] BODY:", req.body);
+console.log("[XPROCES QUALITY] RAW:", req.body?.quality_mode);
+const qualityMode = normalizeQualityMode(req.body?.quality_mode);
+console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
     const outputsRequested = Array.isArray(req.body?.outputs_requested) ? req.body.outputs_requested : [];
     const projectType = String(req.body?.project_type || req.body?.xproces_meta?.project_type || "fotogrametria").toLowerCase();
     const tamsExport = !!req.body?.tams_export || projectType === "tams";
@@ -1161,7 +1164,10 @@ const presetKey = stripNullCharsDeep(req.body?.preset_key || null);
 const outputMode = stripNullCharsDeep(req.body?.output_mode || null);
 const projectType = String(req.body?.project_type || exifSummaryRaw?._xproces?.project_type || "fotogrametria").toLowerCase();
 const tamsExport = !!req.body?.tams_export || projectType === "tams";
+console.log("[XPROCES QUALITY] BODY:", req.body);
+console.log("[XPROCES QUALITY] RAW:", req.body?.quality_mode);
 const qualityMode = normalizeQualityMode(req.body?.quality_mode);
+console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
 const expectedPhotosCount = Number(req.body?.expected_photos_count || exifSummaryRaw?._xproces?.totalPhotos || 0) || 0;
 const expectedTotalBytes = Number(req.body?.expected_total_bytes || exifSummaryRaw?._xproces?.totalBytes || 0) || 0;
 
