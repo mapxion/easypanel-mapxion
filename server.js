@@ -519,36 +519,143 @@ function estimateProcessingSecondsFromInputs(photosCount, totalBytes, qualityMod
   );
 }
 
-function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qualityMode = "normal", outputsRequested = [], projectType = "fotogrametria") {
+const XPROCES_PROCESS_PRICES = Object.freeze({
+  alignment: 5,
+  dense_cloud: 5,
+  dsm: 5,
+  ground_classification: 5,
+  dtm: 5,
+  contours: 5,
+  mesh: 5,
+  texture: 5
+});
+
+const XPROCES_PROCESS_LABELS = Object.freeze({
+  alignment: "Orientación de cámaras",
+  dense_cloud: "Nube de puntos",
+  dsm: "Modelo Digital de Superficie",
+  ground_classification: "Clasificación del terreno",
+  dtm: "Modelo Digital del Terreno",
+  contours: "Curvas de nivel",
+  mesh: "Modelo 3D",
+  texture: "Texturizado"
+});
+
+const XPROCES_OUTPUT_PROCESSES = Object.freeze({
+  las: ["alignment", "dense_cloud"],
+  laz: ["alignment", "dense_cloud"],
+  e57: ["alignment", "dense_cloud"],
+  ply: ["alignment", "dense_cloud"],
+  pts: ["alignment", "dense_cloud"],
+
+  orthomosaic_tif: ["alignment", "dense_cloud", "dsm"],
+  orthomosaic_jpg: ["alignment", "dense_cloud", "dsm"],
+  dem_tif: ["alignment", "dense_cloud", "dsm"],
+
+  dtm_tif: ["alignment", "dense_cloud", "ground_classification", "dtm"],
+  contours_dxf: ["alignment", "dense_cloud", "ground_classification", "dtm", "contours"],
+
+  mesh_obj: ["alignment", "dense_cloud", "mesh", "texture"],
+  mesh_fbx: ["alignment", "dense_cloud", "mesh", "texture"],
+  mesh_stl: ["alignment", "dense_cloud", "mesh"],
+  mesh_dae: ["alignment", "dense_cloud", "mesh", "texture"],
+  mesh_3ds: ["alignment", "dense_cloud", "mesh", "texture"],
+  mesh_wrl: ["alignment", "dense_cloud", "mesh", "texture"],
+  mesh_ply: ["alignment", "dense_cloud", "mesh"],
+  mesh_u3d: ["alignment", "dense_cloud", "mesh"],
+  glb: ["alignment", "dense_cloud", "mesh", "texture"],
+  textures: ["alignment", "dense_cloud", "mesh", "texture"],
+  tiled_model: ["alignment", "dense_cloud", "mesh", "texture"],
+
+  // El informe aprovecha el proyecto ya procesado y no añade un proceso técnico.
+  pdf_report: []
+});
+
+function getPhotoPriceSupplement(photosCount) {
   const photos = Number(photosCount || 0);
+  if (photos > 1000) return 40;
+  if (photos > 500) return 20;
+  if (photos > 100) return 10;
+  return 0;
+}
+
+function getQualityPriceSupplement(qualityMode) {
+  return normalizeQualityMode(qualityMode) === "full" ? 20 : 0;
+}
+
+function calculatePricingDetails(
+  photosCount,
+  qualityMode = "normal",
+  outputsRequested = [],
+  projectType = "fotogrametria"
+) {
   const type = String(projectType || "fotogrametria").toLowerCase();
-  const outputs = Array.isArray(outputsRequested) ? outputsRequested.map(String) : [];
 
-  if (type === "tams") return 0;
-
-  let price = 10;
-
-  if (photos > 1000) price += 40;
-  else if (photos > 500) price += 20;
-  else if (photos > 100) price += 10;
-
-  if (qualityMode === "full") price += 20;
-
-  const extras = {
-    dem_tif: 10,       // DSM
-    dtm_tif: 10,       // DTM
-    contours_dxf: 5,   // Curvas de nivel
-    mesh_obj: 10,
-    glb: 10,
-    mesh_fbx: 10,
-    textures: 5
-  };
-
-  for (const output of outputs) {
-    price += extras[output] || 0;
+  if (type === "tams") {
+    return {
+      price: 0,
+      process_subtotal: 0,
+      photos_supplement: 0,
+      quality_supplement: 0,
+      processes: [],
+      outputs_requested: []
+    };
   }
 
-  return Math.max(0, Math.ceil(price));
+  const outputs = [...new Set(
+    (Array.isArray(outputsRequested) ? outputsRequested : [])
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean)
+  )];
+
+  const processKeys = new Set();
+
+  for (const output of outputs) {
+    const required = XPROCES_OUTPUT_PROCESSES[output] || [];
+    for (const processKey of required) processKeys.add(processKey);
+  }
+
+  const processes = [...processKeys].map((key) => ({
+    key,
+    label: XPROCES_PROCESS_LABELS[key] || key,
+    price: Number(XPROCES_PROCESS_PRICES[key] || 0)
+  }));
+
+  const processSubtotal = processes.reduce(
+    (sum, process) => sum + Number(process.price || 0),
+    0
+  );
+
+  const photosSupplement = getPhotoPriceSupplement(photosCount);
+  const qualitySupplement = getQualityPriceSupplement(qualityMode);
+
+  return {
+    price: Math.max(
+      0,
+      Math.ceil(processSubtotal + photosSupplement + qualitySupplement)
+    ),
+    process_subtotal: processSubtotal,
+    photos_supplement: photosSupplement,
+    quality_supplement: qualitySupplement,
+    processes,
+    outputs_requested: outputs
+  };
+}
+
+function calculatePriceFromInputs(
+  photosCount,
+  totalBytes,
+  estimatedSeconds,
+  qualityMode = "normal",
+  outputsRequested = [],
+  projectType = "fotogrametria"
+) {
+  return calculatePricingDetails(
+    photosCount,
+    qualityMode,
+    outputsRequested,
+    projectType
+  ).price;
 }
 
 // ✅ helper: status “bloqueado” (no permitir más uploads)
@@ -710,7 +817,6 @@ app.get("/admin/config", requireAdmin, (_req, res) => {
       api_base: process.env.PUBLIC_API_BASE || "https://api.xproces.com",
       support_email: "soportetams@intelsi.es",
       auto_refresh_seconds: 5,
-      base_price: 10,
       photo_supplements: [
         { range: "0–100 fotos", amount: 0 },
         { range: "101–500 fotos", amount: 10 },
@@ -722,11 +828,12 @@ app.get("/admin/config", requireAdmin, (_req, res) => {
         normal: 0,
         full: 20
       },
-      output_supplements: {
-        dsm: 10,
-        dtm: 10,
-        contours: 5
-      }
+      process_prices: Object.entries(XPROCES_PROCESS_PRICES).map(([key, price]) => ({
+        key,
+        label: XPROCES_PROCESS_LABELS[key] || key,
+        price
+      })),
+      output_processes: XPROCES_OUTPUT_PROCESSES
     }
   });
 });
@@ -791,14 +898,13 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
 
     console.log("PRICING PREVIEW estimatedSeconds:", estimatedSeconds);
 
-    const price = calculatePriceFromInputs(
+    const pricing = calculatePricingDetails(
       photosCount,
-      totalBytes,
-      estimatedSeconds,
       qualityMode,
       outputsRequested,
       projectType
     );
+    const price = pricing.price;
 
     console.log("PRICING PREVIEW price:", price);
 
@@ -810,6 +916,7 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       quality_mode_label: getQualityModeLabel(qualityMode),
       tams_export: tamsExport,
       price,
+      pricing,
       estimated_seconds: estimatedSeconds,
       estimated_human: formatEtaSeconds(estimatedSeconds)
     });
