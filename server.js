@@ -658,6 +658,52 @@ app.get("/admin/jobs", requireAdmin, async (_req, res) => {
   }
 });
 
+
+app.get("/admin/users", requireAdmin, async (_req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      select
+        u.id,
+        u.email,
+        u.name,
+        u.created_at,
+        count(j.id)::int as jobs_count,
+        count(j.id) filter (
+          where lower(coalesce(j.status, '')) in ('done', 'completed')
+        )::int as completed_jobs,
+        count(j.id) filter (
+          where lower(coalesce(j.status, '')) = 'failed'
+        )::int as failed_jobs,
+        coalesce(sum(coalesce(j.photos_count, 0)), 0)::bigint as photos_count,
+        coalesce(sum(
+          case
+            when lower(coalesce(j.status, '')) in ('done', 'completed')
+            then coalesce(j.price, 0)
+            else 0
+          end
+        ), 0) as revenue_total,
+        max(j.created_at) as last_job_at
+      from users u
+      left join jobs j
+        on lower(coalesce(j.client_email, '')) = lower(coalesce(u.email, ''))
+      group by u.id, u.email, u.name, u.created_at
+      order by u.created_at desc
+      limit 1000
+    `);
+
+    res.json({
+      ok: true,
+      users: rows
+    });
+  } catch (e) {
+    console.error("admin users error", e);
+    res.status(500).json({
+      ok: false,
+      error: "admin_users_error"
+    });
+  }
+});
+
 app.get("/version", (_req, res) =>
   res.json({ version: "v40-photos-only-validation" })
 );
