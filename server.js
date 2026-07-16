@@ -685,24 +685,52 @@ app.get("/admin/users", requireAdmin, async (_req, res) => {
         max(j.created_at) as last_job_at
       from users u
       left join jobs j
-        on lower(coalesce(j.client_email, '')) = lower(coalesce(u.email, ''))
+        on lower(trim(coalesce(j.client_email, ''))) =
+           lower(trim(coalesce(u.email, '')))
       group by u.id, u.email, u.name, u.created_at
       order by u.created_at desc
       limit 1000
     `);
 
-    res.json({
-      ok: true,
-      users: rows
-    });
+    res.json({ ok: true, users: rows });
   } catch (e) {
     console.error("admin users error", e);
     res.status(500).json({
       ok: false,
-      error: "admin_users_error"
+      error: "admin_users_error",
+      message: e?.message || "No se pudieron consultar los usuarios"
     });
   }
 });
+
+app.get("/admin/config", requireAdmin, (_req, res) => {
+  res.json({
+    ok: true,
+    config: {
+      api_base: process.env.PUBLIC_API_BASE || "https://api.xproces.com",
+      support_email: "soportetams@intelsi.es",
+      auto_refresh_seconds: 5,
+      base_price: 10,
+      photo_supplements: [
+        { range: "0–100 fotos", amount: 0 },
+        { range: "101–500 fotos", amount: 10 },
+        { range: "501–1000 fotos", amount: 20 },
+        { range: "Más de 1000 fotos", amount: 40 }
+      ],
+      quality_supplements: {
+        fast: 0,
+        normal: 0,
+        full: 20
+      },
+      output_supplements: {
+        dsm: 10,
+        dtm: 10,
+        contours: 5
+      }
+    }
+  });
+});
+
 
 app.get("/version", (_req, res) =>
   res.json({ version: "v40-photos-only-validation" })
