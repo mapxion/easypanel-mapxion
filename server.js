@@ -26,6 +26,64 @@ const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "XprocesAdmin2026!";
 
+// =====================
+// PAYPAL CHECKOUT
+// =====================
+const PAYPAL_CLIENT_ID = String(process.env.PAYPAL_CLIENT_ID || "").trim();
+const PAYPAL_CLIENT_SECRET = String(process.env.PAYPAL_CLIENT_SECRET || "").trim();
+const PAYPAL_ENV = String(process.env.PAYPAL_ENV || "sandbox").trim().toLowerCase() === "live" ? "live" : "sandbox";
+const PAYPAL_CURRENCY = "EUR";
+const PAYPAL_API_BASE = PAYPAL_ENV === "live"
+  ? "https://api-m.paypal.com"
+  : "https://api-m.sandbox.paypal.com";
+
+function paypalIsConfigured() {
+  return !!(PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET);
+}
+
+async function getPayPalAccessToken() {
+  if (!paypalIsConfigured()) {
+    throw new Error("PayPal no está configurado");
+  }
+
+  const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString("base64");
+  const response = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: "grant_type=client_credentials"
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.access_token) {
+    console.error("PayPal OAuth error", response.status, data);
+    throw new Error("No se pudo autenticar con PayPal");
+  }
+  return data.access_token;
+}
+
+async function paypalRequest(pathname, options = {}) {
+  const accessToken = await getPayPalAccessToken();
+  const response = await fetch(`${PAYPAL_API_BASE}${pathname}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data?.message || `PayPal HTTP ${response.status}`);
+    error.status = response.status;
+    error.paypal = data;
+    throw error;
+  }
+  return data;
+}
+
 function requireAdmin(req, res, next) {
   const token =
     req.headers["x-admin-token"] ||
@@ -244,6 +302,7 @@ pool
   .query("select 1")
   .then(async () => {
     console.log("Postgres conectado");
+    await ensurePaymentColumns();
     await refreshSchemaFlags();
   })
   .catch((err) => console.error("Error Postgres", err));
@@ -383,6 +442,50 @@ async function ensureDownloadCleanupColumns() {
       add column if not exists archived_outputs jsonb,
       add column if not exists archived_summary_saved_at timestamptz
   `);
+}
+
+async function ensurePaymentColumns() {
+  await pool.query(`
+    alter table jobs
+      add column if not exists payment_status varchar(30) not null default 'pending',
+      add column if not exists payment_provider varchar(20),
+      add column if not exists payment_order_id varchar(120),
+      add column if not exists payment_capture_id varchar(120),
+      add column if not exists payment_amount numeric(10,2),
+      add column if not exists payment_currency varchar(3) not null default 'EUR',
+      add column if not exists paid_at timestamptz
+  `);
+}
+
+function canUsePaidJob(job) {
+  return ["paid", "exempt"].includes(String(job?.payment_status || "").toLowerCase());
+}
+
+async function requirePaidJobBeforeUpload(req, res, next) {
+  try {
+    await ensurePaymentColumns();
+    const { rows } = await pool.query(
+      `select id, status, payment_status, user_id from jobs where id=$1`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: "job_not_found" });
+    const job = rows[0];
+    const requestUserId = String(req.headers["x-user-id"] || "").trim();
+    if (job.user_id && String(job.user_id) !== requestUserId) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+    if (!canUsePaidJob(job)) {
+      return res.status(402).json({
+        ok: false,
+        error: "payment_required",
+        message: "El pago debe confirmarse antes de subir las fotografías."
+      });
+    }
+    next();
+  } catch (e) {
+    console.error("payment upload guard error", e);
+    res.status(500).json({ ok: false, error: "payment_guard_error" });
+  }
 }
 
 async function markDownloadStarted(jobId) {
@@ -1227,6 +1330,154 @@ app.get("/jobs/:id", async (req, res) => {
   }
 });
 
+// =====================
+// PAYPAL CHECKOUT
+// =====================
+app.get("/paypal/config", (_req, res) => {
+  res.json({
+    ok: true,
+    enabled: paypalIsConfigured(),
+    client_id: PAYPAL_CLIENT_ID || null,
+    currency: PAYPAL_CURRENCY,
+    environment: PAYPAL_ENV
+  });
+});
+
+app.post("/jobs/:id/paypal/create-order", async (req, res) => {
+  try {
+    await ensurePaymentColumns();
+    if (!paypalIsConfigured()) {
+      return res.status(503).json({ ok: false, error: "paypal_not_configured", message: "PayPal no está configurado en el servidor." });
+    }
+
+    const { rows } = await pool.query("select * from jobs where id=$1", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ ok: false, error: "job_not_found" });
+    const job = rows[0];
+    const requestUserId = String(req.headers["x-user-id"] || "").trim();
+    if (job.user_id && String(job.user_id) !== requestUserId) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+    if (String(job.payment_status || "").toLowerCase() === "paid") {
+      return res.json({ ok: true, already_paid: true, order_id: job.payment_order_id, amount: Number(job.payment_amount || job.price || 0), currency: job.payment_currency || PAYPAL_CURRENCY });
+    }
+
+    const meta = job.exif_summary?._xproces || {};
+    const photosCount = Number(meta.totalPhotos || 0) || 0;
+    const totalBytes = Number(meta.totalBytes || 0) || 0;
+    const qualityMode = normalizeQualityMode(job.quality_mode || meta.quality_mode || "normal");
+    const projectType = String(job.project_type || meta.project_type || "fotogrametria").toLowerCase();
+    const outputsRequested = Array.isArray(meta.outputs_requested) ? meta.outputs_requested : [];
+    const estimatedSeconds = await estimateProcessingSecondsFromInputsHistorical(pool, photosCount, totalBytes, qualityMode, projectType === "tams");
+    const price = calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qualityMode, outputsRequested, projectType);
+
+    if (price <= 0) {
+      await pool.query(`update jobs set price=0, payment_status='exempt', payment_provider='none', payment_amount=0, payment_currency=$2, updated_at=now() where id=$1`, [job.id, PAYPAL_CURRENCY]);
+      return res.json({ ok: true, exempt: true, amount: 0, currency: PAYPAL_CURRENCY });
+    }
+
+    const order = await paypalRequest("/v2/checkout/orders", {
+      method: "POST",
+      headers: { "PayPal-Request-Id": `xproces-create-${job.id}-${Date.now()}` },
+      body: JSON.stringify({
+        intent: "CAPTURE",
+        purchase_units: [{
+          custom_id: String(job.id),
+          description: `XPROCES - ${String(job.project_name || "Proyecto fotogramétrico").slice(0, 120)}`,
+          amount: { currency_code: PAYPAL_CURRENCY, value: Number(price).toFixed(2) }
+        }],
+        application_context: { shipping_preference: "NO_SHIPPING", user_action: "PAY_NOW" }
+      })
+    });
+
+    await pool.query(
+      `update jobs set status='pending_payment', stage='pending_payment', price=$2, payment_status='created', payment_provider='paypal', payment_order_id=$3, payment_amount=$2, payment_currency=$4, message='Pendiente de pago', updated_at=now() where id=$1`,
+      [job.id, price, order.id, PAYPAL_CURRENCY]
+    );
+
+    res.json({ ok: true, order_id: order.id, amount: price, currency: PAYPAL_CURRENCY });
+  } catch (e) {
+    console.error("paypal create-order error", e?.paypal || e);
+    res.status(500).json({ ok: false, error: "paypal_create_order_error", message: e?.message || "No se pudo crear el pago." });
+  }
+});
+
+app.post("/jobs/:id/paypal/capture-order", async (req, res) => {
+  try {
+    await ensurePaymentColumns();
+    const orderId = String(req.body?.order_id || "").trim();
+    if (!orderId) return res.status(400).json({ ok: false, error: "missing_order_id" });
+
+    const { rows } = await pool.query("select * from jobs where id=$1", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ ok: false, error: "job_not_found" });
+    const job = rows[0];
+    const requestUserId = String(req.headers["x-user-id"] || "").trim();
+    if (job.user_id && String(job.user_id) !== requestUserId) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+    if (String(job.payment_status || "").toLowerCase() === "paid") {
+      return res.json({ ok: true, paid: true, capture_id: job.payment_capture_id, amount: Number(job.payment_amount || 0), currency: job.payment_currency || PAYPAL_CURRENCY });
+    }
+    if (String(job.payment_order_id || "") !== orderId) {
+      return res.status(409).json({ ok: false, error: "order_mismatch", message: "La orden de PayPal no corresponde a este proyecto." });
+    }
+
+    let order;
+    try {
+      order = await paypalRequest(`/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`, {
+        method: "POST",
+        headers: { "PayPal-Request-Id": `xproces-capture-${job.id}-${orderId}` },
+        body: "{}"
+      });
+    } catch (captureError) {
+      // Una repetición puede devolver ORDER_ALREADY_CAPTURED. Consultamos la orden y validamos su captura real.
+      order = await paypalRequest(`/v2/checkout/orders/${encodeURIComponent(orderId)}`, { method: "GET" });
+    }
+
+    const unit = order?.purchase_units?.[0] || {};
+    const capture = unit?.payments?.captures?.find((item) => String(item?.status || "").toUpperCase() === "COMPLETED") || unit?.payments?.captures?.[0];
+    const amount = Number(capture?.amount?.value || unit?.amount?.value || 0);
+    const currency = String(capture?.amount?.currency_code || unit?.amount?.currency_code || "").toUpperCase();
+    const customId = String(unit?.custom_id || "");
+    const expectedAmount = Number(job.payment_amount || job.price || 0);
+
+    if (String(order?.status || "").toUpperCase() !== "COMPLETED" || String(capture?.status || "").toUpperCase() !== "COMPLETED") {
+      return res.status(409).json({ ok: false, error: "payment_not_completed", message: "PayPal todavía no ha confirmado el pago." });
+    }
+    if (customId !== String(job.id) || currency !== PAYPAL_CURRENCY || Math.abs(amount - expectedAmount) > 0.001) {
+      console.error("PayPal validation mismatch", { jobId: job.id, customId, currency, amount, expectedAmount });
+      return res.status(409).json({ ok: false, error: "payment_validation_failed", message: "El importe o la referencia del pago no coinciden con el proyecto." });
+    }
+
+    await pool.query(
+      `update jobs set status='created', stage='created', payment_status='paid', payment_provider='paypal', payment_capture_id=$2, payment_amount=$3, payment_currency=$4, paid_at=coalesce(paid_at, now()), message='Pago confirmado. Preparado para subir fotografías.', updated_at=now() where id=$1`,
+      [job.id, capture.id, amount, currency]
+    );
+
+    res.json({ ok: true, paid: true, capture_id: capture.id, amount, currency });
+  } catch (e) {
+    console.error("paypal capture-order error", e?.paypal || e);
+    res.status(500).json({ ok: false, error: "paypal_capture_error", message: e?.message || "No se pudo confirmar el pago." });
+  }
+});
+
+app.post("/jobs/:id/paypal/cancel", async (req, res) => {
+  try {
+    await ensurePaymentColumns();
+    const { rows } = await pool.query("select id, status, payment_status, user_id from jobs where id=$1", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ ok: false, error: "job_not_found" });
+    const job = rows[0];
+    const requestUserId = String(req.headers["x-user-id"] || "").trim();
+    if (job.user_id && String(job.user_id) !== requestUserId) return res.status(403).json({ ok: false, error: "forbidden" });
+    if (String(job.payment_status || "").toLowerCase() === "paid") return res.status(409).json({ ok: false, error: "already_paid" });
+    await pool.query(`update jobs set status='cancelled', stage='cancelled', payment_status='cancelled', message='Pago cancelado', updated_at=now(), finished_at=now() where id=$1`, [job.id]);
+    cleanupJobStorage(job.id, { input: true, output: true });
+    res.json({ ok: true, cancelled: true });
+  } catch (e) {
+    console.error("paypal cancel error", e);
+    res.status(500).json({ ok: false, error: "paypal_cancel_error" });
+  }
+});
+
 // ✅ OPCION A: crear job (NO ENCOLA AQUI)
 // 🔥 v13: ya NO exige photos_count. Crea job “created” con 0 fotos y precio 0.
 app.post("/jobs", async (req, res) => {
@@ -1294,6 +1545,15 @@ const userId = req.body?.user_id || null;
       });
     }
 
+    await ensurePaymentColumns();
+    const estimatedSecondsForPayment = await estimateProcessingSecondsFromInputsHistorical(
+      pool, expectedPhotosCount, expectedTotalBytes, qualityMode, tamsExport
+    );
+    const initialPrice = calculatePriceFromInputs(
+      expectedPhotosCount, expectedTotalBytes, estimatedSecondsForPayment, qualityMode, outputsRequested, projectType
+    );
+    const initialPaymentStatus = initialPrice <= 0 ? "exempt" : "pending";
+
     const insertSql = jobsHasQualityMode
       ? `insert into jobs (
           status,
@@ -1306,9 +1566,11 @@ const userId = req.body?.user_id || null;
           user_id,
           quality_mode,
           project_type,
-          outputs
+          outputs,
+          payment_status,
+          payment_currency
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13)
         returning *`
       : `insert into jobs (
           status,
@@ -1320,16 +1582,18 @@ const userId = req.body?.user_id || null;
           client_name,
           user_id,
           project_type,
-          outputs
+          outputs,
+          payment_status,
+          payment_currency
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12)
         returning *`;
 
     const insertParams = jobsHasQualityMode
       ? [
-          "created",
+          initialPrice <= 0 ? "created" : "pending_payment",
           0,
-          0,
+          initialPrice,
           exifSummary,
           clientEmail,
           projectName,
@@ -1337,19 +1601,23 @@ const userId = req.body?.user_id || null;
           userId,
           qualityMode,
           projectType,
-          JSON.stringify(outputsRequested)
+          JSON.stringify(outputsRequested),
+          initialPaymentStatus,
+          PAYPAL_CURRENCY
         ]
       : [
-          "created",
+          initialPrice <= 0 ? "created" : "pending_payment",
           0,
-          0,
+          initialPrice,
           exifSummary,
           clientEmail,
           projectName,
           clientName,
           userId,
           projectType,
-          JSON.stringify(outputsRequested)
+          JSON.stringify(outputsRequested),
+          initialPaymentStatus,
+          PAYPAL_CURRENCY
         ];
 
     const { rows } = await pool.query(insertSql, insertParams);
@@ -1371,13 +1639,25 @@ app.post("/jobs/:id/submit", async (req, res) => {
     const { id } = req.params;
 
     const selectJobSql = jobsHasQualityMode
-      ? "select id, status, photos_count, quality_mode, exif_summary from jobs where id = $1"
-      : "select id, status, photos_count, exif_summary from jobs where id = $1";
+      ? "select id, status, photos_count, quality_mode, exif_summary, payment_status, payment_amount, payment_currency from jobs where id = $1"
+      : "select id, status, photos_count, exif_summary, payment_status, payment_amount, payment_currency from jobs where id = $1";
 
     const { rows } = await pool.query(selectJobSql, [id]);
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     const job = rows[0];
+    const requestUserId = String(req.headers["x-user-id"] || "").trim();
+    const ownerResult = await pool.query("select user_id from jobs where id=$1", [id]);
+    if (ownerResult.rows?.[0]?.user_id && String(ownerResult.rows[0].user_id) !== requestUserId) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+    if (!canUsePaidJob(job)) {
+      return res.status(402).json({
+        ok: false,
+        error: "payment_required",
+        message: "El pago debe estar confirmado antes de iniciar el procesado."
+      });
+    }
     const qualityMode = normalizeQualityMode(
       req.body?.quality_mode ||
       job.quality_mode ||
@@ -1473,6 +1753,17 @@ app.post("/jobs/:id/submit", async (req, res) => {
       outputsRequested,
       projectType
     );
+
+    if (String(job.payment_status || "").toLowerCase() === "paid") {
+      const paidAmount = Number(job.payment_amount || 0);
+      if (Math.abs(paidAmount - Number(price)) > 0.001) {
+        return res.status(409).json({
+          ok: false,
+          error: "paid_amount_mismatch",
+          message: `El pedido pagado es de ${paidAmount.toFixed(2)} EUR, pero la configuración final corresponde a ${Number(price).toFixed(2)} EUR.`
+        });
+      }
+    }
 
     // TAMS 2026-06-12: ahora también entra en cola para procesado local del worker.
     // Se conserva el bloque antiguo desactivado por seguridad.
@@ -1609,7 +1900,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
 // =====================
 
 // ✅ acepta "photos" y "photos[]"
-app.post("/jobs/:id/upload", uploadInput.any(), async (req, res) => {
+app.post("/jobs/:id/upload", requirePaidJobBeforeUpload, uploadInput.any(), async (req, res) => {
   try {
     const { id } = req.params;
 
