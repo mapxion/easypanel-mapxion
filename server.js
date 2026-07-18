@@ -1447,7 +1447,15 @@ app.post("/jobs/:id/paypal/capture-order", async (req, res) => {
       return res.status(409).json({ ok: false, error: "payment_not_completed", message: "PayPal todavía no ha confirmado el pago." });
     }
     if (customId !== String(job.id) || currency !== PAYPAL_CURRENCY || Math.abs(amount - expectedAmount) > 0.001) {
-      console.error("PayPal validation mismatch", { jobId: job.id, customId, currency, amount, expectedAmount });
+      console.log("PAYPAL VALIDATION", {
+        jobId: job.id,
+        customId,
+        expectedCustomId: String(job.id),
+        amount,
+        expectedAmount,
+        currency,
+        expectedCurrency: PAYPAL_CURRENCY
+      });
       return res.status(409).json({ ok: false, error: "payment_validation_failed", message: "El importe o la referencia del pago no coinciden con el proyecto." });
     }
 
