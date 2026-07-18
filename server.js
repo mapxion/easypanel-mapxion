@@ -447,7 +447,7 @@ async function ensureDownloadCleanupColumns() {
 async function ensurePaymentColumns() {
   await pool.query(`
     alter table jobs
-      add column if not exists payment_status varchar(30) not null default 'pending',
+      add column if not exists payment_status varchar(30) not null default 'exempt',
       add column if not exists payment_provider varchar(20),
       add column if not exists payment_order_id varchar(120),
       add column if not exists payment_capture_id varchar(120),
