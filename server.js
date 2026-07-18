@@ -1446,15 +1446,21 @@ app.post("/jobs/:id/paypal/capture-order", async (req, res) => {
     if (String(order?.status || "").toUpperCase() !== "COMPLETED" || String(capture?.status || "").toUpperCase() !== "COMPLETED") {
       return res.status(409).json({ ok: false, error: "payment_not_completed", message: "PayPal todavía no ha confirmado el pago." });
     }
-    if (customId !== String(job.id) || currency !== PAYPAL_CURRENCY || Math.abs(amount - expectedAmount) > 0.001) {
-      console.log("PAYPAL VALIDATION", {
+    // La respuesta de CAPTURE de PayPal puede omitir purchase_units[].custom_id.
+    // La orden ya se ha vinculado de forma segura al job mediante payment_order_id.
+    // Si custom_id viene informado, debe coincidir; si viene vacío, validamos por orden, importe y moneda.
+    const customIdMatches = !customId || customId === String(job.id);
+    if (!customIdMatches || currency !== PAYPAL_CURRENCY || Math.abs(amount - expectedAmount) > 0.001) {
+      console.error("PayPal validation mismatch", {
         jobId: job.id,
+        orderId,
+        expectedOrderId: String(job.payment_order_id || ""),
         customId,
         expectedCustomId: String(job.id),
-        amount,
-        expectedAmount,
         currency,
-        expectedCurrency: PAYPAL_CURRENCY
+        expectedCurrency: PAYPAL_CURRENCY,
+        amount,
+        expectedAmount
       });
       return res.status(409).json({ ok: false, error: "payment_validation_failed", message: "El importe o la referencia del pago no coinciden con el proyecto." });
     }
