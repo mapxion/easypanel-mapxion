@@ -453,7 +453,22 @@ async function ensurePaymentColumns() {
       add column if not exists payment_capture_id varchar(120),
       add column if not exists payment_amount numeric(10,2),
       add column if not exists payment_currency varchar(3) not null default 'EUR',
+      add column if not exists paypal_payer_id varchar(120),
+      add column if not exists paypal_payer_email varchar(320),
+      add column if not exists payment_date timestamptz,
       add column if not exists paid_at timestamptz
+  `);
+
+  // Una orden o captura de PayPal no puede quedar vinculada a dos trabajos distintos.
+  await pool.query(`
+    create unique index if not exists jobs_payment_order_id_unique
+      on jobs (payment_order_id)
+      where payment_order_id is not null and payment_order_id <> ''
+  `);
+  await pool.query(`
+    create unique index if not exists jobs_payment_capture_id_unique
+      on jobs (payment_capture_id)
+      where payment_capture_id is not null and payment_capture_id <> ''
   `);
 }
 
@@ -719,6 +734,7 @@ app.get("/health", (_req, res) => {
 
 app.get("/admin/jobs", requireAdmin, async (_req, res) => {
   try {
+    await ensurePaymentColumns();
     const { rows } = await pool.query(`
       select
         id,
@@ -737,7 +753,16 @@ app.get("/admin/jobs", requireAdmin, async (_req, res) => {
         finished_at,
         download_seconds,
         processing_seconds,
-        total_seconds
+        total_seconds,
+        payment_status,
+        payment_provider,
+        payment_order_id as paypal_order_id,
+        payment_capture_id as paypal_capture_id,
+        payment_amount,
+        payment_currency,
+        paypal_payer_id,
+        paypal_payer_email,
+        coalesce(payment_date, paid_at) as payment_date
         ${jobsHasQualityMode ? ", quality_mode" : ""}
       from jobs
       order by created_at desc
@@ -1418,7 +1443,17 @@ app.post("/jobs/:id/paypal/capture-order", async (req, res) => {
       return res.status(403).json({ ok: false, error: "forbidden" });
     }
     if (String(job.payment_status || "").toLowerCase() === "paid") {
-      return res.json({ ok: true, paid: true, capture_id: job.payment_capture_id, amount: Number(job.payment_amount || 0), currency: job.payment_currency || PAYPAL_CURRENCY });
+      return res.json({
+        ok: true,
+        paid: true,
+        already_paid: true,
+        capture_id: job.payment_capture_id,
+        amount: Number(job.payment_amount || 0),
+        currency: job.payment_currency || PAYPAL_CURRENCY,
+        payer_id: job.paypal_payer_id || null,
+        payer_email: job.paypal_payer_email || null,
+        payment_date: job.payment_date || job.paid_at || null
+      });
     }
     if (String(job.payment_order_id || "") !== orderId) {
       return res.status(409).json({ ok: false, error: "order_mismatch", message: "La orden de PayPal no corresponde a este proyecto." });
@@ -1442,6 +1477,9 @@ app.post("/jobs/:id/paypal/capture-order", async (req, res) => {
     const currency = String(capture?.amount?.currency_code || unit?.amount?.currency_code || "").toUpperCase();
     const customId = String(unit?.custom_id || "");
     const expectedAmount = Number(job.payment_amount || job.price || 0);
+    const payerId = String(order?.payer?.payer_id || "").trim() || null;
+    const payerEmail = String(order?.payer?.email_address || "").trim().toLowerCase() || null;
+    const paymentDate = capture?.create_time || capture?.update_time || order?.update_time || null;
 
     if (String(order?.status || "").toUpperCase() !== "COMPLETED" || String(capture?.status || "").toUpperCase() !== "COMPLETED") {
       return res.status(409).json({ ok: false, error: "payment_not_completed", message: "PayPal todavía no ha confirmado el pago." });
@@ -1465,12 +1503,91 @@ app.post("/jobs/:id/paypal/capture-order", async (req, res) => {
       return res.status(409).json({ ok: false, error: "payment_validation_failed", message: "El importe o la referencia del pago no coinciden con el proyecto." });
     }
 
-    await pool.query(
-      `update jobs set status='created', stage='created', payment_status='paid', payment_provider='paypal', payment_capture_id=$2, payment_amount=$3, payment_currency=$4, paid_at=coalesce(paid_at, now()), message='Pago confirmado. Preparado para subir fotografías.', updated_at=now() where id=$1`,
-      [job.id, capture.id, amount, currency]
+    const captureId = String(capture?.id || "").trim();
+    if (!captureId) {
+      return res.status(409).json({
+        ok: false,
+        error: "missing_capture_id",
+        message: "PayPal confirmó el pago, pero no devolvió el identificador de captura."
+      });
+    }
+
+    // Protección adicional: una captura no puede utilizarse para pagar otro proyecto.
+    const duplicateCapture = await pool.query(
+      `select id from jobs where payment_capture_id=$1 and id<>$2 limit 1`,
+      [captureId, job.id]
+    );
+    if (duplicateCapture.rows.length) {
+      console.error("PayPal capture already assigned", {
+        captureId,
+        currentJobId: job.id,
+        existingJobId: duplicateCapture.rows[0].id
+      });
+      return res.status(409).json({
+        ok: false,
+        error: "capture_already_used",
+        message: "Esta captura de PayPal ya está vinculada a otro proyecto."
+      });
+    }
+
+    const updateResult = await pool.query(
+      `update jobs
+          set status='created',
+              stage='created',
+              payment_status='paid',
+              payment_provider='paypal',
+              payment_capture_id=$2,
+              payment_amount=$3,
+              payment_currency=$4,
+              paypal_payer_id=$5,
+              paypal_payer_email=$6,
+              payment_date=coalesce(payment_date, $7::timestamptz, now()),
+              paid_at=coalesce(paid_at, $7::timestamptz, now()),
+              message='Pago confirmado. Preparado para subir fotografías.',
+              updated_at=now()
+        where id=$1
+          and payment_status <> 'paid'
+        returning id, payment_capture_id, payment_amount, payment_currency,
+                  paypal_payer_id, paypal_payer_email,
+                  coalesce(payment_date, paid_at) as payment_date`,
+      [job.id, captureId, amount, currency, payerId, payerEmail, paymentDate]
     );
 
-    res.json({ ok: true, paid: true, capture_id: capture.id, amount, currency });
+    // Si dos peticiones llegaron a la vez, la segunda se trata como respuesta idempotente.
+    if (!updateResult.rows.length) {
+      const current = await pool.query(
+        `select payment_status, payment_capture_id, payment_amount, payment_currency,
+                paypal_payer_id, paypal_payer_email,
+                coalesce(payment_date, paid_at) as payment_date
+           from jobs where id=$1`,
+        [job.id]
+      );
+      const paidJob = current.rows[0];
+      if (String(paidJob?.payment_status || "").toLowerCase() === "paid") {
+        return res.json({
+          ok: true,
+          paid: true,
+          already_paid: true,
+          capture_id: paidJob.payment_capture_id,
+          amount: Number(paidJob.payment_amount || 0),
+          currency: paidJob.payment_currency || PAYPAL_CURRENCY,
+          payer_id: paidJob.paypal_payer_id || null,
+          payer_email: paidJob.paypal_payer_email || null,
+          payment_date: paidJob.payment_date || null
+        });
+      }
+    }
+
+    res.json({
+      ok: true,
+      paid: true,
+      capture_id: captureId,
+      amount,
+      currency,
+      payer_id: payerId,
+      payer_email: payerEmail,
+      payment_date: paymentDate
+    });
   } catch (e) {
     console.error("paypal capture-order error", e?.paypal || e);
     res.status(500).json({ ok: false, error: "paypal_capture_error", message: e?.message || "No se pudo confirmar el pago." });
