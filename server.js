@@ -447,7 +447,7 @@ async function ensureDownloadCleanupColumns() {
 async function ensurePaymentColumns() {
   await pool.query(`
     alter table jobs
-      add column if not exists payment_status varchar(30) not null default 'exempt',
+      add column if not exists payment_status varchar(30) not null default 'pending',
       add column if not exists payment_provider varchar(20),
       add column if not exists payment_order_id varchar(120),
       add column if not exists payment_capture_id varchar(120),
@@ -627,7 +627,7 @@ function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qua
   const type = String(projectType || "fotogrametria").toLowerCase();
   const outputs = Array.isArray(outputsRequested) ? outputsRequested.map(String) : [];
 
-  if (type === "tams") return 0;
+  if (type === "tams") return 100;
 
   let price = 10;
 
@@ -1370,9 +1370,12 @@ app.post("/jobs/:id/paypal/create-order", async (req, res) => {
     const estimatedSeconds = await estimateProcessingSecondsFromInputsHistorical(pool, photosCount, totalBytes, qualityMode, projectType === "tams");
     const price = calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qualityMode, outputsRequested, projectType);
 
-    if (price <= 0) {
-      await pool.query(`update jobs set price=0, payment_status='exempt', payment_provider='none', payment_amount=0, payment_currency=$2, updated_at=now() where id=$1`, [job.id, PAYPAL_CURRENCY]);
-      return res.json({ ok: true, exempt: true, amount: 0, currency: PAYPAL_CURRENCY });
+    if (!Number.isFinite(Number(price)) || Number(price) <= 0) {
+      return res.status(409).json({
+        ok: false,
+        error: "invalid_payment_amount",
+        message: "No se ha podido calcular un importe válido para este proyecto. El trabajo no puede iniciarse sin pago."
+      });
     }
 
     const order = await paypalRequest("/v2/checkout/orders", {
