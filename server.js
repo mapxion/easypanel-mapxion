@@ -1423,12 +1423,7 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       tams_export: tamsExport,
       price,
       estimated_seconds: estimatedSeconds,
-      estimated_human: formatEtaSeconds(estimatedSeconds),
-      prediction_method: prediction.method,
-      prediction_neighbors: prediction.neighbors,
-      processing_load_score: processingLoadScore,
-      image_stats: updatedExifSummary?._xproces?.image_stats || null,
-      timing_prediction: timingPlan
+      estimated_human: formatEtaSeconds(estimatedSeconds)
     });
   } catch (e) {
     console.error("pricing preview error", e);
