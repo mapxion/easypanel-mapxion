@@ -8,7 +8,7 @@ import pkg from "pg";
 import archiver from "archiver";
 import cors from "cors";
 import bcrypt from "bcryptjs";
-import { randomBytes } from "crypto";
+import { randomBytes, createHmac, timingSafeEqual } from "crypto";
 
 
 const { Pool } = pkg;
@@ -27,6 +27,47 @@ const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 // Versiones estables del sistema de tiempos. Se guardan junto a cada muestra
 // para no mezclar historicos incompatibles si cambian perfiles o predictor.
 const TIMING_PREDICTOR_VERSION = "stage-v5-2026-07-19";
+
+const PRICING_QUOTE_SECRET = String(process.env.PRICING_QUOTE_SECRET || randomBytes(32).toString("hex"));
+
+function normalizeQuoteOutputs(outputs) {
+  return normalizeOutputList(outputs || []).sort();
+}
+
+function createPricingQuoteToken(payloadInput) {
+  const payload = {
+    photos_count: Number(payloadInput.photos_count || 0),
+    total_bytes: Number(payloadInput.total_bytes || 0),
+    quality_mode: normalizeQualityMode(payloadInput.quality_mode),
+    project_type: String(payloadInput.project_type || "fotogrametria").toLowerCase(),
+    outputs_requested: normalizeQuoteOutputs(payloadInput.outputs_requested),
+    estimated_processing_seconds: Math.max(0, Math.round(Number(payloadInput.estimated_processing_seconds || 0))),
+    price: Number(Number(payloadInput.price || 0).toFixed(2)),
+    predictor_version: String(payloadInput.predictor_version || TIMING_PREDICTOR_VERSION),
+    issued_at: Date.now()
+  };
+  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = createHmac("sha256", PRICING_QUOTE_SECRET).update(encoded).digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+function verifyPricingQuoteToken(token) {
+  const raw = String(token || "");
+  const parts = raw.split(".");
+  if (parts.length !== 2) return null;
+  const [encoded, signature] = parts;
+  const expected = createHmac("sha256", PRICING_QUOTE_SECRET).update(encoded).digest("base64url");
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    if (!payload || Date.now() - Number(payload.issued_at || 0) > 6 * 60 * 60 * 1000) return null;
+    return payload;
+  } catch (_) {
+    return null;
+  }
+}
 const TIMING_METRICS_VERSION = "metrics-v2-2026-07-19";
 const SHORT_STAGE_MIN_DURATION_MS = 500;
 const SHORT_STAGE_EXCLUDED_FROM_TRAINING = new Set([
@@ -2011,13 +2052,27 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       return res.status(400).json({ ok: false, error: "invalid total_bytes" });
     }
 
+    const previewExifSummary = stripNullCharsDeep(req.body?.exif_summary || null);
+    const declaredStats = extractDeclaredImageStats(previewExifSummary, photosCount, totalBytes);
+    const processingLoadScore = calculateProcessingLoadScore({
+      photosCount,
+      totalBytes,
+      avgMegapixels: declaredStats.avgMegapixels,
+      totalMegapixels: declaredStats.totalMegapixels,
+      qualityMode,
+      outputsRequested,
+      projectType
+    });
     const previewFeatures = {
       photosCount,
       totalBytes,
       qualityMode,
       outputsRequested,
       projectType,
-      tamsExport
+      tamsExport,
+      avgMegapixels: declaredStats.avgMegapixels,
+      totalMegapixels: declaredStats.totalMegapixels,
+      processingLoadScore
     };
     const previewFallback = await estimateProcessingDetailsHistorical(pool, previewFeatures);
     const timingPlan = await estimateStageTimingPlan(pool, previewFeatures, previewFallback);
@@ -2036,6 +2091,17 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
 
     console.log("PRICING PREVIEW price:", price);
 
+    const quoteToken = createPricingQuoteToken({
+      photos_count: photosCount,
+      total_bytes: totalBytes,
+      quality_mode: qualityMode,
+      project_type: projectType,
+      outputs_requested: outputsRequested,
+      estimated_processing_seconds: estimatedSeconds,
+      price,
+      predictor_version: TIMING_PREDICTOR_VERSION
+    });
+
     return res.json({
       ok: true,
       photos_count: photosCount,
@@ -2053,7 +2119,8 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       estimated_total_high_seconds: timingPlan.estimated_total_high_seconds,
       estimated_total_human: formatEtaSeconds(timingPlan.estimated_total_service_seconds),
       confidence: timingPlan.confidence,
-      timing_prediction: timingPlan
+      timing_prediction: timingPlan,
+      quote_token: quoteToken
     });
   } catch (e) {
     console.error("pricing preview error", e);
@@ -2806,20 +2873,26 @@ const userId = req.body?.user_id || null;
       projectType
     });
 
-    const initialTimingFeatures = {
-      photosCount: expectedPhotosCount,
-      totalBytes: expectedTotalBytes,
-      qualityMode,
-      tamsExport,
-      projectType,
-      outputsRequested,
-      avgMegapixels: declaredStats.avgMegapixels,
-      totalMegapixels: declaredStats.totalMegapixels,
-      processingLoadScore: initialLoadScore
-    };
-    const initialTimingFallback = await estimateProcessingDetailsHistorical(pool, initialTimingFeatures);
-    const initialTimingPlan = await estimateStageTimingPlan(pool, initialTimingFeatures, initialTimingFallback);
-    const estimatedSecondsForPayment = initialTimingPlan.estimated_processing_seconds;
+    const quote = verifyPricingQuoteToken(req.body?.pricing_quote_token);
+    const expectedOutputKey = normalizeQuoteOutputs(outputsRequested).join("|");
+    const quoteMatches = !!quote &&
+      Number(quote.photos_count) === expectedPhotosCount &&
+      Number(quote.total_bytes) === expectedTotalBytes &&
+      normalizeQualityMode(quote.quality_mode) === qualityMode &&
+      String(quote.project_type || "").toLowerCase() === projectType &&
+      normalizeQuoteOutputs(quote.outputs_requested).join("|") === expectedOutputKey;
+
+    if (!quoteMatches) {
+      return res.status(409).json({
+        ok: false,
+        error: "pricing_quote_invalid",
+        message: "La cotización ya no coincide con las fotos, la calidad o los entregables seleccionados. Vuelva a calcular el precio."
+      });
+    }
+
+    const estimatedSecondsForPayment = Math.max(0, Number(quote.estimated_processing_seconds || 0));
+    const initialPrice = Number(Number(quote.price || 0).toFixed(2));
+    const initialTimingPlan = exifSummaryRaw?._xproces?.timing_prediction || null;
 
     exifSummary = stripNullCharsDeep({
       ...(exifSummary || {}),
@@ -2827,14 +2900,12 @@ const userId = req.body?.user_id || null;
         ...((exifSummary && exifSummary._xproces) || {}),
         processing_load_score: initialLoadScore,
         timing_prediction: initialTimingPlan,
-        prediction_method: initialTimingPlan.method,
-        prediction_neighbors: initialTimingPlan.historical_samples,
-        predictor_version: TIMING_PREDICTOR_VERSION
+        predictor_version: String(quote.predictor_version || TIMING_PREDICTOR_VERSION),
+        pricing_quote_locked: true,
+        quoted_price: initialPrice,
+        quoted_processing_seconds: estimatedSecondsForPayment
       }
     });
-    const initialPrice = calculatePriceFromInputs(
-      expectedPhotosCount, expectedTotalBytes, estimatedSecondsForPayment, qualityMode, outputsRequested, projectType
-    );
     const initialPaymentStatus = initialPrice <= 0 ? "exempt" : "pending";
 
     const insertSql = `insert into jobs (
@@ -5433,7 +5504,13 @@ function estimateStageFromMetricRows(stage, targetInput, rows, fallbackSeconds) 
   const target = { ...buildJobFeatures(targetInput), ...targetInput };
   const now = Date.now();
 
-  let candidates = (rows || []).map((row) => {
+  const targetOutputKey = normalizeQuoteOutputs(target.outputsRequested).join("|");
+  let candidates = (rows || []).filter((row) => {
+    const candidate = metricRowFeatures(row);
+    if (candidate.qualityMode !== target.qualityMode) return false;
+    const candidateOutputKey = normalizeQuoteOutputs(candidate.outputsRequested).join("|");
+    return candidateOutputKey === targetOutputKey;
+  }).map((row) => {
     const durationSeconds = Number(row.duration_ms || 0) / 1000;
     if (!(durationSeconds > 0) || durationSeconds > 7 * 24 * 3600) return null;
 
@@ -5485,10 +5562,6 @@ function estimateStageFromMetricRows(stage, targetInput, rows, fallbackSeconds) 
   const median = ordered[Math.floor(ordered.length / 2)];
   let seconds = (weightedAverage * 0.72) + (median * 0.28);
 
-  // Con solo una o dos muestras, mezclar con la formula evita sobreajustar.
-  if (sampleCount < 3) {
-    seconds = (seconds * 0.60) + (Math.max(1, fallbackSeconds) * 0.40);
-  }
 
   const variance = candidates.reduce((sum, item) => {
     const diff = item.predictedSeconds - weightedAverage;
@@ -5520,7 +5593,7 @@ function estimateStageFromMetricRows(stage, targetInput, rows, fallbackSeconds) 
     average_distance: Math.round(averageDistance * 1000) / 1000,
     confidence,
     confidence_score: timingConfidenceScore(confidence, sampleCount),
-    method: sampleCount >= 3 ? "stage_historical_neighbors" : "stage_historical_blended",
+    method: sampleCount >= 3 ? "stage_historical_neighbors" : "stage_historical_single_or_pair",
     estimated_output_bytes: estimatedOutputBytes
   };
 }
