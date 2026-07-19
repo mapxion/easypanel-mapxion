@@ -317,24 +317,48 @@ async function recordJobStageEvent(pool, jobId, stage, eventType) {
   if (!normalizedStage || !["start", "end", "progress"].includes(normalizedType)) return;
 
   try {
-    const last = await pool.query(
-      `select stage, event_type, created_at
-         from job_stage_events
-        where job_id = $1
-        order by id desc
+    // El worker puede recibir la misma linea por stdout y por el log vivo.
+    // Protegemos SQL para que una fase solo pueda tener un tramo abierto.
+    const openResult = await pool.query(
+      `select s.id
+         from job_stage_events s
+        where s.job_id = $1
+          and s.stage = $2
+          and s.event_type = 'start'
+          and not exists (
+            select 1
+              from job_stage_events e
+             where e.job_id = s.job_id
+               and e.stage = s.stage
+               and e.event_type = 'end'
+               and e.id > s.id
+          )
+        order by s.id desc
         limit 1`,
-      [jobId]
+      [jobId, normalizedStage]
     );
 
-    const previous = last.rows?.[0];
-    if (
-      previous &&
-      previous.stage === normalizedStage &&
-      previous.event_type === normalizedType
-    ) {
-      const ageMs = Date.now() - new Date(previous.created_at).getTime();
-      const dedupeWindow = normalizedType === "progress" ? 1000 : 5000;
-      if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < dedupeWindow) return;
+    const hasOpenStage = openResult.rows.length > 0;
+
+    if (normalizedType === "start" && hasOpenStage) return;
+    if (normalizedType === "end" && !hasOpenStage) return;
+
+    if (normalizedType === "progress") {
+      const lastProgress = await pool.query(
+        `select created_at
+           from job_stage_events
+          where job_id = $1
+            and stage = $2
+            and event_type = 'progress'
+          order by id desc
+          limit 1`,
+        [jobId, normalizedStage]
+      );
+      const previous = lastProgress.rows?.[0];
+      if (previous) {
+        const ageMs = Date.now() - new Date(previous.created_at).getTime();
+        if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < 1500) return;
+      }
     }
 
     await pool.query(
@@ -3630,7 +3654,19 @@ app.patch("/jobs/:id", async (req, res) => {
              estimated_processing_seconds = coalesce($10, estimated_processing_seconds),
              updated_at = now(),
              started_at = case when $2 = 'running' and started_at is null then now() else started_at end,
-             processing_started_at = case when $2 = 'running' and processing_started_at is null then now() else processing_started_at end,
+             processing_started_at = case
+               when processing_started_at is null
+                and $3 in (
+                  'preparing','importing','matching','aligning','cleaning','depth_maps',
+                  'model','uv','texture','tiled_model','point_cloud','ground_classification',
+                  'dem','export_dem','dtm','export_dtm','orthomosaic','colorize_model',
+                  'report','export_tiled_model','export_model','export_point_cloud',
+                  'export_orthomosaic','export_texture','export_reference','exporting',
+                  'zip','closing_metashape','processing_complete'
+                )
+               then now()
+               else processing_started_at
+             end,
              processing_finished_at = case
                when $3 = 'zip_upload' then coalesce(processing_finished_at, now())
                when $2 in ('done','failed','cancelled') then coalesce(processing_finished_at, now())
@@ -3662,6 +3698,110 @@ app.patch("/jobs/:id", async (req, res) => {
   }
 });
 
+async function completeTimingAnalyticsBeforeClaim(job) {
+  const currentExif = job?.exif_summary || {};
+  const qualityMode = normalizeQualityMode(
+    job?.quality || currentExif?._xproces?.quality_mode || "normal"
+  );
+  const projectType = String(
+    job?.project_type || currentExif?._xproces?.project_type || "fotogrametria"
+  ).toLowerCase();
+  const outputsRequested = normalizeOutputList(
+    job?.outputs || currentExif?._xproces?.outputs_requested || []
+  );
+
+  const inputStats = collectInputImageStats(job.id, currentExif);
+  const processingLoadScore = calculateProcessingLoadScore({
+    photosCount: inputStats.photosCount,
+    totalBytes: inputStats.inputTotalBytes,
+    avgMegapixels: inputStats.avgMegapixels,
+    totalMegapixels: inputStats.totalMegapixels,
+    qualityMode,
+    outputsRequested,
+    projectType
+  });
+
+  const targetFeatures = {
+    photosCount: inputStats.photosCount,
+    totalBytes: inputStats.inputTotalBytes,
+    avgMegapixels: inputStats.avgMegapixels,
+    totalMegapixels: inputStats.totalMegapixels,
+    processingLoadScore,
+    qualityMode,
+    outputsRequested,
+    projectType,
+    tamsExport: projectType === "tams",
+    actualUploadSeconds: job?.upload_completed_at && job?.created_at
+      ? Math.max(0, (new Date(job.upload_completed_at).getTime() - new Date(job.created_at).getTime()) / 1000)
+      : null
+  };
+
+  const prediction = await estimateProcessingDetailsHistorical(pool, targetFeatures);
+  const timingPlan = await estimateStageTimingPlan(pool, targetFeatures, prediction);
+
+  const updatedExifSummary = stripNullCharsDeep({
+    ...currentExif,
+    _xproces: {
+      ...((currentExif && currentExif._xproces) || {}),
+      quality_mode: qualityMode,
+      project_type: projectType,
+      outputs_requested: outputsRequested,
+      totalPhotos: inputStats.photosCount,
+      totalBytes: inputStats.inputTotalBytes,
+      image_stats: {
+        avg_photo_mb: inputStats.avgPhotoMb,
+        avg_width: inputStats.avgWidth,
+        avg_height: inputStats.avgHeight,
+        avg_megapixels: inputStats.avgMegapixels,
+        total_megapixels: inputStats.totalMegapixels,
+        sampled_dimensions: inputStats.sampledDimensions
+      },
+      processing_load_score: processingLoadScore,
+      timing_prediction: timingPlan,
+      prediction_method: prediction.method,
+      prediction_neighbors: prediction.neighbors
+    }
+  });
+
+  const result = await pool.query(
+    `update jobs
+        set photos_count = $2,
+            input_total_bytes = $3,
+            quality = $4,
+            project_type = $5,
+            outputs = $6::jsonb,
+            avg_photo_mb = $7,
+            avg_width = $8,
+            avg_height = $9,
+            avg_megapixels = $10,
+            total_megapixels = $11,
+            processing_load_score = $12,
+            estimated_processing_seconds = $13,
+            exif_summary = $14,
+            updated_at = now()
+      where id = $1
+      returning *`,
+    [
+      job.id,
+      inputStats.photosCount,
+      inputStats.inputTotalBytes,
+      qualityMode,
+      projectType,
+      JSON.stringify(outputsRequested),
+      inputStats.avgPhotoMb,
+      inputStats.avgWidth,
+      inputStats.avgHeight,
+      inputStats.avgMegapixels,
+      inputStats.totalMegapixels,
+      processingLoadScore,
+      prediction.seconds,
+      updatedExifSummary
+    ]
+  );
+
+  return result.rows[0] || job;
+}
+
 // =====================
 // WORKER (HTTP por internet)
 // =====================
@@ -3674,8 +3814,7 @@ app.post("/worker/claim", requireWorkerAuth, async (_req, res) => {
               progress=coalesce(progress, 0),
               message='Worker claimed',
               updated_at=now(),
-              started_at=case when started_at is null then now() else started_at end,
-              processing_started_at=case when processing_started_at is null then now() else processing_started_at end
+              started_at=case when started_at is null then now() else started_at end
         where id = (
           select id
           from jobs
@@ -3691,13 +3830,16 @@ app.post("/worker/claim", requireWorkerAuth, async (_req, res) => {
       return res.json({ ok: true, job: null });
     }
 
-    const job = rows[0];
-    await recordJobStageEvent(pool, job.id, "running", "start");
+    // Algunos trabajos llegan a queued por la vigilancia de subida y no por
+    // /submit. Antes de entregarlos al PC completamos siempre calidad, EXIF,
+    // carga y plan de tiempos usando los ficheros reales del input.
+    const job = await completeTimingAnalyticsBeforeClaim(rows[0]);
+    await recordJobStageEvent(pool, job.id, "downloading", "start");
     res.json({
       ok: true,
       job: {
         ...job,
-        quality_mode: normalizeQualityMode(job.quality_mode || job?.exif_summary?._xproces?.quality_mode || "normal")
+        quality_mode: normalizeQualityMode(job.quality || job?.exif_summary?._xproces?.quality_mode || "normal")
       }
     });
   } catch (e) {
@@ -4356,7 +4498,7 @@ function requiredTimingStages(featuresInput) {
   }
   if (needsReport) stages.add("report");
   if (needsTiled) stages.add("export_tiled_model");
-  if (["mesh_obj", "model_obj", "obj", "glb", "mesh_fbx", "fbx"].some((x) => outputs.has(x)) || outputs.has("las")) {
+  if (["mesh_obj", "model_obj", "obj", "glb", "mesh_fbx", "fbx"].some((x) => outputs.has(x))) {
     stages.add("export_model");
   }
   if (outputs.has("las") || outputs.has("point_cloud_las")) stages.add("export_point_cloud");
