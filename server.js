@@ -27,7 +27,13 @@ const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 // Versiones estables del sistema de tiempos. Se guardan junto a cada muestra
 // para no mezclar historicos incompatibles si cambian perfiles o predictor.
 const TIMING_PREDICTOR_VERSION = "stage-v5-2026-07-19";
-const TIMING_METRICS_VERSION = "metrics-v1-2026-07-19";
+const TIMING_METRICS_VERSION = "metrics-v2-2026-07-19";
+const SHORT_STAGE_MIN_DURATION_MS = 500;
+const SHORT_STAGE_EXCLUDED_FROM_TRAINING = new Set([
+  "export_dem", "export_dtm", "colorize_model",
+  "export_tiled_model", "export_model", "export_point_cloud",
+  "export_texture", "export_reference"
+]);
 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "XprocesAdmin2026!";
 
@@ -669,6 +675,11 @@ async function finalizeJobStageMetrics(db, jobId) {
     else if (!trainableStages.has(stage) && !["final", "running"].includes(stage)) reason = "unknown_stage";
     else if (!isTransferStage(stage) && !metric.profile_version) reason = "missing_profile_version";
     else if (stage !== "uploading" && !metric.worker_version) reason = "missing_worker_version";
+    else if (
+      SHORT_STAGE_EXCLUDED_FROM_TRAINING.has(stage) &&
+      durationMs > 0 &&
+      durationMs < SHORT_STAGE_MIN_DURATION_MS
+    ) reason = "duration_too_short";
     else reason = null;
 
     // final/running son estados de control, no muestras de calculo.
@@ -830,6 +841,27 @@ async function applyTimingManifest(db, jobId, manifestInput) {
         where id = $1`,
       [jobId, updated]
     );
+
+    // Propagar inmediatamente las versiones a TODAS las fases ya medidas.
+    // El manifiesto puede llegar al principio, antes del ZIP o al final. Esta
+    // actualización evita que fases anteriores queden invalidadas por haber
+    // sido consolidadas antes de recibir worker_version/profile_version.
+    await db.query(
+      `update job_stage_metrics
+          set worker_version = coalesce(worker_version, $2),
+              profile_version = coalesce(profile_version, $3),
+              updated_at = now()
+        where job_id = $1`,
+      [
+        jobId,
+        manifest.worker_version || null,
+        manifest.profile_version || null
+      ]
+    );
+
+    // Reconstruir las métricas existentes con el exif_summary recién
+    // actualizado. Es idempotente y no crea eventos ni altera el Batch.
+    await refreshCompletedStageMetrics(db, jobId);
   }
 
   return {
