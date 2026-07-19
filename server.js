@@ -1744,35 +1744,30 @@ function estimateProcessingSecondsFromInputs(photosCount, totalBytes, qualityMod
 }
 
 function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qualityMode = "normal", outputsRequested = [], projectType = "fotogrametria") {
-  const photos = Number(photosCount || 0);
   const type = String(projectType || "fotogrametria").toLowerCase();
-  const outputs = Array.isArray(outputsRequested) ? outputsRequested.map(String) : [];
 
+  // TAMS mantiene su precio fijo independiente del tiempo estimado.
   if (type === "tams") return 100;
 
-  let price = 10;
+  // XProces se cobra únicamente según el tiempo estimado de procesamiento.
+  // Tramos acumulativos, sin coste mínimo y sin redondeo a euros enteros:
+  //   minutos 1-45:    0,50 EUR/min
+  //   minutos 46-120:  0,40 EUR/min
+  //   desde minuto 121: 0,30 EUR/min
+  const minutes = Math.max(0, Number(estimatedSeconds || 0) / 60);
 
-  if (photos > 1000) price += 40;
-  else if (photos > 500) price += 20;
-  else if (photos > 100) price += 10;
+  let price = 0;
 
-  if (qualityMode === "full") price += 20;
-
-  const extras = {
-    dem_tif: 10,       // DSM
-    dtm_tif: 10,       // DTM
-    contours_dxf: 5,   // Curvas de nivel
-    mesh_obj: 10,
-    glb: 10,
-    mesh_fbx: 10,
-    textures: 5
-  };
-
-  for (const output of outputs) {
-    price += extras[output] || 0;
+  if (minutes <= 45) {
+    price = minutes * 0.50;
+  } else if (minutes <= 120) {
+    price = (45 * 0.50) + ((minutes - 45) * 0.40);
+  } else {
+    price = (45 * 0.50) + (75 * 0.40) + ((minutes - 120) * 0.30);
   }
 
-  return Math.max(0, Math.ceil(price));
+  // Se conservan céntimos exactos para la base de datos y PayPal.
+  return Math.max(0, Math.round((price + Number.EPSILON) * 100) / 100);
 }
 
 // ✅ helper: status “bloqueado” (no permitir más uploads)
@@ -1953,23 +1948,15 @@ app.get("/admin/config", requireAdmin, (_req, res) => {
       api_base: process.env.PUBLIC_API_BASE || "https://api.xproces.com",
       support_email: "soportetams@intelsi.es",
       auto_refresh_seconds: 5,
-      base_price: 10,
-      photo_supplements: [
-        { range: "0–100 fotos", amount: 0 },
-        { range: "101–500 fotos", amount: 10 },
-        { range: "501–1000 fotos", amount: 20 },
-        { range: "Más de 1000 fotos", amount: 40 }
+      pricing_model: "estimated_processing_time",
+      minimum_price: 0,
+      rounding: "cents_only",
+      time_rates: [
+        { from_minute: 0, to_minute: 45, eur_per_minute: 0.50 },
+        { from_minute: 45, to_minute: 120, eur_per_minute: 0.40 },
+        { from_minute: 120, to_minute: null, eur_per_minute: 0.30 }
       ],
-      quality_supplements: {
-        fast: 0,
-        normal: 0,
-        full: 20
-      },
-      output_supplements: {
-        dsm: 10,
-        dtm: 10,
-        contours: 5
-      }
+      tams_fixed_price: 100
     }
   });
 });
