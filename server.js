@@ -8,7 +8,7 @@ import pkg from "pg";
 import archiver from "archiver";
 import cors from "cors";
 import bcrypt from "bcryptjs";
-import { randomBytes, createHmac, timingSafeEqual } from "crypto";
+import { randomBytes, createHmac } from "crypto";
 
 
 const { Pool } = pkg;
@@ -27,47 +27,6 @@ const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 // Versiones estables del sistema de tiempos. Se guardan junto a cada muestra
 // para no mezclar historicos incompatibles si cambian perfiles o predictor.
 const TIMING_PREDICTOR_VERSION = "stage-v5-2026-07-19";
-
-const PRICING_QUOTE_SECRET = String(process.env.PRICING_QUOTE_SECRET || randomBytes(32).toString("hex"));
-
-function normalizeQuoteOutputs(outputs) {
-  return normalizeOutputList(outputs || []).sort();
-}
-
-function createPricingQuoteToken(payloadInput) {
-  const payload = {
-    photos_count: Number(payloadInput.photos_count || 0),
-    total_bytes: Number(payloadInput.total_bytes || 0),
-    quality_mode: normalizeQualityMode(payloadInput.quality_mode),
-    project_type: String(payloadInput.project_type || "fotogrametria").toLowerCase(),
-    outputs_requested: normalizeQuoteOutputs(payloadInput.outputs_requested),
-    estimated_processing_seconds: Math.max(0, Math.round(Number(payloadInput.estimated_processing_seconds || 0))),
-    price: Number(Number(payloadInput.price || 0).toFixed(2)),
-    predictor_version: String(payloadInput.predictor_version || TIMING_PREDICTOR_VERSION),
-    issued_at: Date.now()
-  };
-  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
-  const signature = createHmac("sha256", PRICING_QUOTE_SECRET).update(encoded).digest("base64url");
-  return `${encoded}.${signature}`;
-}
-
-function verifyPricingQuoteToken(token) {
-  const raw = String(token || "");
-  const parts = raw.split(".");
-  if (parts.length !== 2) return null;
-  const [encoded, signature] = parts;
-  const expected = createHmac("sha256", PRICING_QUOTE_SECRET).update(encoded).digest("base64url");
-  const a = Buffer.from(signature);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
-  try {
-    const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
-    if (!payload || Date.now() - Number(payload.issued_at || 0) > 6 * 60 * 60 * 1000) return null;
-    return payload;
-  } catch (_) {
-    return null;
-  }
-}
 const TIMING_METRICS_VERSION = "metrics-v2-2026-07-19";
 const SHORT_STAGE_MIN_DURATION_MS = 500;
 const SHORT_STAGE_EXCLUDED_FROM_TRAINING = new Set([
@@ -77,6 +36,10 @@ const SHORT_STAGE_EXCLUDED_FROM_TRAINING = new Set([
 ]);
 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "XprocesAdmin2026!";
+const PRICING_QUOTE_SECRET = String(
+  process.env.PRICING_QUOTE_SECRET || WORKER_TOKEN || ADMIN_TOKEN
+);
+const PRICING_QUOTE_TTL_SECONDS = 60 * 60;
 
 // =====================
 // PAYPAL CHECKOUT
@@ -2038,9 +2001,20 @@ app.post("/pricing/preview", async (req, res) => {
 console.log("[XPROCES QUALITY] RAW:", req.body?.quality_mode);
 const qualityMode = normalizeQualityMode(req.body?.quality_mode);
 console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
-    const outputsRequested = Array.isArray(req.body?.outputs_requested) ? req.body.outputs_requested : [];
+    const outputsRequested = normalizeOutputList(Array.isArray(req.body?.outputs_requested) ? req.body.outputs_requested : []);
     const projectType = String(req.body?.project_type || req.body?.xproces_meta?.project_type || "fotogrametria").toLowerCase();
     const tamsExport = !!req.body?.tams_export || projectType === "tams";
+    const previewExifSummary = stripNullCharsDeep(req.body?.exif_summary || null);
+    const previewStats = extractDeclaredImageStats(previewExifSummary, photosCount, totalBytes);
+    const previewLoadScore = calculateProcessingLoadScore({
+      photosCount,
+      totalBytes,
+      avgMegapixels: previewStats.avgMegapixels,
+      totalMegapixels: previewStats.totalMegapixels,
+      qualityMode,
+      outputsRequested,
+      projectType
+    });
 
     console.log("PRICING PREVIEW parsed:", { photosCount, totalBytes, qualityMode, tamsExport });
 
@@ -2052,17 +2026,6 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       return res.status(400).json({ ok: false, error: "invalid total_bytes" });
     }
 
-    const previewExifSummary = stripNullCharsDeep(req.body?.exif_summary || null);
-    const declaredStats = extractDeclaredImageStats(previewExifSummary, photosCount, totalBytes);
-    const processingLoadScore = calculateProcessingLoadScore({
-      photosCount,
-      totalBytes,
-      avgMegapixels: declaredStats.avgMegapixels,
-      totalMegapixels: declaredStats.totalMegapixels,
-      qualityMode,
-      outputsRequested,
-      projectType
-    });
     const previewFeatures = {
       photosCount,
       totalBytes,
@@ -2070,9 +2033,12 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       outputsRequested,
       projectType,
       tamsExport,
-      avgMegapixels: declaredStats.avgMegapixels,
-      totalMegapixels: declaredStats.totalMegapixels,
-      processingLoadScore
+      avgPhotoMb: previewStats.avgPhotoMb,
+      avgWidth: previewStats.avgWidth,
+      avgHeight: previewStats.avgHeight,
+      avgMegapixels: previewStats.avgMegapixels,
+      totalMegapixels: previewStats.totalMegapixels,
+      processingLoadScore: previewLoadScore
     };
     const previewFallback = await estimateProcessingDetailsHistorical(pool, previewFeatures);
     const timingPlan = await estimateStageTimingPlan(pool, previewFeatures, previewFallback);
@@ -2091,16 +2057,27 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
 
     console.log("PRICING PREVIEW price:", price);
 
-    const quoteToken = createPricingQuoteToken({
+    const quotePayload = {
+      version: 1,
+      issued_at: Math.floor(Date.now() / 1000),
+      expires_at: Math.floor(Date.now() / 1000) + PRICING_QUOTE_TTL_SECONDS,
+      predictor_version: TIMING_PREDICTOR_VERSION,
       photos_count: photosCount,
       total_bytes: totalBytes,
       quality_mode: qualityMode,
-      project_type: projectType,
       outputs_requested: outputsRequested,
-      estimated_processing_seconds: estimatedSeconds,
-      price,
-      predictor_version: TIMING_PREDICTOR_VERSION
-    });
+      project_type: projectType,
+      tams_export: tamsExport,
+      avg_photo_mb: previewStats.avgPhotoMb,
+      avg_width: previewStats.avgWidth,
+      avg_height: previewStats.avgHeight,
+      avg_megapixels: previewStats.avgMegapixels,
+      total_megapixels: previewStats.totalMegapixels,
+      processing_load_score: previewLoadScore,
+      estimated_seconds: estimatedSeconds,
+      price
+    };
+    const pricingQuote = createPricingQuote(quotePayload);
 
     return res.json({
       ok: true,
@@ -2110,6 +2087,8 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       quality_mode_label: getQualityModeLabel(qualityMode),
       tams_export: tamsExport,
       price,
+      pricing_quote: pricingQuote,
+      quote_expires_at: quotePayload.expires_at,
       estimated_seconds: estimatedSeconds,
       estimated_low_seconds: timingPlan.estimated_processing_low_seconds,
       estimated_high_seconds: timingPlan.estimated_processing_high_seconds,
@@ -2119,8 +2098,7 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       estimated_total_high_seconds: timingPlan.estimated_total_high_seconds,
       estimated_total_human: formatEtaSeconds(timingPlan.estimated_total_service_seconds),
       confidence: timingPlan.confidence,
-      timing_prediction: timingPlan,
-      quote_token: quoteToken
+      timing_prediction: timingPlan
     });
   } catch (e) {
     console.error("pricing preview error", e);
@@ -2805,6 +2783,29 @@ const qualityMode = normalizeQualityMode(req.body?.quality_mode);
 console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
 const expectedPhotosCount = Number(req.body?.expected_photos_count || exifSummaryRaw?._xproces?.totalPhotos || 0) || 0;
 const expectedTotalBytes = Number(req.body?.expected_total_bytes || exifSummaryRaw?._xproces?.totalBytes || 0) || 0;
+const pricingQuote = verifyPricingQuote(req.body?.pricing_quote);
+if (projectType !== "tams" && !pricingQuote) {
+  return res.status(409).json({
+    ok: false,
+    error: "pricing_quote_invalid",
+    message: "La cotización ha caducado o no es válida. Vuelva a calcular el precio antes de continuar."
+  });
+}
+if (pricingQuote) {
+  const quoteOutputs = normalizeOutputList(pricingQuote.outputs_requested);
+  if (Number(pricingQuote.photos_count) !== expectedPhotosCount ||
+      Number(pricingQuote.total_bytes) !== expectedTotalBytes ||
+      normalizeQualityMode(pricingQuote.quality_mode) !== qualityMode ||
+      !outputSetsEqual(quoteOutputs, outputsRequested) ||
+      String(pricingQuote.project_type || "") !== projectType ||
+      !!pricingQuote.tams_export !== !!tamsExport) {
+    return res.status(409).json({
+      ok: false,
+      error: "pricing_quote_mismatch",
+      message: "Las fotos, la calidad o los entregables han cambiado. Vuelva a calcular la cotización."
+    });
+  }
+}
 
 let exifSummary = stripNullCharsDeep({
   ...(exifSummaryRaw || {}),
@@ -2858,52 +2859,41 @@ const userId = req.body?.user_id || null;
     await ensurePaymentColumns();
     await ensureTimingAnalyticsSchema();
 
-    const declaredStats = extractDeclaredImageStats(
-      exifSummary,
-      expectedPhotosCount,
-      expectedTotalBytes
-    );
-    const initialLoadScore = calculateProcessingLoadScore({
-      photosCount: expectedPhotosCount,
-      totalBytes: expectedTotalBytes,
-      avgMegapixels: declaredStats.avgMegapixels,
-      totalMegapixels: declaredStats.totalMegapixels,
-      qualityMode,
-      outputsRequested,
-      projectType
-    });
-
-    const quote = verifyPricingQuoteToken(req.body?.pricing_quote_token);
-    const expectedOutputKey = normalizeQuoteOutputs(outputsRequested).join("|");
-    const quoteMatches = !!quote &&
-      Number(quote.photos_count) === expectedPhotosCount &&
-      Number(quote.total_bytes) === expectedTotalBytes &&
-      normalizeQualityMode(quote.quality_mode) === qualityMode &&
-      String(quote.project_type || "").toLowerCase() === projectType &&
-      normalizeQuoteOutputs(quote.outputs_requested).join("|") === expectedOutputKey;
-
-    if (!quoteMatches) {
-      return res.status(409).json({
-        ok: false,
-        error: "pricing_quote_invalid",
-        message: "La cotización ya no coincide con las fotos, la calidad o los entregables seleccionados. Vuelva a calcular el precio."
-      });
-    }
-
-    const estimatedSecondsForPayment = Math.max(0, Number(quote.estimated_processing_seconds || 0));
-    const initialPrice = Number(Number(quote.price || 0).toFixed(2));
-    const initialTimingPlan = exifSummaryRaw?._xproces?.timing_prediction || null;
+    const declaredStats = pricingQuote ? {
+      avgPhotoMb: Number(pricingQuote.avg_photo_mb || 0),
+      avgWidth: Number(pricingQuote.avg_width || 0),
+      avgHeight: Number(pricingQuote.avg_height || 0),
+      avgMegapixels: Number(pricingQuote.avg_megapixels || 0),
+      totalMegapixels: Number(pricingQuote.total_megapixels || 0)
+    } : extractDeclaredImageStats(exifSummary, expectedPhotosCount, expectedTotalBytes);
+    const initialLoadScore = pricingQuote
+      ? Number(pricingQuote.processing_load_score || 0)
+      : calculateProcessingLoadScore({
+          photosCount: expectedPhotosCount,
+          totalBytes: expectedTotalBytes,
+          avgMegapixels: declaredStats.avgMegapixels,
+          totalMegapixels: declaredStats.totalMegapixels,
+          qualityMode,
+          outputsRequested,
+          projectType
+        });
+    const estimatedSecondsForPayment = pricingQuote
+      ? Number(pricingQuote.estimated_seconds || 0)
+      : 0;
+    const initialPrice = pricingQuote
+      ? Number(pricingQuote.price || 0)
+      : calculatePriceFromInputs(expectedPhotosCount, expectedTotalBytes, 0, qualityMode, outputsRequested, projectType);
 
     exifSummary = stripNullCharsDeep({
       ...(exifSummary || {}),
       _xproces: {
         ...((exifSummary && exifSummary._xproces) || {}),
         processing_load_score: initialLoadScore,
-        timing_prediction: initialTimingPlan,
-        predictor_version: String(quote.predictor_version || TIMING_PREDICTOR_VERSION),
         pricing_quote_locked: true,
-        quoted_price: initialPrice,
-        quoted_processing_seconds: estimatedSecondsForPayment
+        pricing_quote_issued_at: pricingQuote?.issued_at || null,
+        pricing_quote_expires_at: pricingQuote?.expires_at || null,
+        prediction_method: "locked_web_quote",
+        predictor_version: pricingQuote?.predictor_version || TIMING_PREDICTOR_VERSION
       }
     });
     const initialPaymentStatus = initialPrice <= 0 ? "exempt" : "pending";
@@ -3096,26 +3086,11 @@ app.post("/jobs/:id/submit", async (req, res) => {
       ? Math.max(0, Math.round((new Date(job.upload_completed_at).getTime() - new Date(actualUploadStart).getTime()) / 1000))
       : null;
 
-    const targetFeatures = {
-      id,
-      actualUploadSeconds,
-      photosCount,
-      totalBytes: inputTotalBytes,
-      avgPhotoMb: inputStats.avgPhotoMb,
-      avgWidth: inputStats.avgWidth,
-      avgHeight: inputStats.avgHeight,
-      avgMegapixels: inputStats.avgMegapixels,
-      totalMegapixels: inputStats.totalMegapixels,
-      processingLoadScore,
-      qualityMode,
-      outputsRequested,
-      projectType,
-      tamsExport
-    };
-
-    const prediction = await estimateProcessingDetailsHistorical(pool, targetFeatures);
-    const timingPlan = await estimateStageTimingPlan(pool, targetFeatures, prediction);
-    const estimatedSeconds = timingPlan.estimated_processing_seconds;
+    // El precio y el tiempo quedaron fijados cuando la web terminó de analizar
+    // todas las fotografías. Al finalizar la subida solo guardamos las métricas
+    // reales de entrada para enriquecer el histórico; no se recalcula la cotización.
+    const estimatedSeconds = Math.max(0, Number(job.estimated_processing_seconds || 0));
+    const price = Math.max(0, Number(job.price || 0));
 
     updatedExifSummary = stripNullCharsDeep({
       ...(updatedExifSummary || {}),
@@ -3135,29 +3110,19 @@ app.post("/jobs/:id/submit", async (req, res) => {
           sampled_dimensions: inputStats.sampledDimensions
         },
         processing_load_score: processingLoadScore,
-        timing_prediction: timingPlan,
-        prediction_method: timingPlan.method,
-        prediction_neighbors: timingPlan.historical_samples,
+        pricing_quote_locked: true,
+        prediction_method: "locked_web_quote",
         predictor_version: TIMING_PREDICTOR_VERSION
       }
     });
 
-    const price = calculatePriceFromInputs(
-      photosCount,
-      inputTotalBytes,
-      estimatedSeconds,
-      qualityMode,
-      outputsRequested,
-      projectType
-    );
-
     if (String(job.payment_status || "").toLowerCase() === "paid") {
       const paidAmount = Number(job.payment_amount || 0);
-      if (Math.abs(paidAmount - Number(price)) > 0.001) {
+      if (Math.abs(paidAmount - price) > 0.001) {
         return res.status(409).json({
           ok: false,
           error: "paid_amount_mismatch",
-          message: `El pedido pagado es de ${paidAmount.toFixed(2)} EUR, pero la configuración final corresponde a ${Number(price).toFixed(2)} EUR.`
+          message: `El pedido pagado es de ${paidAmount.toFixed(2)} EUR y la cotización guardada es de ${price.toFixed(2)} EUR.`
         });
       }
     }
@@ -3268,7 +3233,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
       inputStats.avgMegapixels,
       inputStats.totalMegapixels,
       processingLoadScore,
-      Math.max(0, Math.min(99, Math.round(timingPlan.upload_end_percent ?? 0)))
+      0
     ];
 
     await pool.query(submitUpdateSql, submitUpdateParams);
@@ -3291,18 +3256,18 @@ app.post("/jobs/:id/submit", async (req, res) => {
       price,
       estimated_seconds: estimatedSeconds,
       estimated_human: formatEtaSeconds(estimatedSeconds),
-      estimated_total_seconds: timingPlan.estimated_total_service_seconds,
-      estimated_total_human: formatEtaSeconds(timingPlan.estimated_total_service_seconds),
-      prediction_method: timingPlan.method,
-      prediction_neighbors: timingPlan.historical_samples,
+      estimated_total_seconds: estimatedSeconds,
+      estimated_total_human: formatEtaSeconds(estimatedSeconds),
+      prediction_method: "locked_web_quote",
+      prediction_neighbors: null,
       confidence: timingPlan.confidence,
-      estimated_low_seconds: timingPlan.estimated_processing_low_seconds,
-      estimated_high_seconds: timingPlan.estimated_processing_high_seconds,
-      estimated_total_low_seconds: timingPlan.estimated_total_low_seconds,
-      estimated_total_high_seconds: timingPlan.estimated_total_high_seconds,
+      estimated_low_seconds: estimatedSeconds,
+      estimated_high_seconds: estimatedSeconds,
+      estimated_total_low_seconds: estimatedSeconds,
+      estimated_total_high_seconds: estimatedSeconds,
       processing_load_score: processingLoadScore,
       image_stats: updatedExifSummary?._xproces?.image_stats || null,
-      timing_prediction: timingPlan
+      timing_prediction: null
     });
   } catch (e) {
     console.error("submit error", e);
@@ -5104,6 +5069,33 @@ function outputSetDistance(a, b) {
   return 1 - (intersection / union.size);
 }
 
+function outputSetsEqual(a, b) {
+  const aa = normalizeOutputList(a).sort();
+  const bb = normalizeOutputList(b).sort();
+  return aa.length === bb.length && aa.every((value, index) => value === bb[index]);
+}
+
+function createPricingQuote(payload) {
+  const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const signature = createHmac("sha256", PRICING_QUOTE_SECRET).update(body).digest("base64url");
+  return `${body}.${signature}`;
+}
+
+function verifyPricingQuote(token) {
+  const raw = String(token || "").trim();
+  const [body, signature, extra] = raw.split(".");
+  if (!body || !signature || extra) return null;
+  const expected = createHmac("sha256", PRICING_QUOTE_SECRET).update(body).digest("base64url");
+  if (signature.length !== expected.length || signature !== expected) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+    if (!payload || Number(payload.expires_at || 0) < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch (_) {
+    return null;
+  }
+}
+
 function processingFeatureDistance(target, candidate) {
   let distance = 0;
   distance += logRatioDistance(target.photosCount, candidate.photosCount) * 2.2;
@@ -5158,6 +5150,10 @@ async function estimateProcessingDetailsHistorical(pool, targetInput) {
       const features = buildJobFeatures(row);
       const seconds = Number(row.processing_seconds || 0);
       if (!Number.isFinite(seconds) || seconds <= 0) return null;
+      if (features.qualityMode !== target.qualityMode) return null;
+      if (!outputSetsEqual(features.outputsRequested, target.outputsRequested)) return null;
+      if (features.projectType !== target.projectType) return null;
+      if (!!features.tamsExport !== !!target.tamsExport) return null;
 
       const distance = processingFeatureDistance(target, features);
       const targetScore = Math.max(1, target.processingLoadScore);
@@ -5179,7 +5175,7 @@ async function estimateProcessingDetailsHistorical(pool, targetInput) {
     .sort((a, b) => a.distance - b.distance)
     .slice(0, 12);
 
-  if (candidates.length >= 3) {
+  if (candidates.length >= 1) {
     const weightedSum = candidates.reduce((sum, item) => sum + (item.predictedSeconds * item.weight), 0);
     const weightSum = candidates.reduce((sum, item) => sum + item.weight, 0);
     const weightedAverage = weightSum > 0 ? weightedSum / weightSum : 0;
@@ -5190,7 +5186,7 @@ async function estimateProcessingDetailsHistorical(pool, targetInput) {
 
     return {
       seconds: Math.max(60, Math.round(blended)),
-      method: "historical_nearest_jobs",
+      method: candidates.length === 1 ? "historical_exact_single_job" : "historical_exact_jobs",
       neighbors: candidates.length,
       neighborDetails: candidates
     };
@@ -5504,17 +5500,15 @@ function estimateStageFromMetricRows(stage, targetInput, rows, fallbackSeconds) 
   const target = { ...buildJobFeatures(targetInput), ...targetInput };
   const now = Date.now();
 
-  const targetOutputKey = normalizeQuoteOutputs(target.outputsRequested).join("|");
-  let candidates = (rows || []).filter((row) => {
-    const candidate = metricRowFeatures(row);
-    if (candidate.qualityMode !== target.qualityMode) return false;
-    const candidateOutputKey = normalizeQuoteOutputs(candidate.outputsRequested).join("|");
-    return candidateOutputKey === targetOutputKey;
-  }).map((row) => {
+  let candidates = (rows || []).map((row) => {
     const durationSeconds = Number(row.duration_ms || 0) / 1000;
     if (!(durationSeconds > 0) || durationSeconds > 7 * 24 * 3600) return null;
 
     const candidate = metricRowFeatures(row);
+    if (candidate.qualityMode !== target.qualityMode) return null;
+    if (!outputSetsEqual(candidate.outputsRequested, target.outputsRequested)) return null;
+    if (candidate.projectType !== target.projectType) return null;
+    if (!!candidate.tamsExport !== !!target.tamsExport) return null;
     const distance = stageFeatureDistance(stage, target, candidate, row);
     const scale = stageScaleFactor(stage, target, candidate, row);
     const predictedSeconds = durationSeconds * scale;
@@ -5593,7 +5587,7 @@ function estimateStageFromMetricRows(stage, targetInput, rows, fallbackSeconds) 
     average_distance: Math.round(averageDistance * 1000) / 1000,
     confidence,
     confidence_score: timingConfidenceScore(confidence, sampleCount),
-    method: sampleCount >= 3 ? "stage_historical_neighbors" : "stage_historical_single_or_pair",
+    method: sampleCount === 1 ? "stage_historical_exact_single" : "stage_historical_exact_neighbors",
     estimated_output_bytes: estimatedOutputBytes
   };
 }
