@@ -303,6 +303,7 @@ pool
   .then(async () => {
     console.log("Postgres conectado");
     await ensurePaymentColumns();
+    await ensureDownloadCleanupColumns();
     await refreshSchemaFlags();
   })
   .catch((err) => console.error("Error Postgres", err));
@@ -440,7 +441,9 @@ async function ensureDownloadCleanupColumns() {
       add column if not exists storage_purged_at timestamptz,
       add column if not exists archived_log text,
       add column if not exists archived_outputs jsonb,
-      add column if not exists archived_summary_saved_at timestamptz
+      add column if not exists archived_summary_saved_at timestamptz,
+      add column if not exists upload_completed_at timestamptz,
+      add column if not exists results_ready_at timestamptz
   `);
 }
 
@@ -735,6 +738,7 @@ app.get("/health", (_req, res) => {
 app.get("/admin/jobs", requireAdmin, async (_req, res) => {
   try {
     await ensurePaymentColumns();
+    await ensureDownloadCleanupColumns();
     const { rows } = await pool.query(`
       select
         id,
@@ -751,6 +755,14 @@ app.get("/admin/jobs", requireAdmin, async (_req, res) => {
         created_at,
         started_at,
         finished_at,
+        coalesce(upload_completed_at, processing_started_at, started_at) as upload_completed_at,
+        processing_started_at,
+        processing_finished_at,
+        coalesce(results_ready_at, processing_finished_at, finished_at) as results_ready_at,
+        download_started_at,
+        download_completed_at,
+        download_count,
+        download_verified,
         download_seconds,
         processing_seconds,
         total_seconds,
@@ -2358,6 +2370,7 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
                input_total_bytes = $2,
                message = $3,
                error = null,
+               upload_completed_at = coalesce(upload_completed_at, now()),
                updated_at = now()
          where id = $4`,
         [realCount, realBytes, nextMessage, id]
@@ -2373,6 +2386,7 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
                estimated_processing_seconds = 0,
                progress = 100,
                message = $3,
+               upload_completed_at = coalesce(upload_completed_at, now()),
                updated_at = now()
          where id = $4`,
         [realCount, realBytes, nextMessage, id]
@@ -2590,6 +2604,15 @@ app.post("/jobs/:id/output", uploadOutput.single("file"), async (req, res) => {
 
     if (!req.file)
       return res.status(400).json({ error: "missing file field (file)" });
+
+    // Multer solo entra aquí cuando el ZIP final ya se ha guardado completo en el VPS.
+    await pool.query(
+      `update jobs
+          set results_ready_at = coalesce(results_ready_at, now()),
+              updated_at = now()
+        where id = $1`,
+      [id]
+    );
 
     // Red de seguridad: si aún quedaba input en el VPS, lo purgamos al recibir el ZIP final.
     const inputCleanupOk = safeRemoveDir(inputDir(id));
@@ -3037,7 +3060,8 @@ app.patch("/jobs/:id", async (req, res) => {
              started_at = case when $2 = 'running' and started_at is null then now() else started_at end,
              processing_started_at = case when $2 = 'running' and processing_started_at is null then now() else processing_started_at end,
              processing_finished_at = case when $2 in ('done','failed','cancelled') then now() else processing_finished_at end,
-             finished_at = case when $2 in ('done','failed','cancelled') then now() else finished_at end
+             finished_at = case when $2 in ('done','failed','cancelled') then now() else finished_at end,
+             results_ready_at = case when $2 = 'done' then coalesce(results_ready_at, now()) else results_ready_at end
        where id = $1
        returning *`,
       [
@@ -3141,6 +3165,7 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
                    estimated_processing_seconds = 0,
                    progress = 100,
                    message = 'TAMS pendiente de descarga al PC',
+                   upload_completed_at = coalesce(upload_completed_at, now()),
                    updated_at = now()
              where id = $1 and status = 'receiving'`,
             [job.id, serverFilesCount, serverBytes]
@@ -3154,6 +3179,7 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
                    photos_count = $2,
                    input_total_bytes = $3,
                    message = 'En cola para procesado',
+                   upload_completed_at = coalesce(upload_completed_at, now()),
                    updated_at = now()
              where id = $1 and status = 'receiving'`,
             [job.id, serverFilesCount, serverBytes]
