@@ -196,6 +196,7 @@ function normalizeProcessingStage(value) {
   if (["created", "receiving", "queued", "running", "done", "failed", "cancelled", "final"].includes(raw)) return raw;
   if (["upload", "uploading", "subida", "subiendo"].includes(raw)) return "uploading";
   if (["download", "downloading", "descarga", "descargando", "validating", "validation", "validando"].includes(raw)) return "downloading";
+  if (["predownload", "predownloading", "predescarga", "predescargando", "receiving_download"].includes(raw)) return "predownloading";
   if (["result_download", "download_results", "descarga_resultados"].includes(raw)) return "result_download";
   if (["prepare", "preparing", "preparando", "batch", "batch_xml"].includes(raw)) return "preparing";
   if (["import", "importing", "importando", "adding_photos", "anadiendo_fotos"].includes(raw)) return "importing";
@@ -645,7 +646,7 @@ async function finalizeJobStageMetrics(db, jobId) {
   // expresamente por el cliente. Los outputs quedan guardados en la propia
   // muestra y el predictor ya los usa para comparar trabajos compatibles.
   const trainableStages = new Set([
-    "uploading", "downloading", "zip_upload",
+    "uploading", "predownloading", "downloading", "zip_upload",
     ...TIMING_STAGE_ORDER
   ]);
 
@@ -4336,7 +4337,10 @@ app.patch("/jobs/:id", async (req, res) => {
              processing_seconds = coalesce(
                $8,
                case
-                 when $2 in ('done','failed','cancelled') then greatest(0, extract(epoch from (now() - coalesce(processing_started_at, started_at, created_at)))::int)
+                 when $2 in ('done','failed','cancelled') then coalesce(
+                   processing_seconds,
+                   greatest(0, extract(epoch from (coalesce(processing_finished_at, now()) - coalesce(processing_started_at, started_at, created_at)))::int)
+                 )
                  else processing_seconds
                end
              ),
@@ -4851,6 +4855,34 @@ app.post("/worker/jobs/:id/confirm-download", requireWorkerAuth, async (req, res
   }
 });
 
+app.post("/worker/jobs/:id/stage-event", requireWorkerAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const stage = normalizeProcessingStage(req.body?.stage);
+    const eventType = String(req.body?.event_type || "").trim().toLowerCase();
+    const metrics = req.body?.metrics && typeof req.body.metrics === "object" ? req.body.metrics : {};
+
+    if (!stage) return res.status(400).json({ ok: false, error: "invalid stage" });
+    if (!["start", "progress", "end"].includes(eventType)) {
+      return res.status(400).json({ ok: false, error: "invalid event_type" });
+    }
+
+    const { rows } = await pool.query("select id from jobs where id = $1", [id]);
+    if (!rows.length) return res.status(404).json({ ok: false, error: "job not found" });
+
+    await recordJobStageEvent(pool, id, stage, eventType);
+    let metric = null;
+    if (eventType === "end") {
+      metric = await upsertJobStageMetric(pool, id, stage, { metrics });
+    }
+
+    return res.json({ ok: true, stage, event_type: eventType, metric_recorded: !!metric });
+  } catch (e) {
+    console.error("worker stage event error", e);
+    return res.status(500).json({ ok: false, error: "worker stage event error" });
+  }
+});
+
 app.post("/worker/jobs/:id/timing-manifest", requireWorkerAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -5314,7 +5346,7 @@ function timingConfidenceScore(label, sampleCount = 0) {
 }
 
 function isTransferStage(stage) {
-  return ["uploading", "downloading", "zip_upload"].includes(normalizeProcessingStage(stage));
+  return ["uploading", "predownloading", "downloading", "zip_upload"].includes(normalizeProcessingStage(stage));
 }
 
 function isExportStage(stage) {
