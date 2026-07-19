@@ -177,66 +177,138 @@ function stripNullCharsDeep(value) {
 }
 
 
+
 function normalizeProcessingStage(value) {
   const raw = String(value || "").trim().toLowerCase();
   if (!raw) return null;
 
-  if (["created", "receiving", "queued", "running", "done", "failed", "cancelled"].includes(raw)) return raw;
-  if (["prepare", "preparing", "preparando"].includes(raw)) return "preparing";
-  if (["import", "importing", "importando"].includes(raw)) return "importing";
+  if (["created", "receiving", "queued", "running", "done", "failed", "cancelled", "final"].includes(raw)) return raw;
+  if (["upload", "uploading", "subida", "subiendo"].includes(raw)) return "uploading";
+  if (["download", "downloading", "descarga", "descargando", "validating", "validation", "validando"].includes(raw)) return "downloading";
+  if (["prepare", "preparing", "preparando", "batch", "batch_xml"].includes(raw)) return "preparing";
+  if (["import", "importing", "importando", "adding_photos", "anadiendo_fotos"].includes(raw)) return "importing";
   if (["match", "matching", "detecting", "detectando", "detectando_puntos"].includes(raw)) return "matching";
   if (["align", "aligning", "alineando", "alineacion", "alineación"].includes(raw)) return "aligning";
   if (["clean", "cleaning", "limpiando", "optimizando", "optimization", "optimizing"].includes(raw)) return "cleaning";
   if (["depth", "depthmaps", "depth_maps", "profundidad", "mapas_profundidad"].includes(raw)) return "depth_maps";
-  if (["pointcloud", "point_cloud", "cloud", "nube", "nube_puntos"].includes(raw)) return "point_cloud";
-  if (["dem", "dtm", "terreno"].includes(raw)) return "dem";
   if (["model", "modelo", "mesh", "malla"].includes(raw)) return "model";
-  if (["uv", "texture", "texturing", "textura", "texturizando"].includes(raw)) return "texture";
-  if (["export", "exporting", "exportando"].includes(raw)) return "exporting";
+  if (["uv", "generating_uv"].includes(raw)) return "uv";
+  if (["texture", "texturing", "textura", "texturizando"].includes(raw)) return "texture";
+  if (["tiled", "tiled_model", "teselas", "modelo_teselas"].includes(raw)) return "tiled_model";
+  if (["pointcloud", "point_cloud", "cloud", "nube", "nube_puntos"].includes(raw)) return "point_cloud";
+  if (["classify_ground", "ground_classification", "clasificando_terreno", "clasificacion_terreno"].includes(raw)) return "ground_classification";
+  if (["dem", "dsm", "mde"].includes(raw)) return "dem";
+  if (["dtm", "mdt", "terreno"].includes(raw)) return "dtm";
+  if (["orthomosaic", "ortho", "ortofoto", "ortomosaico"].includes(raw)) return "orthomosaic";
+  if (["colorize_model", "coloring_model", "coloreando_modelo"].includes(raw)) return "colorize_model";
   if (["report", "pdf", "informe"].includes(raw)) return "report";
+  if (["export_model", "exportando_modelo"].includes(raw)) return "export_model";
+  if (["export_point_cloud", "exportando_nube", "export_las"].includes(raw)) return "export_point_cloud";
+  if (["export_dem", "exportando_mde", "exportando_dsm"].includes(raw)) return "export_dem";
+  if (["export_dtm", "exportando_mdt"].includes(raw)) return "export_dtm";
+  if (["export_orthomosaic", "exportando_ortofoto", "exportando_ortomosaico"].includes(raw)) return "export_orthomosaic";
+  if (["export_texture", "exportando_textura"].includes(raw)) return "export_texture";
+  if (["export_tiled_model", "exportando_teselas"].includes(raw)) return "export_tiled_model";
+  if (["export_reference", "exportando_referencia"].includes(raw)) return "export_reference";
+  if (["export", "exporting", "exportando", "exports", "exportaciones"].includes(raw)) return "exporting";
+  if (["zip", "compressing", "compression", "comprimiendo", "compresion"].includes(raw)) return "zip";
+  if (["closing_metashape", "closing", "cerrando_metashape", "cerrando"].includes(raw)) return "closing_metashape";
+  if (["zip_upload", "uploading_zip", "subiendo_zip", "subiendo_resultados"].includes(raw)) return "zip_upload";
+  if (["processing_complete", "procesado_finalizado"].includes(raw)) return "processing_complete";
 
   return raw.replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || null;
 }
 
+function inferStageFromMessage(message) {
+  const text = String(message || "").toLowerCase();
+  if (!text) return null;
+
+  if (/subiendo\s+(el\s+)?zip|zip\s+final|subiendo\s+resultados|outputs\.zip/.test(text)) return "zip_upload";
+  if (/cerrando\s+metashape|closing\s+metashape/.test(text)) return "closing_metashape";
+  if (/comprimiendo|creando\s+zip|compresi[oó]n/.test(text)) return "zip";
+
+  if (/export(model|ando\s+modelo)|exportando\s+obj|saving\s+3d\s+model/.test(text)) return "export_model";
+  if (/export(pointcloud|ando\s+nube)|exportando\s+las|saving\s+point\s+cloud/.test(text)) return "export_point_cloud";
+  if (/export.*(mdt|dtm)|\/mdt\.tif|\\mdt\.tif/.test(text)) return "export_dtm";
+  if (/export.*(mde|dem|dsm)|\/mde(_color)?\.tif|\\mde(_color)?\.tif/.test(text)) return "export_dem";
+  if (/export.*(orto|orthomosaic)|\/orto\.tif|\\orto\.tif/.test(text)) return "export_orthomosaic";
+  if (/export.*textur/.test(text)) return "export_texture";
+  if (/export.*(tesela|tiled)/.test(text)) return "export_tiled_model";
+  if (/export.*referen/.test(text)) return "export_reference";
+
+  if (/generando\s+informe|generating\s+report|exportreport|informe\s+pdf/.test(text)) return "report";
+  if (/coloriz(e|ing)model|coloreando\s+modelo|colorize\s+model/.test(text)) return "colorize_model";
+  if (/buildorthomosaic|generando\s+orto|generando\s+ortomosaico|building\s+orthomosaic/.test(text)) return "orthomosaic";
+  if (/builddem.*classes\s*=\s*(terreno|ground)|classes\s*=\s*terreno|generando\s+mdt|generando\s+dtm/.test(text)) return "dtm";
+  if (/builddem|buildelevation|generando\s+mde|generando\s+dsm|generating\s+dem/.test(text)) return "dem";
+  if (/classifygroundpoints|clasificando\s+(el\s+)?terreno|clasificando\s+puntos\s+de\s+terreno|ground\s+classification/.test(text)) return "ground_classification";
+  if (/buildpointcloud|builddensecloud|generando\s+nube|building\s+point\s+cloud/.test(text)) return "point_cloud";
+  if (/buildtiledmodel|modelo\s+de\s+teselas|building\s+tiled\s+model/.test(text)) return "tiled_model";
+  if (/buildtexture|generando\s+textura|building\s+texture/.test(text)) return "texture";
+  if (/builduv|generando\s+uv|building\s+uv/.test(text)) return "uv";
+  if (/buildmodel|creando\s+modelo|generando\s+modelo|building\s+model|creando\s+malla/.test(text)) return "model";
+  if (/builddepthmaps|mapas\s+de\s+profundidad|building\s+depth\s+maps/.test(text)) return "depth_maps";
+  if (/aligncameras|orientando\s+(fotograf[ií]as|fotos|c[aá]maras)|alineando/.test(text)) return "aligning";
+  if (/matchphotos|emparejando\s+(fotograf[ií]as|fotos)|matching\s+photos/.test(text)) return "matching";
+  if (/a[nñ]adiendo\s+(fotograf[ií]as|fotos)|importando\s+fotos|importing\s+photos/.test(text)) return "importing";
+  if (/worker\s+claimed|confirmando\s+descarga|descarga\s+y\s+validaci[oó]n|validando\s+descarga|download\s+validation/.test(text)) return "downloading";
+  if (/procesando\s+proyecto|inicio\s+procesado\s+metashape|proyecto\s+preparado|preparando\s+(xml|proyecto)|motor\s+batch|abriendo\s+metashape|proces(?:o|amiento)\s+por\s+lotes|batch\s+xml/.test(text)) return "preparing";
+  if (/exportaciones\s+detectadas|exportaciones\s+completas|exportando\s+archivos/.test(text)) return "exporting";
+  if (/procesado\s+finalizado|fin\s+procesado\s+metashape/.test(text)) return "processing_complete";
+  if (/trabajo\s+(procesado|finalizado)\s+correctamente/.test(text)) return "final";
+
+  return null;
+}
+
 function inferProcessingStage({ status, stage, progress, message }) {
+  const fromMessage = inferStageFromMessage(message);
+  if (fromMessage) return fromMessage;
+
   const direct = normalizeProcessingStage(stage);
   if (direct) return direct;
 
   const st = String(status || "").toLowerCase();
   if (["done", "failed", "cancelled", "queued", "receiving", "created"].includes(st)) return st;
 
-  const text = String(message || "").toLowerCase();
-  if (text.includes("prepar")) return "preparing";
-  if (text.includes("import")) return "importing";
-  if (text.includes("detect") || text.includes("puntos clave") || text.includes("match")) return "matching";
-  if (text.includes("aline")) return "aligning";
-  if (text.includes("limpi") || text.includes("optim")) return "cleaning";
-  if (text.includes("profundidad") || text.includes("depth")) return "depth_maps";
-  if (text.includes("nube") || text.includes("point cloud")) return "point_cloud";
-  if (text.includes("dem") || text.includes("terreno") || text.includes("dtm")) return "dem";
-  if (text.includes("modelo") || text.includes("model") || text.includes("malla")) return "model";
-  if (text.includes("textura") || text.includes("texture") || text.includes("uv")) return "texture";
-  if (text.includes("export")) return "exporting";
-  if (text.includes("informe") || text.includes("pdf")) return "report";
-
   const p = Number(progress);
   if (Number.isFinite(p)) {
-    if (p >= 100) return "done";
-    if (p >= 96) return "report";
-    if (p >= 92) return "exporting";
-    if (p >= 86) return "texture";
-    if (p >= 84) return "model";
-    if (p >= 82) return "dem";
-    if (p >= 78) return "point_cloud";
-    if (p >= 65) return "depth_maps";
-    if (p >= 50) return "cleaning";
-    if (p >= 45) return "aligning";
-    if (p >= 30) return "matching";
-    if (p >= 15) return "importing";
-    if (p >= 10) return "preparing";
+    if (p >= 100) return "final";
+    if (p >= 85) return "zip_upload";
+    if (p >= 57) return "zip";
+    if (p >= 43) return "exporting";
+    if (p >= 33) return "orthomosaic";
+    if (p >= 32) return "dem";
+    if (p >= 27) return "point_cloud";
+    if (p >= 22) return "model";
+    if (p >= 20) return "depth_maps";
+    if (p >= 19) return "matching";
+    if (p >= 13) return "importing";
+    if (p >= 11) return "preparing";
   }
 
   return null;
+}
+
+function extractProgressSignalFromLog(rawLog) {
+  const text = String(rawLog || "");
+  if (!text.trim()) return null;
+
+  const stageMatches = [...text.matchAll(/XPROCES_STAGE\|([^|\r\n]+)\|([^\r\n]*)/g)];
+  const progressMatches = [...text.matchAll(/XPROCES_PROGRESS\|(\d{1,3})\|([^\r\n]*)/g)];
+
+  const lastStage = stageMatches.length ? stageMatches[stageMatches.length - 1] : null;
+  const lastProgress = progressMatches.length ? progressMatches[progressMatches.length - 1] : null;
+
+  const message = String(lastStage?.[2] || lastProgress?.[2] || "").trim() || null;
+  const stage = normalizeProcessingStage(lastStage?.[1]) || inferStageFromMessage(message) || inferStageFromMessage(text);
+  const percent = lastProgress ? Number(lastProgress[1]) : null;
+
+  if (!stage && !message && !Number.isFinite(percent)) return null;
+  return {
+    stage,
+    message,
+    percent: Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null
+  };
 }
 
 async function recordJobStageEvent(pool, jobId, stage, eventType) {
@@ -245,13 +317,32 @@ async function recordJobStageEvent(pool, jobId, stage, eventType) {
   if (!normalizedStage || !["start", "end", "progress"].includes(normalizedType)) return;
 
   try {
+    const last = await pool.query(
+      `select stage, event_type, created_at
+         from job_stage_events
+        where job_id = $1
+        order by id desc
+        limit 1`,
+      [jobId]
+    );
+
+    const previous = last.rows?.[0];
+    if (
+      previous &&
+      previous.stage === normalizedStage &&
+      previous.event_type === normalizedType
+    ) {
+      const ageMs = Date.now() - new Date(previous.created_at).getTime();
+      const dedupeWindow = normalizedType === "progress" ? 1000 : 5000;
+      if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < dedupeWindow) return;
+    }
+
     await pool.query(
       `insert into job_stage_events (job_id, stage, event_type, created_at)
        values ($1, $2, $3, now())`,
       [jobId, normalizedStage, normalizedType]
     );
   } catch (e) {
-    // No paramos el proceso por métricas: si falla el histórico, el job debe seguir.
     console.error("job_stage_events insert error", e?.message || e);
   }
 }
@@ -304,6 +395,7 @@ pool
     console.log("Postgres conectado");
     await ensurePaymentColumns();
     await ensureDownloadCleanupColumns();
+    await ensureTimingAnalyticsSchema();
     await refreshSchemaFlags();
   })
   .catch((err) => console.error("Error Postgres", err));
@@ -447,6 +539,34 @@ async function ensureDownloadCleanupColumns() {
   `);
 }
 
+
+async function ensureTimingAnalyticsSchema() {
+  // La instalación actual ya tiene casi todas estas columnas. IF NOT EXISTS
+  // permite desplegar este server.js sin una migración manual separada.
+  await pool.query(`
+    alter table jobs
+      add column if not exists quality text,
+      add column if not exists outputs jsonb not null default '[]'::jsonb,
+      add column if not exists avg_photo_mb numeric,
+      add column if not exists avg_width integer,
+      add column if not exists avg_height integer,
+      add column if not exists avg_megapixels numeric,
+      add column if not exists total_megapixels numeric,
+      add column if not exists processing_load_score numeric,
+      add column if not exists estimated_processing_seconds integer
+  `);
+
+  await pool.query(`
+    create index if not exists idx_job_stage_events_job_time
+      on job_stage_events (job_id, created_at)
+  `);
+
+  await pool.query(`
+    create index if not exists idx_jobs_timing_similarity
+      on jobs (status, project_type, quality, created_at desc)
+  `);
+}
+
 async function ensurePaymentColumns() {
   await pool.query(`
     alter table jobs
@@ -509,11 +629,43 @@ async function requirePaidJobBeforeUpload(req, res, next) {
 async function markDownloadStarted(jobId) {
   try {
     await ensureDownloadCleanupColumns();
-    await pool.query(
-      `update jobs
-          set download_started_at = coalesce(download_started_at, now()),
-              updated_at = now()
+
+    const currentResult = await pool.query(
+      `select stage, progress, download_started_at, exif_summary
+         from jobs
         where id = $1`,
+      [jobId]
+    );
+    if (!currentResult.rows.length) return;
+
+    const current = currentResult.rows[0];
+    if (!current.download_started_at) {
+      const previousStage = normalizeProcessingStage(current.stage);
+      const planned = getPlannedProgressForStage(current.exif_summary, "downloading");
+      const nextProgress = Number.isFinite(planned)
+        ? Math.max(Number(current.progress || 0), Math.round(planned))
+        : Number(current.progress || 0);
+
+      if (previousStage && previousStage !== "downloading") {
+        await recordJobStageEvent(pool, jobId, previousStage, "end");
+      }
+      await recordJobStageEvent(pool, jobId, "downloading", "start");
+
+      await pool.query(
+        `update jobs
+            set download_started_at = now(),
+                stage = 'downloading',
+                progress = greatest(coalesce(progress, 0), $2),
+                message = 'Descargando y validando fotografías',
+                updated_at = now()
+          where id = $1`,
+        [jobId, nextProgress]
+      );
+      return;
+    }
+
+    await pool.query(
+      `update jobs set updated_at = now() where id = $1`,
       [jobId]
     );
   } catch (e) {
@@ -627,6 +779,302 @@ function getInputTotalBytes(jobId) {
     if (stat.isFile()) return acc + stat.size;
     return acc;
   }, 0);
+}
+
+
+function finiteNumber(value, fallback = null) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function normalizeOutputList(value) {
+  if (Array.isArray(value)) {
+    return [...new Set(value.map((x) => String(x || "").trim().toLowerCase()).filter(Boolean))];
+  }
+
+  if (typeof value === "string") {
+    const raw = value.trim();
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return normalizeOutputList(parsed);
+    } catch (_) {
+      // Puede venir como lista separada por comas desde el worker/frontend.
+    }
+    return [...new Set(raw.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean))];
+  }
+
+  return [];
+}
+
+function extractDeclaredImageStats(exifSummary, photosCount = 0, totalBytes = 0) {
+  const meta = exifSummary?._xproces || {};
+  const sources = [meta.image_stats || {}, meta, exifSummary || {}];
+
+  const pick = (...keys) => {
+    for (const source of sources) {
+      for (const key of keys) {
+        const n = finiteNumber(source?.[key], null);
+        if (n !== null && n >= 0) return n;
+      }
+    }
+    return null;
+  };
+
+  const photos = Math.max(0, Number(photosCount || meta.totalPhotos || 0));
+  const bytes = Math.max(0, Number(totalBytes || meta.totalBytes || 0));
+  const avgPhotoMb = pick("avg_photo_mb", "avgPhotoMb", "average_photo_mb", "averagePhotoMb")
+    ?? (photos > 0 && bytes > 0 ? bytes / photos / (1024 * 1024) : null);
+  const avgWidth = pick("avg_width", "avgWidth", "average_width", "averageWidth");
+  const avgHeight = pick("avg_height", "avgHeight", "average_height", "averageHeight");
+  const avgMegapixels = pick("avg_megapixels", "avgMegapixels", "average_megapixels", "averageMegapixels", "megapixels");
+  const totalMegapixels = pick("total_megapixels", "totalMegapixels")
+    ?? (avgMegapixels !== null && photos > 0 ? avgMegapixels * photos : null);
+
+  return {
+    avgPhotoMb,
+    avgWidth,
+    avgHeight,
+    avgMegapixels,
+    totalMegapixels
+  };
+}
+
+function readImageHeader(filePath, maxBytes = 1024 * 1024) {
+  const stat = fs.statSync(filePath);
+  const size = Math.max(0, Math.min(stat.size, maxBytes));
+  const buffer = Buffer.alloc(size);
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const bytesRead = fs.readSync(fd, buffer, 0, size, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readImageDimensions(filePath) {
+  try {
+    const buffer = readImageHeader(filePath);
+    if (buffer.length < 24) return null;
+
+    // PNG
+    if (
+      buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e &&
+      buffer[3] === 0x47 && buffer[4] === 0x0d && buffer[5] === 0x0a
+    ) {
+      const width = buffer.readUInt32BE(16);
+      const height = buffer.readUInt32BE(20);
+      if (width > 0 && height > 0) return { width, height };
+    }
+
+    // JPEG: busca cualquier marcador SOF que incluya ancho y alto.
+    if (buffer[0] === 0xff && buffer[1] === 0xd8) {
+      const sofMarkers = new Set([
+        0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7,
+        0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf
+      ]);
+      let offset = 2;
+
+      while (offset + 9 < buffer.length) {
+        if (buffer[offset] !== 0xff) {
+          offset += 1;
+          continue;
+        }
+
+        while (offset < buffer.length && buffer[offset] === 0xff) offset += 1;
+        if (offset >= buffer.length) break;
+
+        const marker = buffer[offset];
+        offset += 1;
+
+        // Marcadores sin longitud.
+        if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7) || marker === 0x01) {
+          continue;
+        }
+
+        if (offset + 2 > buffer.length) break;
+        const segmentLength = buffer.readUInt16BE(offset);
+        if (segmentLength < 2 || offset + segmentLength > buffer.length) break;
+
+        if (sofMarkers.has(marker) && segmentLength >= 7) {
+          const height = buffer.readUInt16BE(offset + 3);
+          const width = buffer.readUInt16BE(offset + 5);
+          if (width > 0 && height > 0) return { width, height };
+        }
+
+        offset += segmentLength;
+      }
+    }
+
+    // TIFF básico (little/big endian), suficiente para leer Width/Height del primer IFD.
+    const littleEndian = buffer[0] === 0x49 && buffer[1] === 0x49;
+    const bigEndian = buffer[0] === 0x4d && buffer[1] === 0x4d;
+    if (littleEndian || bigEndian) {
+      const readU16 = (offset) => littleEndian ? buffer.readUInt16LE(offset) : buffer.readUInt16BE(offset);
+      const readU32 = (offset) => littleEndian ? buffer.readUInt32LE(offset) : buffer.readUInt32BE(offset);
+      const ifdOffset = readU32(4);
+      if (ifdOffset > 0 && ifdOffset + 2 < buffer.length) {
+        const count = readU16(ifdOffset);
+        let width = null;
+        let height = null;
+        for (let i = 0; i < count; i += 1) {
+          const entry = ifdOffset + 2 + (i * 12);
+          if (entry + 12 > buffer.length) break;
+          const tag = readU16(entry);
+          const type = readU16(entry + 2);
+          const valueCount = readU32(entry + 4);
+          if (![256, 257].includes(tag) || valueCount < 1) continue;
+
+          let value = null;
+          if (type === 3) value = readU16(entry + 8);
+          else if (type === 4) value = readU32(entry + 8);
+
+          if (tag === 256) width = value;
+          if (tag === 257) height = value;
+        }
+        if (width > 0 && height > 0) return { width, height };
+      }
+    }
+  } catch (e) {
+    console.error("No se pudieron leer dimensiones de imagen:", path.basename(filePath), e?.message || e);
+  }
+
+  return null;
+}
+
+function collectInputImageStats(jobId, exifSummary = null) {
+  const names = listInputImages(jobId);
+  const count = names.length;
+  const declared = extractDeclaredImageStats(exifSummary, count, 0);
+
+  if (!count) {
+    return {
+      photosCount: 0,
+      inputTotalBytes: 0,
+      avgPhotoMb: declared.avgPhotoMb,
+      avgWidth: declared.avgWidth,
+      avgHeight: declared.avgHeight,
+      avgMegapixels: declared.avgMegapixels,
+      totalMegapixels: declared.totalMegapixels,
+      sampledDimensions: 0
+    };
+  }
+
+  let totalBytes = 0;
+  for (const name of names) {
+    try {
+      totalBytes += fs.statSync(path.join(inputDir(jobId), name)).size;
+    } catch (_) {
+      // El submit se ejecuta cuando la subida ya está cerrada; un fallo aislado
+      // de stat no debe impedir procesar el resto.
+    }
+  }
+
+  // Las cámaras de un trabajo suelen usar la misma resolución. Muestrear 64
+  // cabeceras limita E/S incluso con miles de fotos y mantiene una media fiable.
+  const sampleLimit = 64;
+  const sampleIndexes = new Set();
+  const sampleCount = Math.min(sampleLimit, count);
+  for (let i = 0; i < sampleCount; i += 1) {
+    sampleIndexes.add(Math.round((i * (count - 1)) / Math.max(1, sampleCount - 1)));
+  }
+
+  let widthTotal = 0;
+  let heightTotal = 0;
+  let megapixelsTotal = 0;
+  let validDimensions = 0;
+
+  for (const index of sampleIndexes) {
+    const dimensions = readImageDimensions(path.join(inputDir(jobId), names[index]));
+    if (!dimensions) continue;
+    widthTotal += dimensions.width;
+    heightTotal += dimensions.height;
+    megapixelsTotal += (dimensions.width * dimensions.height) / 1_000_000;
+    validDimensions += 1;
+  }
+
+  const avgWidth = validDimensions > 0
+    ? Math.round(widthTotal / validDimensions)
+    : declared.avgWidth;
+  const avgHeight = validDimensions > 0
+    ? Math.round(heightTotal / validDimensions)
+    : declared.avgHeight;
+  const avgMegapixels = validDimensions > 0
+    ? megapixelsTotal / validDimensions
+    : declared.avgMegapixels;
+  const avgPhotoMb = totalBytes > 0
+    ? totalBytes / count / (1024 * 1024)
+    : declared.avgPhotoMb;
+  const totalMegapixels = avgMegapixels !== null && avgMegapixels !== undefined
+    ? avgMegapixels * count
+    : declared.totalMegapixels;
+
+  return {
+    photosCount: count,
+    inputTotalBytes: totalBytes,
+    avgPhotoMb,
+    avgWidth,
+    avgHeight,
+    avgMegapixels,
+    totalMegapixels,
+    sampledDimensions: validDimensions
+  };
+}
+
+const OUTPUT_LOAD_WEIGHTS = {
+  las: 0.12,
+  point_cloud_las: 0.12,
+  orthomosaic_tif: 0.30,
+  ortho_tif: 0.30,
+  dem_tif: 0.10,
+  dsm_tif: 0.10,
+  dtm_tif: 0.18,
+  contours_dxf: 0.05,
+  mesh_obj: 0.18,
+  model_obj: 0.18,
+  obj: 0.18,
+  glb: 0.14,
+  mesh_fbx: 0.18,
+  fbx: 0.18,
+  textures: 0.20,
+  texture: 0.20,
+  tiled_model: 0.18,
+  tiles_3tz: 0.18,
+  pdf_report: 0.03
+};
+
+function calculateProcessingLoadScore({
+  photosCount,
+  totalBytes,
+  avgMegapixels,
+  totalMegapixels,
+  qualityMode,
+  outputsRequested,
+  projectType
+}) {
+  const photos = Math.max(0, Number(photosCount || 0));
+  const bytes = Math.max(0, Number(totalBytes || 0));
+  const totalMb = bytes / (1024 * 1024);
+  const avgMp = Math.max(0, Number(avgMegapixels || 0));
+  const totalMp = Math.max(0, Number(totalMegapixels || 0))
+    || (avgMp > 0 ? avgMp * photos : 0)
+    || (photos * 12);
+
+  const outputs = normalizeOutputList(outputsRequested);
+  const outputFactor = 1 + outputs.reduce(
+    (sum, output) => sum + (OUTPUT_LOAD_WEIGHTS[output] || 0.04),
+    0
+  );
+
+  const type = String(projectType || "fotogrametria").toLowerCase();
+  const typeFactor = type === "3d" ? 1.15 : (type === "tams" ? 0.75 : 1);
+  const qualityFactor = getQualityModeTimeFactor(qualityMode);
+
+  // Combina píxeles y volumen comprimido. No pretende ser "segundos":
+  // es una unidad de carga estable para comparar trabajos similares.
+  const baseWork = totalMp + (totalMb * 0.20);
+  return Math.round(baseWork * qualityFactor * outputFactor * typeFactor * 100) / 100;
 }
 
 function estimateProcessingSecondsFromInputs(photosCount, totalBytes, qualityMode = "normal") {
@@ -951,7 +1399,12 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       tams_export: tamsExport,
       price,
       estimated_seconds: estimatedSeconds,
-      estimated_human: formatEtaSeconds(estimatedSeconds)
+      estimated_human: formatEtaSeconds(estimatedSeconds),
+      prediction_method: prediction.method,
+      prediction_neighbors: prediction.neighbors,
+      processing_load_score: processingLoadScore,
+      image_stats: updatedExifSummary?._xproces?.image_stats || null,
+      timing_prediction: timingPlan
     });
   } catch (e) {
     console.error("pricing preview error", e);
@@ -1692,79 +2145,92 @@ const userId = req.body?.user_id || null;
     }
 
     await ensurePaymentColumns();
+    await ensureTimingAnalyticsSchema();
+
+    const declaredStats = extractDeclaredImageStats(
+      exifSummary,
+      expectedPhotosCount,
+      expectedTotalBytes
+    );
+    const initialLoadScore = calculateProcessingLoadScore({
+      photosCount: expectedPhotosCount,
+      totalBytes: expectedTotalBytes,
+      avgMegapixels: declaredStats.avgMegapixels,
+      totalMegapixels: declaredStats.totalMegapixels,
+      qualityMode,
+      outputsRequested,
+      projectType
+    });
+
     const estimatedSecondsForPayment = await estimateProcessingSecondsFromInputsHistorical(
-      pool, expectedPhotosCount, expectedTotalBytes, qualityMode, tamsExport
+      pool,
+      expectedPhotosCount,
+      expectedTotalBytes,
+      qualityMode,
+      tamsExport,
+      {
+        projectType,
+        outputsRequested,
+        avgMegapixels: declaredStats.avgMegapixels,
+        totalMegapixels: declaredStats.totalMegapixels,
+        processingLoadScore: initialLoadScore
+      }
     );
     const initialPrice = calculatePriceFromInputs(
       expectedPhotosCount, expectedTotalBytes, estimatedSecondsForPayment, qualityMode, outputsRequested, projectType
     );
     const initialPaymentStatus = initialPrice <= 0 ? "exempt" : "pending";
 
-    const insertSql = jobsHasQualityMode
-      ? `insert into jobs (
-          status,
-          photos_count,
-          price,
-          exif_summary,
-          client_email,
-          project_name,
-          client_name,
-          user_id,
-          quality_mode,
-          project_type,
-          outputs,
-          payment_status,
-          payment_currency
-        )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13)
-        returning *`
-      : `insert into jobs (
-          status,
-          photos_count,
-          price,
-          exif_summary,
-          client_email,
-          project_name,
-          client_name,
-          user_id,
-          project_type,
-          outputs,
-          payment_status,
-          payment_currency
-        )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12)
-        returning *`;
+    const insertSql = `insert into jobs (
+        status,
+        photos_count,
+        price,
+        exif_summary,
+        client_email,
+        project_name,
+        client_name,
+        user_id,
+        quality,
+        project_type,
+        outputs,
+        avg_photo_mb,
+        avg_width,
+        avg_height,
+        avg_megapixels,
+        total_megapixels,
+        processing_load_score,
+        estimated_processing_seconds,
+        payment_status,
+        payment_currency
+      )
+      values (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb,
+        $12, $13, $14, $15, $16, $17, $18, $19, $20
+      )
+      returning *`;
 
-    const insertParams = jobsHasQualityMode
-      ? [
-          initialPrice <= 0 ? "created" : "pending_payment",
-          0,
-          initialPrice,
-          exifSummary,
-          clientEmail,
-          projectName,
-          clientName,
-          userId,
-          qualityMode,
-          projectType,
-          JSON.stringify(outputsRequested),
-          initialPaymentStatus,
-          PAYPAL_CURRENCY
-        ]
-      : [
-          initialPrice <= 0 ? "created" : "pending_payment",
-          0,
-          initialPrice,
-          exifSummary,
-          clientEmail,
-          projectName,
-          clientName,
-          userId,
-          projectType,
-          JSON.stringify(outputsRequested),
-          initialPaymentStatus,
-          PAYPAL_CURRENCY
-        ];
+    const insertParams = [
+      initialPrice <= 0 ? "created" : "pending_payment",
+      0,
+      initialPrice,
+      exifSummary,
+      clientEmail,
+      projectName,
+      clientName,
+      userId,
+      qualityMode,
+      projectType,
+      JSON.stringify(normalizeOutputList(outputsRequested)),
+      declaredStats.avgPhotoMb,
+      declaredStats.avgWidth,
+      declaredStats.avgHeight,
+      declaredStats.avgMegapixels,
+      declaredStats.totalMegapixels,
+      initialLoadScore,
+      estimatedSecondsForPayment,
+      initialPaymentStatus,
+      PAYPAL_CURRENCY
+    ];
 
     const { rows } = await pool.query(insertSql, insertParams);
 
@@ -1783,12 +2249,16 @@ const userId = req.body?.user_id || null;
 app.post("/jobs/:id/submit", async (req, res) => {
   try {
     const { id } = req.params;
+    await ensureTimingAnalyticsSchema();
 
-    const selectJobSql = jobsHasQualityMode
-      ? "select id, status, photos_count, quality_mode, exif_summary, payment_status, payment_amount, payment_currency from jobs where id = $1"
-      : "select id, status, photos_count, exif_summary, payment_status, payment_amount, payment_currency from jobs where id = $1";
-
-    const { rows } = await pool.query(selectJobSql, [id]);
+    const { rows } = await pool.query(
+      `select id, status, photos_count, quality, exif_summary,
+              created_at, upload_completed_at,
+              payment_status, payment_amount, payment_currency
+         from jobs
+        where id = $1`,
+      [id]
+    );
     if (!rows.length) return res.status(404).json({ error: "job not found" });
 
     const job = rows[0];
@@ -1806,12 +2276,12 @@ app.post("/jobs/:id/submit", async (req, res) => {
     }
     const qualityMode = normalizeQualityMode(
       req.body?.quality_mode ||
-      job.quality_mode ||
+      job.quality ||
       job?.exif_summary?._xproces?.quality_mode ||
       "normal"
     );
 
-    const updatedExifSummary = stripNullCharsDeep({
+    let updatedExifSummary = stripNullCharsDeep({
       ...(job.exif_summary || {}),
       _xproces: {
         ...((job.exif_summary && job.exif_summary._xproces) || {}),
@@ -1850,8 +2320,9 @@ app.post("/jobs/:id/submit", async (req, res) => {
       });
     }
 
-    const photosCount = inputs.length;
-    const inputTotalBytes = getInputTotalBytes(id);
+    const inputStats = collectInputImageStats(id, updatedExifSummary);
+    const photosCount = inputStats.photosCount;
+    const inputTotalBytes = inputStats.inputTotalBytes;
     const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || 0;
 
     if (expectedPhotos > 0 && photosCount < expectedPhotos) {
@@ -1880,16 +2351,67 @@ app.post("/jobs/:id/submit", async (req, res) => {
     }
 
     const projectType = String(job.exif_summary?._xproces?.project_type || "fotogrametria").toLowerCase();
-    const outputsRequested = Array.isArray(job.exif_summary?._xproces?.outputs_requested) ? job.exif_summary._xproces.outputs_requested : [];
+    const outputsRequested = normalizeOutputList(job.exif_summary?._xproces?.outputs_requested || []);
     const tamsExport = !!job.exif_summary?._xproces?.tams_export || projectType === "tams";
 
-    const estimatedSeconds = await estimateProcessingSecondsFromInputsHistorical(
-      pool,
+    const processingLoadScore = calculateProcessingLoadScore({
       photosCount,
-      inputTotalBytes,
+      totalBytes: inputTotalBytes,
+      avgMegapixels: inputStats.avgMegapixels,
+      totalMegapixels: inputStats.totalMegapixels,
       qualityMode,
+      outputsRequested,
+      projectType
+    });
+
+    const actualUploadSeconds = job.created_at && job.upload_completed_at
+      ? Math.max(0, Math.round((new Date(job.upload_completed_at).getTime() - new Date(job.created_at).getTime()) / 1000))
+      : null;
+
+    const targetFeatures = {
+      id,
+      actualUploadSeconds,
+      photosCount,
+      totalBytes: inputTotalBytes,
+      avgPhotoMb: inputStats.avgPhotoMb,
+      avgWidth: inputStats.avgWidth,
+      avgHeight: inputStats.avgHeight,
+      avgMegapixels: inputStats.avgMegapixels,
+      totalMegapixels: inputStats.totalMegapixels,
+      processingLoadScore,
+      qualityMode,
+      outputsRequested,
+      projectType,
       tamsExport
-    );
+    };
+
+    const prediction = await estimateProcessingDetailsHistorical(pool, targetFeatures);
+    const estimatedSeconds = prediction.seconds;
+    const timingPlan = await estimateStageTimingPlan(pool, targetFeatures, prediction);
+
+    updatedExifSummary = stripNullCharsDeep({
+      ...(updatedExifSummary || {}),
+      _xproces: {
+        ...((updatedExifSummary && updatedExifSummary._xproces) || {}),
+        quality_mode: qualityMode,
+        project_type: projectType,
+        outputs_requested: outputsRequested,
+        totalPhotos: photosCount,
+        totalBytes: inputTotalBytes,
+        image_stats: {
+          avg_photo_mb: inputStats.avgPhotoMb,
+          avg_width: inputStats.avgWidth,
+          avg_height: inputStats.avgHeight,
+          avg_megapixels: inputStats.avgMegapixels,
+          total_megapixels: inputStats.totalMegapixels,
+          sampled_dimensions: inputStats.sampledDimensions
+        },
+        processing_load_score: processingLoadScore,
+        timing_prediction: timingPlan,
+        prediction_method: prediction.method,
+        prediction_neighbors: prediction.neighbors
+      }
+    });
 
     const price = calculatePriceFromInputs(
       photosCount,
@@ -1975,44 +2497,50 @@ app.post("/jobs/:id/submit", async (req, res) => {
     }
 
     // Fotogrametría / 3D: guardar conteo real + precio real y poner en cola.
-    const submitUpdateSql = jobsHasQualityMode
-      ? `update jobs
-           set status='queued',
-               stage='queued',
-               photos_count=$2,
-               price=$3,
-               input_total_bytes=$4,
-               quality_mode=$5,
-               exif_summary=$6,
-               project_type=$7,
-               outputs=$8::jsonb,
-               estimated_processing_seconds=$9,
-               progress=0,
-               message='En cola',
-               error=null,
-               updated_at=now(),
-               started_at = case when started_at is null then now() else started_at end
-         where id=$1`
-      : `update jobs
-           set status='queued',
-               stage='queued',
-               photos_count=$2,
-               price=$3,
-               input_total_bytes=$4,
-               exif_summary=$5,
-               project_type=$6,
-               outputs=$7::jsonb,
-               estimated_processing_seconds=$8,
-               progress=0,
-               message='En cola',
-               error=null,
-               updated_at=now(),
-               started_at = case when started_at is null then now() else started_at end
-         where id=$1`;
+    // Fotogrametría / 3D: guarda las características reales que alimentan
+    // el histórico y la estimación de los siguientes trabajos.
+    const submitUpdateSql = `update jobs
+         set status='queued',
+             stage='queued',
+             photos_count=$2,
+             price=$3,
+             input_total_bytes=$4,
+             quality=$5,
+             exif_summary=$6,
+             project_type=$7,
+             outputs=$8::jsonb,
+             estimated_processing_seconds=$9,
+             avg_photo_mb=$10,
+             avg_width=$11,
+             avg_height=$12,
+             avg_megapixels=$13,
+             total_megapixels=$14,
+             processing_load_score=$15,
+             progress=$16,
+             message='En cola',
+             error=null,
+             updated_at=now(),
+             started_at = case when started_at is null then now() else started_at end
+       where id=$1`;
 
-    const submitUpdateParams = jobsHasQualityMode
-      ? [id, photosCount, price, inputTotalBytes, qualityMode, updatedExifSummary, projectType, JSON.stringify(outputsRequested), estimatedSeconds]
-      : [id, photosCount, price, inputTotalBytes, updatedExifSummary, projectType, JSON.stringify(outputsRequested), estimatedSeconds];
+    const submitUpdateParams = [
+      id,
+      photosCount,
+      price,
+      inputTotalBytes,
+      qualityMode,
+      updatedExifSummary,
+      projectType,
+      JSON.stringify(outputsRequested),
+      estimatedSeconds,
+      inputStats.avgPhotoMb,
+      inputStats.avgWidth,
+      inputStats.avgHeight,
+      inputStats.avgMegapixels,
+      inputStats.totalMegapixels,
+      processingLoadScore,
+      Math.max(0, Math.min(99, Math.round(timingPlan.upload_end_percent ?? 0)))
+    ];
 
     await pool.query(submitUpdateSql, submitUpdateParams);
 
@@ -2033,7 +2561,12 @@ app.post("/jobs/:id/submit", async (req, res) => {
       tams_export: tamsExport,
       price,
       estimated_seconds: estimatedSeconds,
-      estimated_human: formatEtaSeconds(estimatedSeconds)
+      estimated_human: formatEtaSeconds(estimatedSeconds),
+      prediction_method: prediction.method,
+      prediction_neighbors: prediction.neighbors,
+      processing_load_score: processingLoadScore,
+      image_stats: updatedExifSummary?._xproces?.image_stats || null,
+      timing_prediction: timingPlan
     });
   } catch (e) {
     console.error("submit error", e);
@@ -2091,10 +2624,16 @@ app.post("/jobs/:id/upload", requirePaidJobBeforeUpload, uploadInput.any(), asyn
     let nextStatus = String(job.status || "").toLowerCase();
     let nextMessage = "Recibiendo fotos";
 
+    const uploadWasAlreadyActive = String(job.status || "").toLowerCase() === "receiving";
+
     if (nextStatus === "created") {
       nextStatus = "receiving";
     } else if (!nextStatus) {
       nextStatus = "receiving";
+    }
+
+    if (!uploadWasAlreadyActive && nextStatus === "receiving") {
+      await recordJobStageEvent(pool, id, "uploading", "start");
     }
 
     if (expectedPhotos && totalPhotos >= expectedPhotos) {
@@ -2393,6 +2932,8 @@ app.post("/jobs/:id/complete-upload", async (req, res) => {
       );
     }
 
+    await recordJobStageEvent(pool, id, "uploading", "end");
+
     return res.json({
       ok: true,
       ready: true,
@@ -2613,6 +3154,7 @@ app.post("/jobs/:id/output", uploadOutput.single("file"), async (req, res) => {
         where id = $1`,
       [id]
     );
+    await recordJobStageEvent(pool, id, "zip_upload", "end");
 
     // Red de seguridad: si aún quedaba input en el VPS, lo purgamos al recibir el ZIP final.
     const inputCleanupOk = safeRemoveDir(inputDir(id));
@@ -2943,9 +3485,10 @@ app.patch("/jobs/:id", async (req, res) => {
     }
 
     const currentJobResult = await pool.query(
-      `select id, status, stage, progress, started_at, finished_at, created_at, processing_started_at, processing_finished_at
-       from jobs
-       where id = $1`,
+      `select id, status, stage, progress, started_at, finished_at, created_at,
+              processing_started_at, processing_finished_at, exif_summary
+         from jobs
+        where id = $1`,
       [id]
     );
 
@@ -2963,6 +3506,14 @@ app.patch("/jobs/:id", async (req, res) => {
     let nextMessageParam = message ?? null;
     let nextStageInput = stage;
 
+    const rawLiveLog = process_log ?? log_line ?? log;
+    const logSignal = extractProgressSignalFromLog(rawLiveLog);
+    if (logSignal) {
+      if (nextProgressParam === null && logSignal.percent !== null) nextProgressParam = logSignal.percent;
+      if (!nextMessageParam && logSignal.message) nextMessageParam = logSignal.message;
+      if (!nextStageInput && logSignal.stage) nextStageInput = logSignal.stage;
+    }
+
     const zipPathForJob = path.join(outputDir(id), "outputs.zip");
     let zipReadyForClient = false;
     try {
@@ -2978,8 +3529,8 @@ app.patch("/jobs/:id", async (req, res) => {
     // No se permite status done ni botón de descarga hasta que outputs.zip exista en el VPS.
     if (incomingStatus === "done" && !zipReadyForClient) {
       nextStatusParam = "running";
-      nextStageInput = "export";
-      nextProgressParam = 99;
+      nextStageInput = "zip_upload";
+      nextProgressParam = 85;
       nextMessageParam = "Subiendo ZIP final al servidor";
       incomingStatus = "running";
     } else if (
@@ -2993,7 +3544,26 @@ app.patch("/jobs/:id", async (req, res) => {
       incomingStatus = "done";
     }
 
-    const nextStage = inferProcessingStage({ status: incomingStatus || currentStatus, stage: nextStageInput, progress: nextProgressParam, message: nextMessageParam });
+    const nextStage = inferProcessingStage({
+      status: incomingStatus || currentStatus,
+      stage: nextStageInput,
+      progress: nextProgressParam,
+      message: nextMessageParam
+    });
+
+    // Para trabajos nuevos, el porcentaje deja de depender de los números fijos
+    // del script. Se toma el inicio previsto de la fase calculado con fotos,
+    // megapíxeles, calidad, salidas solicitadas e histórico real.
+    if (nextStage && incomingStatus !== "done") {
+      const plannedProgress = getPlannedProgressForStage(currentJob.exif_summary, nextStage);
+      if (Number.isFinite(plannedProgress)) {
+        nextProgressParam = Math.max(
+          currentProgress,
+          Math.min(99, Math.round(plannedProgress))
+        );
+      }
+    }
+
     const terminalStatus = incomingStatus && ["done", "failed", "cancelled"].includes(incomingStatus);
 
     if (currentStatus === "cancelled") {
@@ -3007,7 +3577,6 @@ app.patch("/jobs/:id", async (req, res) => {
     if (process_log !== undefined || log_line !== undefined || log !== undefined) {
       try {
         ensureJobDirs(id);
-        const rawLiveLog = process_log ?? log_line ?? log;
         const liveText = String(rawLiveLog ?? "").replace(/\u0000/g, "").slice(0, 20000);
         if (liveText.trim()) {
           const liveLogPath = path.join(outputDir(id), "metashape-python-log.txt");
@@ -3018,19 +3587,22 @@ app.patch("/jobs/:id", async (req, res) => {
       }
     }
 
-    if (nextStage && nextStage !== currentStage) {
+    const stageChanged = !!(nextStage && nextStage !== currentStage);
+    if (stageChanged) {
       if (currentStage) await recordJobStageEvent(pool, id, currentStage, "end");
       await recordJobStageEvent(pool, id, nextStage, "start");
-    } else if (nextStage && p !== null && p !== currentProgress) {
+    } else if (nextStage && nextProgressParam !== null && nextProgressParam !== currentProgress) {
       await recordJobStageEvent(pool, id, nextStage, "progress");
     }
 
-    if (terminalStatus && currentStage && currentStage !== nextStage) {
-      await recordJobStageEvent(pool, id, currentStage, "end");
-    }
-    if (terminalStatus && nextStage) {
-      await recordJobStageEvent(pool, id, nextStage, "start");
-      await recordJobStageEvent(pool, id, nextStage, "end");
+    // Al terminar, cerrar una sola vez la fase terminal. El bloque anterior ya
+    // abrió la fase nueva cuando hubo transición.
+    if (terminalStatus) {
+      if (nextStage) {
+        await recordJobStageEvent(pool, id, nextStage, "end");
+      } else if (currentStage) {
+        await recordJobStageEvent(pool, id, currentStage, "end");
+      }
     }
 
     const { rows } = await pool.query(
@@ -3059,7 +3631,11 @@ app.patch("/jobs/:id", async (req, res) => {
              updated_at = now(),
              started_at = case when $2 = 'running' and started_at is null then now() else started_at end,
              processing_started_at = case when $2 = 'running' and processing_started_at is null then now() else processing_started_at end,
-             processing_finished_at = case when $2 in ('done','failed','cancelled') then now() else processing_finished_at end,
+             processing_finished_at = case
+               when $3 = 'zip_upload' then coalesce(processing_finished_at, now())
+               when $2 in ('done','failed','cancelled') then coalesce(processing_finished_at, now())
+               else processing_finished_at
+             end,
              finished_at = case when $2 in ('done','failed','cancelled') then now() else finished_at end,
              results_ready_at = case when $2 = 'done' then coalesce(results_ready_at, now()) else results_ready_at end
        where id = $1
@@ -3094,8 +3670,8 @@ app.post("/worker/claim", requireWorkerAuth, async (_req, res) => {
     const { rows } = await pool.query(
       `update jobs
           set status='running',
-              stage='running',
-              progress=0,
+              stage='downloading',
+              progress=coalesce(progress, 0),
               message='Worker claimed',
               updated_at=now(),
               started_at=case when started_at is null then now() else started_at end,
@@ -3358,16 +3934,12 @@ app.post("/worker/jobs/:id/confirm-download", requireWorkerAuth, async (req, res
     const { id } = req.params;
 
     const { rows } = await pool.query(
-      "select id, input_purged from jobs where id = $1",
+      "select id, input_purged, stage, progress, exif_summary from jobs where id = $1",
       [id]
     );
     if (!rows.length) return res.status(404).json({ ok: false, error: "job not found" });
 
     const job = rows[0];
-
-    if (job.input_purged) {
-      return res.json({ ok: true, alreadyPurged: true });
-    }
 
     const dir = inputDir(id);
     const purged = safeRemoveDir(dir);
@@ -3378,19 +3950,30 @@ app.post("/worker/jobs/:id/confirm-download", requireWorkerAuth, async (req, res
       console.log("Input eliminado correctamente:", id);
     }
 
+    const processingStartProgress = getPlannedProgressForStage(job.exif_summary, "preparing");
+    const nextProgress = Number.isFinite(processingStartProgress)
+      ? Math.max(Number(job.progress || 0), Math.round(processingStartProgress))
+      : Number(job.progress || 0);
+
+    await recordJobStageEvent(pool, id, "downloading", "end");
+    await recordJobStageEvent(pool, id, "preparing", "start");
+
     await pool.query(
      `update jobs
          set input_purged = $2,
              input_purged_at = case when $2 then now() else input_purged_at end,
+             download_finished_at = now(),
+             processing_started_at = now(),
              status = case when status = 'tams_pending_download' and $2 then 'tams_downloaded' else status end,
-             stage = case when status = 'tams_pending_download' and $2 then 'downloaded_pc' else stage end,
-             message = case when status = 'tams_pending_download' and $2 then 'TAMS descargado en PC' else message end,
+             stage = case when status = 'tams_pending_download' and $2 then 'downloaded_pc' else 'preparing' end,
+             progress = case when status = 'tams_pending_download' and $2 then progress else greatest(coalesce(progress, 0), $3) end,
+             message = case when status = 'tams_pending_download' and $2 then 'TAMS descargado en PC' else 'Descarga validada. Iniciando procesado' end,
              updated_at = now()
        where id = $1`,
-     [id, purged]
+     [id, purged, nextProgress]
    );
 
-    res.json({ ok: true, purged });
+    res.json({ ok: true, purged, processingStarted: true });
   } catch (e) {
     console.error("confirm-download error", e);
     res.status(500).json({ ok: false, error: "confirm-download error" });
@@ -3453,100 +4036,607 @@ app.get("/worker/jobs/:id/file/:name", requireWorkerAuth, async (req, res) => {
   }
 });
 
-function estimateProcessingSecondsFromFallback(job) {
-  const photos = Number(job.photos_count || 0);
-  const bytes = Number(job.input_total_bytes || 0);
-  const gb = bytes / (1024 * 1024 * 1024);
-  const qualityMode = normalizeQualityMode(job?.quality_mode);
 
-  return Math.round(
-    (120 + (photos * 18) + (gb * 420)) * getQualityModeTimeFactor(qualityMode)
+function getJobQualityMode(job) {
+  return normalizeQualityMode(
+    job?.quality ||
+    job?.quality_mode ||
+    job?.exif_summary?._xproces?.quality_mode ||
+    "normal"
   );
 }
 
-async function estimateProcessingSecondsFromInputsHistorical(pool, photosCount, totalBytes, qualityMode = "normal", tamsExport = false) {
-  const photos = Number(photosCount || 0);
-  const bytes = Number(totalBytes || 0);
-  const normalizedQualityMode = normalizeQualityMode(qualityMode);
+function getJobOutputs(job) {
+  return normalizeOutputList(
+    job?.outputs ||
+    job?.exif_summary?._xproces?.outputs_requested ||
+    []
+  );
+}
+
+function buildJobFeatures(job = {}) {
+  const photosCount = Number(job.photos_count ?? job.photosCount ?? 0) || 0;
+  const totalBytes = Number(job.input_total_bytes ?? job.totalBytes ?? 0) || 0;
+  const declared = extractDeclaredImageStats(
+    job.exif_summary || null,
+    photosCount,
+    totalBytes
+  );
+  const avgMegapixels = finiteNumber(job.avg_megapixels ?? job.avgMegapixels, declared.avgMegapixels);
+  const totalMegapixels = finiteNumber(job.total_megapixels ?? job.totalMegapixels, declared.totalMegapixels);
+  const qualityMode = normalizeQualityMode(job.qualityMode || getJobQualityMode(job));
+  const outputsRequested = normalizeOutputList(job.outputsRequested || getJobOutputs(job));
+  const projectType = String(
+    job.projectType ||
+    job.project_type ||
+    job?.exif_summary?._xproces?.project_type ||
+    "fotogrametria"
+  ).toLowerCase();
+  const tamsExport = !!(
+    job.tamsExport ??
+    job?.exif_summary?._xproces?.tams_export ??
+    (projectType === "tams")
+  );
+
+  const processingLoadScore = Number(
+    job.processing_load_score ??
+    job.processingLoadScore ??
+    calculateProcessingLoadScore({
+      photosCount,
+      totalBytes,
+      avgMegapixels,
+      totalMegapixels,
+      qualityMode,
+      outputsRequested,
+      projectType
+    })
+  ) || 0;
+
+  return {
+    id: job.id || null,
+    photosCount,
+    totalBytes,
+    avgPhotoMb: finiteNumber(job.avg_photo_mb ?? job.avgPhotoMb, declared.avgPhotoMb),
+    avgWidth: finiteNumber(job.avg_width ?? job.avgWidth, declared.avgWidth),
+    avgHeight: finiteNumber(job.avg_height ?? job.avgHeight, declared.avgHeight),
+    avgMegapixels,
+    totalMegapixels,
+    processingLoadScore,
+    qualityMode,
+    outputsRequested,
+    projectType,
+    tamsExport
+  };
+}
+
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, Number(value)));
+}
+
+function logRatioDistance(a, b) {
+  const x = Math.max(0, Number(a || 0));
+  const y = Math.max(0, Number(b || 0));
+  if (x === 0 && y === 0) return 0;
+  return Math.abs(Math.log((x + 1) / (y + 1)));
+}
+
+function outputSetDistance(a, b) {
+  const setA = new Set(normalizeOutputList(a));
+  const setB = new Set(normalizeOutputList(b));
+  const union = new Set([...setA, ...setB]);
+  if (!union.size) return 0;
+
+  let intersection = 0;
+  for (const item of setA) {
+    if (setB.has(item)) intersection += 1;
+  }
+  return 1 - (intersection / union.size);
+}
+
+function processingFeatureDistance(target, candidate) {
+  let distance = 0;
+  distance += logRatioDistance(target.photosCount, candidate.photosCount) * 2.2;
+  distance += logRatioDistance(target.totalBytes, candidate.totalBytes) * 1.4;
+  distance += logRatioDistance(target.totalMegapixels, candidate.totalMegapixels) * 2.0;
+  distance += logRatioDistance(target.avgMegapixels, candidate.avgMegapixels) * 0.7;
+  distance += outputSetDistance(target.outputsRequested, candidate.outputsRequested) * 3.0;
+
+  if (target.qualityMode !== candidate.qualityMode) distance += 2.5;
+  if (target.projectType !== candidate.projectType) distance += 4.0;
+  if (!!target.tamsExport !== !!candidate.tamsExport) distance += 4.0;
+
+  return distance;
+}
+
+function estimateProcessingSecondsFromFallback(job) {
+  const features = buildJobFeatures(job);
+  const gb = features.totalBytes / (1024 * 1024 * 1024);
+  const base = 120 + (features.photosCount * 18) + (gb * 420);
+  const outputExtra = features.outputsRequested.reduce(
+    (sum, output) => sum + (OUTPUT_LOAD_WEIGHTS[output] || 0.04),
+    0
+  );
+  return Math.max(60, Math.round(
+    base * getQualityModeTimeFactor(features.qualityMode) * (1 + outputExtra * 0.45)
+  ));
+}
+
+async function estimateProcessingDetailsHistorical(pool, targetInput) {
+  const target = buildJobFeatures(targetInput);
   const startDate = "2026-04-05";
 
-  const tryQueries = [];
+  const { rows } = await pool.query(
+    `select id, processing_seconds, total_seconds, photos_count, input_total_bytes,
+            avg_photo_mb, avg_width, avg_height, avg_megapixels, total_megapixels,
+            processing_load_score, project_type, quality, outputs, exif_summary,
+            created_at
+       from jobs
+      where status = 'done'
+        and processing_seconds is not null
+        and processing_seconds > 0
+        and photos_count > 0
+        and created_at >= $1
+        and ($2::uuid is null or id <> $2::uuid)
+      order by created_at desc
+      limit 500`,
+    [startDate, target.id || null]
+  );
 
-  if (jobsHasQualityMode) {
-    tryQueries.push({
-      sql: `select processing_seconds, photos_count
-            from jobs
-            where status = 'done'
-              and processing_seconds is not null
-              and photos_count > 0
-              and created_at >= $1
-              and quality_mode = $2
-              and coalesce((exif_summary->'_xproces'->>'tams_export')::boolean, false) = $3
-            order by created_at desc
-            limit 50`,
-      params: [startDate, normalizedQualityMode, !!tamsExport]
-    });
+  const candidates = rows
+    .map((row) => {
+      const features = buildJobFeatures(row);
+      const seconds = Number(row.processing_seconds || 0);
+      if (!Number.isFinite(seconds) || seconds <= 0) return null;
+
+      const distance = processingFeatureDistance(target, features);
+      const targetScore = Math.max(1, target.processingLoadScore);
+      const candidateScore = Math.max(1, features.processingLoadScore);
+      const scale = clampNumber(Math.pow(targetScore / candidateScore, 0.82), 0.25, 4);
+      const predictedSeconds = seconds * scale;
+      const weight = 1 / Math.pow(0.35 + distance, 2);
+
+      return {
+        id: row.id,
+        seconds,
+        predictedSeconds,
+        distance,
+        weight,
+        features
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, 12);
+
+  if (candidates.length >= 3) {
+    const weightedSum = candidates.reduce((sum, item) => sum + (item.predictedSeconds * item.weight), 0);
+    const weightSum = candidates.reduce((sum, item) => sum + item.weight, 0);
+    const weightedAverage = weightSum > 0 ? weightedSum / weightSum : 0;
+
+    const ordered = candidates.map((item) => item.predictedSeconds).sort((a, b) => a - b);
+    const median = ordered[Math.floor(ordered.length / 2)];
+    const blended = (weightedAverage * 0.75) + (median * 0.25);
+
+    return {
+      seconds: Math.max(60, Math.round(blended)),
+      method: "historical_nearest_jobs",
+      neighbors: candidates.length,
+      neighborDetails: candidates
+    };
   }
 
-  tryQueries.push({
-    sql: `select processing_seconds, photos_count
-          from jobs
-          where status = 'done'
-            and processing_seconds is not null
-            and photos_count > 0
-            and created_at >= $1
-            and coalesce((exif_summary->'_xproces'->>'tams_export')::boolean, false) = $2
-          order by created_at desc
-          limit 50`,
-    params: [startDate, !!tamsExport]
-  });
+  return {
+    seconds: estimateProcessingSecondsFromFallback(target),
+    method: "formula_fallback",
+    neighbors: candidates.length,
+    neighborDetails: candidates
+  };
+}
 
-  tryQueries.push({
-    sql: `select processing_seconds, photos_count
-          from jobs
-          where status = 'done'
-            and processing_seconds is not null
-            and photos_count > 0
-            and created_at >= $1
-          order by created_at desc
-          limit 50`,
-    params: [startDate]
+async function estimateProcessingSecondsFromInputsHistorical(
+  pool,
+  photosCount,
+  totalBytes,
+  qualityMode = "normal",
+  tamsExport = false,
+  extra = {}
+) {
+  const details = await estimateProcessingDetailsHistorical(pool, {
+    photosCount,
+    totalBytes,
+    qualityMode,
+    tamsExport,
+    ...extra
   });
+  return details.seconds;
+}
 
-  for (const q of tryQueries) {
-    const { rows } = await pool.query(q.sql, q.params);
-    if (rows.length >= 3) {
-      const totalPhotos = rows.reduce((acc, r) => acc + Number(r.photos_count || 0), 0);
-      const totalSeconds = rows.reduce((acc, r) => acc + Number(r.processing_seconds || 0), 0);
-      if (totalPhotos > 0) {
-        const secPerPhoto = totalSeconds / totalPhotos;
-        return Math.round(photos * secPerPhoto * 1.25);
+const TIMING_STAGE_ORDER = [
+  "preparing",
+  "importing",
+  "matching",
+  "aligning",
+  "depth_maps",
+  "model",
+  "uv",
+  "texture",
+  "tiled_model",
+  "point_cloud",
+  "ground_classification",
+  "dem",
+  "export_dem",
+  "dtm",
+  "export_dtm",
+  "orthomosaic",
+  "colorize_model",
+  "report",
+  "export_tiled_model",
+  "export_model",
+  "export_point_cloud",
+  "export_orthomosaic",
+  "export_texture",
+  "export_reference",
+  "exporting",
+  "zip",
+  "closing_metashape",
+  "processing_complete"
+];
+
+const FALLBACK_STAGE_WEIGHTS = {
+  preparing: 0.035,
+  importing: 0.010,
+  matching: 0.055,
+  aligning: 0.025,
+  depth_maps: 0.120,
+  model: 0.160,
+  uv: 0.080,
+  texture: 0.150,
+  tiled_model: 0.100,
+  point_cloud: 0.110,
+  ground_classification: 0.025,
+  dem: 0.025,
+  export_dem: 0.010,
+  dtm: 0.025,
+  export_dtm: 0.010,
+  orthomosaic: 0.100,
+  colorize_model: 0.015,
+  report: 0.020,
+  export_tiled_model: 0.015,
+  export_model: 0.020,
+  export_point_cloud: 0.020,
+  export_orthomosaic: 0.025,
+  export_texture: 0.010,
+  export_reference: 0.005,
+  exporting: 0.060,
+  zip: 0.080,
+  closing_metashape: 0.100,
+  processing_complete: 0.005
+};
+
+function requiredTimingStages(featuresInput) {
+  const features = buildJobFeatures(featuresInput);
+  const outputs = new Set(features.outputsRequested);
+  const stages = new Set([
+    "preparing",
+    "importing",
+    "matching",
+    "aligning",
+    "depth_maps",
+    "model"
+  ]);
+
+  const needsTexture = ["textures", "texture", "mesh_obj", "model_obj", "obj", "glb", "mesh_fbx", "fbx"].some((x) => outputs.has(x));
+  const needsTiled = ["tiled_model", "tiles_3tz", "3tz"].some((x) => outputs.has(x));
+  const needsPointCloud = outputs.has("las") || outputs.has("point_cloud_las") ||
+    outputs.has("dem_tif") || outputs.has("dsm_tif") || outputs.has("dtm_tif") ||
+    outputs.has("contours_dxf") || outputs.has("orthomosaic_tif") || outputs.has("ortho_tif");
+  const needsDem = outputs.has("dem_tif") || outputs.has("dsm_tif");
+  const needsDtm = outputs.has("dtm_tif") || outputs.has("contours_dxf");
+  const needsOrtho = outputs.has("orthomosaic_tif") || outputs.has("ortho_tif");
+  const needsReport = outputs.has("pdf_report");
+
+  if (needsTexture) {
+    stages.add("uv");
+    stages.add("texture");
+  }
+  if (needsTiled) stages.add("tiled_model");
+  if (needsPointCloud) stages.add("point_cloud");
+  if (needsDtm) stages.add("ground_classification");
+  if (needsDem) {
+    stages.add("dem");
+    stages.add("export_dem");
+  }
+  if (needsDtm) {
+    stages.add("dtm");
+    stages.add("export_dtm");
+  }
+  if (needsOrtho) {
+    stages.add("orthomosaic");
+    stages.add("colorize_model");
+  }
+  if (needsReport) stages.add("report");
+  if (needsTiled) stages.add("export_tiled_model");
+  if (["mesh_obj", "model_obj", "obj", "glb", "mesh_fbx", "fbx"].some((x) => outputs.has(x)) || outputs.has("las")) {
+    stages.add("export_model");
+  }
+  if (outputs.has("las") || outputs.has("point_cloud_las")) stages.add("export_point_cloud");
+  if (needsOrtho) stages.add("export_orthomosaic");
+  if (needsTexture) stages.add("export_texture");
+
+  stages.add("exporting");
+  if (!features.tamsExport) stages.add("zip");
+  stages.add("closing_metashape");
+  stages.add("processing_complete");
+
+  return TIMING_STAGE_ORDER.filter((stage) => stages.has(stage));
+}
+
+
+function weightedTimingAverage(samples) {
+  const valid = (samples || []).filter((item) =>
+    Number.isFinite(Number(item?.seconds)) && Number(item.seconds) > 0 &&
+    Number.isFinite(Number(item?.weight)) && Number(item.weight) > 0
+  );
+  if (!valid.length) return null;
+  const weighted = valid.reduce((sum, item) => sum + Number(item.seconds) * Number(item.weight), 0);
+  const weights = valid.reduce((sum, item) => sum + Number(item.weight), 0);
+  return weights > 0 ? weighted / weights : null;
+}
+
+async function estimateServiceTimingSegments(pool, targetInput, prediction) {
+  const target = buildJobFeatures(targetInput);
+  const actualUploadSeconds = finiteNumber(targetInput?.actualUploadSeconds, null);
+  const neighbors = Array.isArray(prediction?.neighborDetails) ? prediction.neighborDetails : [];
+  const uploadSamples = [];
+  const downloadSamples = [];
+  const zipUploadSamples = [];
+
+  if (neighbors.length) {
+    const ids = neighbors.map((item) => item.id);
+    const { rows } = await pool.query(
+      `select id,
+              input_total_bytes,
+              processing_load_score,
+              download_seconds,
+              processing_seconds,
+              total_seconds,
+              extract(epoch from (upload_completed_at - created_at))::double precision as upload_seconds,
+              extract(epoch from (results_ready_at - processing_finished_at))::double precision as zip_upload_seconds
+         from jobs
+        where id = any($1::uuid[])`,
+      [ids]
+    );
+
+    const neighborMap = new Map(neighbors.map((item) => [String(item.id), item]));
+    for (const row of rows) {
+      const neighbor = neighborMap.get(String(row.id));
+      if (!neighbor) continue;
+
+      const sourceBytes = Math.max(1, Number(row.input_total_bytes || neighbor.features?.totalBytes || 1));
+      const byteScale = clampNumber(
+        Math.pow(Math.max(1, target.totalBytes) / sourceBytes, 0.85),
+        0.20,
+        5
+      );
+      const sourceScore = Math.max(1, Number(row.processing_load_score || neighbor.features?.processingLoadScore || 1));
+      const loadScale = clampNumber(
+        Math.pow(Math.max(1, target.processingLoadScore) / sourceScore, 0.60),
+        0.25,
+        4
+      );
+
+      const uploadSeconds = Number(row.upload_seconds || 0);
+      if (uploadSeconds > 0 && uploadSeconds < 6 * 3600) {
+        uploadSamples.push({ seconds: uploadSeconds * byteScale, weight: neighbor.weight });
+      }
+
+      const downloadSeconds = Number(row.download_seconds || 0);
+      if (downloadSeconds > 0 && downloadSeconds < 6 * 3600) {
+        downloadSamples.push({ seconds: downloadSeconds * byteScale, weight: neighbor.weight });
+      }
+
+      let zipSeconds = Number(row.zip_upload_seconds || 0);
+      if (!(zipSeconds > 0)) {
+        const total = Number(row.total_seconds || 0);
+        const processing = Number(row.processing_seconds || 0);
+        const download = Number(row.download_seconds || 0);
+        const upload = Number(row.upload_seconds || 0);
+        const residual = total - processing - download - Math.max(0, upload);
+        if (residual > 0) zipSeconds = residual;
+      }
+      if (zipSeconds > 0 && zipSeconds < 6 * 3600) {
+        zipUploadSamples.push({ seconds: zipSeconds * loadScale, weight: neighbor.weight });
       }
     }
   }
 
-  return estimateProcessingSecondsFromInputs(photos, bytes, normalizedQualityMode);
+  const inputBytes = Math.max(0, target.totalBytes);
+  const fallbackUpload = Math.max(5, inputBytes / (6 * 1024 * 1024));
+  const fallbackDownload = Math.max(5, inputBytes / (25 * 1024 * 1024));
+  const fallbackZipUpload = target.tamsExport
+    ? 0
+    : Math.max(30, Math.min(1800, Number(prediction.seconds || 0) * 0.15));
+
+  const uploadSeconds = actualUploadSeconds !== null && actualUploadSeconds > 0
+    ? actualUploadSeconds
+    : (weightedTimingAverage(uploadSamples) ?? fallbackUpload);
+  const downloadSeconds = weightedTimingAverage(downloadSamples) ?? fallbackDownload;
+  const processingSeconds = Math.max(1, Number(prediction.seconds || 1));
+  const zipUploadSeconds = target.tamsExport
+    ? 0
+    : (weightedTimingAverage(zipUploadSamples) ?? fallbackZipUpload);
+  const totalSeconds = Math.max(1, uploadSeconds + downloadSeconds + processingSeconds + zipUploadSeconds);
+
+  return {
+    upload_seconds: Math.max(0, Math.round(uploadSeconds)),
+    download_seconds: Math.max(0, Math.round(downloadSeconds)),
+    processing_seconds: Math.max(1, Math.round(processingSeconds)),
+    zip_upload_seconds: Math.max(0, Math.round(zipUploadSeconds)),
+    total_service_seconds: Math.max(1, Math.round(totalSeconds)),
+    upload_samples: uploadSamples.length,
+    download_samples: downloadSamples.length,
+    zip_upload_samples: zipUploadSamples.length
+  };
+}
+
+async function estimateStageTimingPlan(pool, targetInput, predictionInput = null) {
+  const target = buildJobFeatures(targetInput);
+  const prediction = predictionInput || await estimateProcessingDetailsHistorical(pool, target);
+  const serviceSegments = await estimateServiceTimingSegments(pool, targetInput, prediction);
+  const stages = requiredTimingStages(target);
+  const neighborDetails = Array.isArray(prediction.neighborDetails) ? prediction.neighborDetails : [];
+
+  const stageSamples = new Map();
+
+  if (neighborDetails.length) {
+    const ids = neighborDetails.map((item) => item.id);
+    const { rows } = await pool.query(
+      `with paired as (
+         select s.job_id,
+                s.stage,
+                s.created_at as started_at,
+                e.created_at as finished_at
+           from job_stage_events s
+           join lateral (
+             select x.created_at
+               from job_stage_events x
+              where x.job_id = s.job_id
+                and x.stage = s.stage
+                and x.event_type = 'end'
+                and x.id > s.id
+              order by x.id
+              limit 1
+           ) e on true
+          where s.job_id = any($1::uuid[])
+            and s.event_type = 'start'
+       )
+       select job_id, stage,
+              sum(extract(epoch from (finished_at - started_at)))::double precision as seconds
+         from paired
+        where finished_at >= started_at
+        group by job_id, stage`,
+      [ids]
+    );
+
+    const neighborMap = new Map(neighborDetails.map((item) => [String(item.id), item]));
+    for (const row of rows) {
+      const stage = normalizeProcessingStage(row.stage);
+      const seconds = Number(row.seconds || 0);
+      const neighbor = neighborMap.get(String(row.job_id));
+      if (!neighbor || !stages.includes(stage) || !Number.isFinite(seconds) || seconds <= 0 || seconds > 7 * 24 * 3600) continue;
+
+      const targetScore = Math.max(1, target.processingLoadScore);
+      const sourceScore = Math.max(1, neighbor.features.processingLoadScore);
+      const scaledSeconds = seconds * clampNumber(Math.pow(targetScore / sourceScore, 0.75), 0.25, 4);
+
+      if (!stageSamples.has(stage)) stageSamples.set(stage, []);
+      stageSamples.get(stage).push({
+        seconds: scaledSeconds,
+        weight: neighbor.weight
+      });
+    }
+  }
+
+  const rawDurations = {};
+  for (const stage of stages) {
+    const samples = stageSamples.get(stage) || [];
+    if (samples.length >= 2) {
+      const weighted = samples.reduce((sum, item) => sum + item.seconds * item.weight, 0);
+      const weights = samples.reduce((sum, item) => sum + item.weight, 0);
+      rawDurations[stage] = weights > 0 ? weighted / weights : 0;
+    } else {
+      rawDurations[stage] = Math.max(1, (FALLBACK_STAGE_WEIGHTS[stage] || 0.01) * prediction.seconds);
+    }
+  }
+
+  const rawTotal = Object.values(rawDurations).reduce((sum, value) => sum + Number(value || 0), 0) || 1;
+  const scale = prediction.seconds / rawTotal;
+
+  // Convierte el tiempo completo del servicio a porcentaje: subida real ya
+  // realizada + descarga estimada + procesado estimado + subida final del ZIP.
+  const serviceTotal = Math.max(1, Number(serviceSegments.total_service_seconds || 1));
+  const uploadEndPercent = (Number(serviceSegments.upload_seconds || 0) / serviceTotal) * 100;
+  const processingStartPercent = (
+    (Number(serviceSegments.upload_seconds || 0) + Number(serviceSegments.download_seconds || 0)) /
+    serviceTotal
+  ) * 100;
+  const processingEndPercent = target.tamsExport
+    ? 100
+    : (
+        (
+          Number(serviceSegments.upload_seconds || 0) +
+          Number(serviceSegments.download_seconds || 0) +
+          Number(serviceSegments.processing_seconds || prediction.seconds || 0)
+        ) / serviceTotal
+      ) * 100;
+  const processingRange = Math.max(0.1, processingEndPercent - processingStartPercent);
+
+  let accumulatedSeconds = 0;
+  const planStages = stages.map((stage) => {
+    const seconds = Math.max(1, Math.round(rawDurations[stage] * scale));
+    const startPercent = Math.round(
+      (processingStartPercent + (accumulatedSeconds / prediction.seconds) * processingRange) * 10
+    ) / 10;
+    accumulatedSeconds += seconds;
+    const endPercent = Math.round(
+      (processingStartPercent + (Math.min(accumulatedSeconds, prediction.seconds) / prediction.seconds) * processingRange) * 10
+    ) / 10;
+
+    return {
+      stage,
+      seconds,
+      start_percent: clampNumber(startPercent, processingStartPercent, processingEndPercent),
+      end_percent: clampNumber(endPercent, processingStartPercent, processingEndPercent),
+      sample_count: (stageSamples.get(stage) || []).length
+    };
+  });
+
+  return {
+    version: 2,
+    method: prediction.method,
+    neighbors: prediction.neighbors,
+    estimated_processing_seconds: prediction.seconds,
+    estimated_total_service_seconds: serviceSegments.total_service_seconds,
+    service_segments: serviceSegments,
+    upload_start_percent: 0,
+    upload_end_percent: Math.round(uploadEndPercent * 10) / 10,
+    download_start_percent: Math.round(uploadEndPercent * 10) / 10,
+    download_end_percent: Math.round(processingStartPercent * 10) / 10,
+    processing_start_percent: Math.round(processingStartPercent * 10) / 10,
+    processing_end_percent: Math.round(processingEndPercent * 10) / 10,
+    zip_upload_start_percent: Math.round(processingEndPercent * 10) / 10,
+    final_percent: 100,
+    stages: planStages
+  };
+}
+
+function getPlannedProgressForStage(exifSummary, stage) {
+  const normalizedStage = normalizeProcessingStage(stage);
+  if (!normalizedStage) return null;
+
+  const plan = exifSummary?._xproces?.timing_prediction;
+  if (!plan || !Array.isArray(plan.stages)) {
+    if (normalizedStage === "uploading" || normalizedStage === "receiving") return 0;
+    if (normalizedStage === "downloading") return 9;
+    if (normalizedStage === "zip_upload") return 85;
+    if (normalizedStage === "final" || normalizedStage === "done") return 100;
+    return null;
+  }
+
+  if (normalizedStage === "uploading" || normalizedStage === "receiving") return Number(plan.upload_start_percent ?? 0);
+  if (normalizedStage === "queued" || normalizedStage === "running") return Number(plan.upload_end_percent ?? plan.download_start_percent ?? 0);
+  if (normalizedStage === "downloading") return Number(plan.download_start_percent ?? plan.upload_end_percent ?? 0);
+  if (normalizedStage === "zip_upload") return Number(plan.zip_upload_start_percent ?? 85);
+  if (normalizedStage === "final" || normalizedStage === "done") return Number(plan.final_percent ?? 100);
+
+  const found = plan.stages.find((item) => normalizeProcessingStage(item.stage) === normalizedStage);
+  return found ? Number(found.start_percent) : null;
 }
 
 async function estimateProcessingSeconds(pool, job) {
   if (!job) return 0;
-
-  const photos = Number(job.photos_count || 0);
-  const bytes = Number(job.input_total_bytes || 0);
-  const qualityMode = normalizeQualityMode(job?.quality_mode);
-  const tamsExport = !!job?.exif_summary?._xproces?.tams_export;
-
-  if (photos > 0 || bytes > 0) {
-    return await estimateProcessingSecondsFromInputsHistorical(
-      pool,
-      photos,
-      bytes,
-      qualityMode,
-      tamsExport
-    );
-  }
-
-  return estimateProcessingSecondsFromFallback(job);
+  const details = await estimateProcessingDetailsHistorical(pool, buildJobFeatures(job));
+  return details.seconds;
 }
 
 function formatEtaSeconds(seconds) {
@@ -3563,10 +4653,12 @@ app.get("/jobs/:id/eta", async (req, res) => {
     const { id } = req.params;
 
     const { rows } = await pool.query(
-      `select id, status, progress, photos_count, input_total_bytes, created_at
-       ${jobsHasQualityMode ? ", quality_mode" : ""}
-       from jobs
-       where id = $1`,
+      `select id, status, progress, photos_count, input_total_bytes, created_at,
+              quality, project_type, outputs, exif_summary,
+              avg_photo_mb, avg_width, avg_height, avg_megapixels,
+              total_megapixels, processing_load_score
+         from jobs
+        where id = $1`,
       [id]
     );
 
@@ -3577,11 +4669,13 @@ app.get("/jobs/:id/eta", async (req, res) => {
     const targetJob = rows[0];
 
     const allRows = await pool.query(
-      `select id, status, progress, photos_count, input_total_bytes, created_at
-       ${jobsHasQualityMode ? ", quality_mode" : ""}
-       from jobs
-       where status in ('queued', 'running')
-       order by created_at asc`
+      `select id, status, progress, photos_count, input_total_bytes, created_at,
+              quality, project_type, outputs, exif_summary,
+              avg_photo_mb, avg_width, avg_height, avg_megapixels,
+              total_megapixels, processing_load_score
+         from jobs
+        where status in ('queued', 'running')
+        order by created_at asc`
     );
 
     const activeJobs = allRows.rows;
@@ -3609,8 +4703,8 @@ app.get("/jobs/:id/eta", async (req, res) => {
       ok: true,
       job_id: id,
       status: targetJob.status,
-      quality_mode: normalizeQualityMode(targetJob.quality_mode),
-      quality_mode_label: getQualityModeLabel(targetJob.quality_mode),
+      quality_mode: getJobQualityMode(targetJob),
+      quality_mode_label: getQualityModeLabel(getJobQualityMode(targetJob)),
       queue_wait_seconds: waitSeconds,
       own_processing_seconds: ownProcessingSeconds,
       total_estimated_seconds: totalSeconds,
@@ -3621,6 +4715,75 @@ app.get("/jobs/:id/eta", async (req, res) => {
   } catch (e) {
     console.error("eta error", e);
     res.status(500).json({ ok: false, error: "eta error" });
+  }
+});
+
+
+app.get("/jobs/:id/timing", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query(
+      `select id, status, progress, stage, photos_count, input_total_bytes,
+              quality, project_type, outputs, exif_summary,
+              avg_photo_mb, avg_width, avg_height, avg_megapixels,
+              total_megapixels, processing_load_score,
+              estimated_processing_seconds, processing_seconds, total_seconds
+         from jobs
+        where id = $1`,
+      [id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: "job not found" });
+    }
+
+    const job = rows[0];
+    const actual = await pool.query(
+      `with paired as (
+         select s.stage,
+                s.created_at as started_at,
+                e.created_at as finished_at
+           from job_stage_events s
+           join lateral (
+             select x.created_at
+               from job_stage_events x
+              where x.job_id = s.job_id
+                and x.stage = s.stage
+                and x.event_type = 'end'
+                and x.id > s.id
+              order by x.id
+              limit 1
+           ) e on true
+          where s.job_id = $1
+            and s.event_type = 'start'
+       )
+       select stage,
+              min(started_at) as started_at,
+              max(finished_at) as finished_at,
+              round(sum(extract(epoch from (finished_at - started_at))))::integer as seconds
+         from paired
+        where finished_at >= started_at
+        group by stage
+        order by min(started_at)`,
+      [id]
+    );
+
+    res.json({
+      ok: true,
+      job_id: id,
+      status: job.status,
+      progress: job.progress,
+      stage: job.stage,
+      features: buildJobFeatures(job),
+      estimated_processing_seconds: job.estimated_processing_seconds,
+      actual_processing_seconds: job.processing_seconds,
+      total_seconds: job.total_seconds,
+      prediction: job?.exif_summary?._xproces?.timing_prediction || null,
+      actual_stages: actual.rows
+    });
+  } catch (e) {
+    console.error("timing endpoint error", e);
+    res.status(500).json({ ok: false, error: "timing error" });
   }
 });
 
