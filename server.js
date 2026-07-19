@@ -2500,24 +2500,9 @@ app.post("/jobs/:id/paypal/create-order", async (req, res) => {
       return res.json({ ok: true, already_paid: true, order_id: job.payment_order_id, amount: Number(job.payment_amount || job.price || 0), currency: job.payment_currency || PAYPAL_CURRENCY });
     }
 
-    const meta = job.exif_summary?._xproces || {};
-    const photosCount = Number(meta.totalPhotos || 0) || 0;
-    const totalBytes = Number(meta.totalBytes || 0) || 0;
-    const qualityMode = normalizeQualityMode(job.quality || job.quality_mode || meta.quality_mode || "normal");
-    const projectType = String(job.project_type || meta.project_type || "fotogrametria").toLowerCase();
-    const outputsRequested = Array.isArray(meta.outputs_requested) ? meta.outputs_requested : [];
-    const paymentFeatures = {
-      photosCount,
-      totalBytes,
-      qualityMode,
-      outputsRequested,
-      projectType,
-      tamsExport: projectType === "tams"
-    };
-    const paymentFallback = await estimateProcessingDetailsHistorical(pool, paymentFeatures);
-    const paymentTimingPlan = await estimateStageTimingPlan(pool, paymentFeatures, paymentFallback);
-    const estimatedSeconds = paymentTimingPlan.estimated_processing_seconds;
-    const price = calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qualityMode, outputsRequested, projectType);
+    // PayPal debe cobrar exactamente el precio calculado y guardado al crear el trabajo.
+    // No se vuelve a estimar aquí para evitar diferencias con el importe mostrado en la web.
+    const price = Number(job.price);
 
     if (!Number.isFinite(Number(price)) || Number(price) <= 0) {
       return res.status(409).json({
