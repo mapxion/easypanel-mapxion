@@ -2970,6 +2970,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
 
     const { rows } = await pool.query(
       `select id, status, photos_count, quality, exif_summary,
+              price, estimated_processing_seconds,
               created_at, upload_started_at, upload_completed_at,
               payment_status, payment_amount, payment_currency
          from jobs
