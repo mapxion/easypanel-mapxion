@@ -37,6 +37,9 @@ const SHORT_STAGE_EXCLUDED_FROM_TRAINING = new Set([
 ]);
 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "XprocesAdmin2026!";
+const TELEGRAM_BOT_USERNAME = String(process.env.TELEGRAM_BOT_USERNAME || "XProcesBot").replace(/^@/, "").trim();
+const TELEGRAM_WEBHOOK_SECRET = String(process.env.TELEGRAM_WEBHOOK_SECRET || "").trim();
+const TELEGRAM_LINK_CODE_TTL_MINUTES = 15;
 const PRICING_QUOTE_SECRET = String(
   process.env.PRICING_QUOTE_SECRET || WORKER_TOKEN || ADMIN_TOKEN
 );
@@ -925,6 +928,7 @@ pool
     console.log("Postgres conectado");
     await ensurePaymentColumns();
     await ensureDownloadCleanupColumns();
+    await ensureTelegramSchema();
     await ensureTimingAnalyticsSchema();
     await refreshSchemaFlags();
   })
@@ -1224,6 +1228,156 @@ async function ensureTimingAnalyticsSchema() {
     from job_stage_metrics m
     join jobs j on j.id = m.job_id
   `);
+}
+
+
+async function ensureTelegramSchema() {
+  await pool.query(`
+    create table if not exists telegram_user_settings (
+      user_id uuid primary key references users(id) on delete cascade,
+      chat_id bigint unique,
+      username varchar(255),
+      first_name varchar(255),
+      is_active boolean not null default false,
+      preferences jsonb not null default '{
+        "job_received": true,
+        "processing_started": true,
+        "processing_finished": true,
+        "processing_error": true,
+        "payment_received": true
+      }'::jsonb,
+      linked_at timestamptz,
+      disconnected_at timestamptz,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    )
+  `);
+
+  await pool.query(`
+    create table if not exists telegram_link_codes (
+      code varchar(32) primary key,
+      user_id uuid not null references users(id) on delete cascade,
+      expires_at timestamptz not null,
+      used_at timestamptz,
+      created_at timestamptz not null default now()
+    )
+  `);
+
+  await pool.query(`create index if not exists telegram_link_codes_user_id_idx on telegram_link_codes(user_id)`);
+  await pool.query(`create index if not exists telegram_link_codes_expires_at_idx on telegram_link_codes(expires_at)`);
+}
+
+function getRequestUserId(req) {
+  return String(req.headers["x-user-id"] || req.query?.user_id || req.body?.user_id || "").trim();
+}
+
+async function requireExistingUser(req, res) {
+  const userId = getRequestUserId(req);
+  if (!isValidUuid(userId)) {
+    res.status(401).json({ ok: false, error: "missing_user", message: "Usuario no identificado" });
+    return null;
+  }
+  const result = await pool.query(`select id, email, name from users where id=$1 limit 1`, [userId]);
+  if (!result.rows.length) {
+    res.status(404).json({ ok: false, error: "user_not_found", message: "Usuario no encontrado" });
+    return null;
+  }
+  return result.rows[0];
+}
+
+function defaultTelegramPreferences() {
+  return {
+    job_received: true,
+    processing_started: true,
+    processing_finished: true,
+    processing_error: true,
+    payment_received: true
+  };
+}
+
+function normalizeTelegramPreferences(value) {
+  const defaults = defaultTelegramPreferences();
+  const input = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  for (const key of Object.keys(defaults)) {
+    if (Object.prototype.hasOwnProperty.call(input, key)) defaults[key] = input[key] !== false;
+  }
+  return defaults;
+}
+
+function generateTelegramLinkCode() {
+  const digits = String(Math.floor(100000 + Math.random() * 900000));
+  return `XP-${digits}`;
+}
+
+async function getTelegramUserSettings(userId) {
+  await ensureTelegramSchema();
+  const result = await pool.query(
+    `select user_id, chat_id, username, first_name, is_active, preferences, linked_at, disconnected_at
+       from telegram_user_settings where user_id=$1 limit 1`,
+    [userId]
+  );
+  return result.rows[0] || null;
+}
+
+async function sendUserTelegramEvent(userId, preferenceKey, text) {
+  if (!userId) return { ok: false, skipped: true, error: "missing_user_id" };
+  const settings = await getTelegramUserSettings(userId);
+  if (!settings?.is_active || !settings?.chat_id) {
+    return { ok: false, skipped: true, error: "telegram_user_not_connected" };
+  }
+  const preferences = normalizeTelegramPreferences(settings.preferences);
+  if (preferenceKey && preferences[preferenceKey] === false) {
+    return { ok: false, skipped: true, error: "telegram_preference_disabled" };
+  }
+  return sendTelegramMessage(text, { chatId: String(settings.chat_id) });
+}
+
+function telegramJobTitle(job) {
+  return String(job?.project_name || job?.name || job?.project_type || "Proyecto XProces");
+}
+
+async function notifyUserPaymentReceived(job, payment) {
+  const amount = Number(payment?.amount || job?.payment_amount || job?.price || 0);
+  const currency = String(payment?.currency || job?.payment_currency || "EUR").toUpperCase();
+  const text = [
+    "💳 <b>Pago recibido</b>",
+    "",
+    `Proyecto: <b>${telegramJobTitle(job).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</b>`,
+    `Importe: <b>${amount.toFixed(2).replace(".", ",")} ${currency}</b>`,
+    `Trabajo: <code>${String(job?.id || "")}</code>`,
+    "",
+    "El trabajo queda preparado para continuar con la subida y el procesado."
+  ].join("\n");
+  return sendUserTelegramEvent(job?.user_id, "payment_received", text);
+}
+
+async function notifyUserJobTransition(previousJob, updatedJob) {
+  const oldStatus = String(previousJob?.status || "").toLowerCase();
+  const newStatus = String(updatedJob?.status || "").toLowerCase();
+  const oldStage = normalizeProcessingStage(previousJob?.stage);
+  const newStage = normalizeProcessingStage(updatedJob?.stage);
+  const title = telegramJobTitle(updatedJob).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const jobId = String(updatedJob?.id || "");
+
+  if (newStatus === "running" && oldStatus !== "running") {
+    return sendUserTelegramEvent(updatedJob?.user_id, "processing_started", [
+      "⚙️ <b>Procesado iniciado</b>", "", `Proyecto: <b>${title}</b>`, `Trabajo: <code>${jobId}</code>`
+    ].join("\n"));
+  }
+  if (newStatus === "done" && oldStatus !== "done") {
+    return sendUserTelegramEvent(updatedJob?.user_id, "processing_finished", [
+      "✅ <b>Procesado finalizado</b>", "", `Proyecto: <b>${title}</b>`, `Trabajo: <code>${jobId}</code>`, "", "Los resultados ya están preparados en XProces."
+    ].join("\n"));
+  }
+  if (newStatus === "failed" && oldStatus !== "failed") {
+    return sendUserTelegramEvent(updatedJob?.user_id, "processing_error", [
+      "❌ <b>Incidencia en el procesado</b>", "", `Proyecto: <b>${title}</b>`, `Trabajo: <code>${jobId}</code>`, `Detalle: ${String(updatedJob?.error || updatedJob?.message || "Requiere revisión")}`
+    ].join("\n"));
+  }
+  if (newStage && newStage !== oldStage && newStage === "processing_complete") {
+    return { ok: false, skipped: true, error: "waiting_for_zip_upload" };
+  }
+  return { ok: false, skipped: true, error: "no_relevant_transition" };
 }
 
 async function ensurePaymentColumns() {
@@ -1819,7 +1973,7 @@ const outputStorage = multer.diskStorage({
 
 const uploadOutput = multer({
   storage: outputStorage,
-  limits: { fileSize: 10 * 1024 * 1024 * 1024 }, // 10GB
+  limits: { fileSize: 25 * 1024 * 1024 * 1024 }, // 25GB
 });
 
 // XPROCES LIVE VIEWPORT: upload pequeño en memoria, no crea históricos.
@@ -2521,6 +2675,233 @@ app.get("/jobs/:id", async (req, res) => {
 // =====================
 // TELEGRAM NOTIFICATIONS
 // =====================
+
+// =====================
+// TELEGRAM USUARIOS
+// =====================
+app.get("/telegram/status", async (req, res) => {
+  try {
+    const user = await requireExistingUser(req, res);
+    if (!user) return;
+    await ensureTelegramSchema();
+
+    const settings = await getTelegramUserSettings(user.id);
+    const pending = await pool.query(
+      `select code, expires_at from telegram_link_codes
+        where user_id=$1 and used_at is null and expires_at > now()
+        order by created_at desc limit 1`,
+      [user.id]
+    );
+
+    return res.json({
+      ok: true,
+      configured: Boolean(String(process.env.TELEGRAM_BOT_TOKEN || "").trim()),
+      connected: Boolean(settings?.is_active && settings?.chat_id),
+      pending: pending.rows.length > 0,
+      link_code: pending.rows[0]?.code || null,
+      link_expires_at: pending.rows[0]?.expires_at || null,
+      bot_username: TELEGRAM_BOT_USERNAME,
+      username: settings?.username || null,
+      first_name: settings?.first_name || null,
+      preferences: normalizeTelegramPreferences(settings?.preferences)
+    });
+  } catch (e) {
+    console.error("telegram status error", e);
+    res.status(500).json({ ok: false, error: "telegram_status_error" });
+  }
+});
+
+app.post("/telegram/link-code", async (req, res) => {
+  try {
+    const user = await requireExistingUser(req, res);
+    if (!user) return;
+    if (!String(process.env.TELEGRAM_BOT_TOKEN || "").trim()) {
+      return res.status(503).json({ ok: false, error: "telegram_not_configured", message: "Telegram no está configurado en el servidor" });
+    }
+    await ensureTelegramSchema();
+    await pool.query(`delete from telegram_link_codes where expires_at <= now() or used_at is not null`);
+    await pool.query(`delete from telegram_link_codes where user_id=$1 and used_at is null`, [user.id]);
+
+    let code = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const candidate = generateTelegramLinkCode();
+      try {
+        await pool.query(
+          `insert into telegram_link_codes(code, user_id, expires_at)
+           values($1,$2,now() + ($3 || ' minutes')::interval)`,
+          [candidate, user.id, TELEGRAM_LINK_CODE_TTL_MINUTES]
+        );
+        code = candidate;
+        break;
+      } catch (e) {
+        if (e?.code !== "23505") throw e;
+      }
+    }
+    if (!code) throw new Error("No se pudo generar un código único");
+
+    res.json({
+      ok: true,
+      pending: true,
+      link_code: code,
+      expires_in_minutes: TELEGRAM_LINK_CODE_TTL_MINUTES,
+      bot_username: TELEGRAM_BOT_USERNAME,
+      command: `/vincular ${code}`,
+      bot_url: `https://t.me/${TELEGRAM_BOT_USERNAME}`
+    });
+  } catch (e) {
+    console.error("telegram link-code error", e);
+    res.status(500).json({ ok: false, error: "telegram_link_code_error" });
+  }
+});
+
+app.post("/telegram/preferences", async (req, res) => {
+  try {
+    const user = await requireExistingUser(req, res);
+    if (!user) return;
+    await ensureTelegramSchema();
+    const preferences = normalizeTelegramPreferences(req.body?.preferences);
+    await pool.query(
+      `insert into telegram_user_settings(user_id, preferences, updated_at)
+       values($1,$2::jsonb,now())
+       on conflict(user_id) do update set preferences=excluded.preferences, updated_at=now()`,
+      [user.id, JSON.stringify(preferences)]
+    );
+    res.json({ ok: true, preferences });
+  } catch (e) {
+    console.error("telegram preferences error", e);
+    res.status(500).json({ ok: false, error: "telegram_preferences_error" });
+  }
+});
+
+app.post("/telegram/test", async (req, res) => {
+  try {
+    const user = await requireExistingUser(req, res);
+    if (!user) return;
+    const result = await sendUserTelegramEvent(user.id, null, [
+      "✅ <b>Telegram conectado correctamente</b>", "", "Este es un mensaje de prueba de XProces."
+    ].join("\n"));
+    if (!result.ok) {
+      return res.status(result.skipped ? 409 : 502).json({ ok: false, error: result.error || "telegram_test_error", message: "No se pudo enviar el mensaje de prueba" });
+    }
+    res.json({ ok: true, message_id: result.messageId || null });
+  } catch (e) {
+    console.error("telegram user test error", e);
+    res.status(500).json({ ok: false, error: "telegram_user_test_error" });
+  }
+});
+
+app.post("/telegram/disconnect", async (req, res) => {
+  try {
+    const user = await requireExistingUser(req, res);
+    if (!user) return;
+    await ensureTelegramSchema();
+    await pool.query(
+      `insert into telegram_user_settings(user_id, is_active, disconnected_at, updated_at)
+       values($1,false,now(),now())
+       on conflict(user_id) do update set chat_id=null, username=null, first_name=null, is_active=false, disconnected_at=now(), updated_at=now()`,
+      [user.id]
+    );
+    await pool.query(`delete from telegram_link_codes where user_id=$1`, [user.id]);
+    res.json({ ok: true, connected: false });
+  } catch (e) {
+    console.error("telegram disconnect error", e);
+    res.status(500).json({ ok: false, error: "telegram_disconnect_error" });
+  }
+});
+
+app.post("/telegram/webhook", async (req, res) => {
+  try {
+    if (TELEGRAM_WEBHOOK_SECRET) {
+      const receivedSecret = String(req.headers["x-telegram-bot-api-secret-token"] || "").trim();
+      if (receivedSecret !== TELEGRAM_WEBHOOK_SECRET) {
+        return res.status(401).json({ ok: false, error: "invalid_telegram_webhook_secret" });
+      }
+    }
+
+    const message = req.body?.message || req.body?.edited_message;
+    const text = String(message?.text || "").trim();
+    const chatId = message?.chat?.id;
+    if (!message || !chatId || !text) return res.json({ ok: true, ignored: true });
+
+    const match = text.match(/^\/vincular(?:@\w+)?\s+(XP-\d{6})\s*$/i);
+    if (!match) {
+      if (/^\/start(?:@\w+)?/i.test(text)) {
+        await sendTelegramMessage("Hola. Para conectar tu cuenta de XProces, abre Mi perfil en la web y envía aquí el comando /vincular seguido del código mostrado.", { chatId: String(chatId) });
+      }
+      return res.json({ ok: true, ignored: true });
+    }
+
+    await ensureTelegramSchema();
+    const code = match[1].toUpperCase();
+    const client = await pool.connect();
+    try {
+      await client.query("begin");
+      const linkResult = await client.query(
+        `select code, user_id, expires_at, used_at from telegram_link_codes where code=$1 for update`,
+        [code]
+      );
+      if (!linkResult.rows.length || linkResult.rows[0].used_at || new Date(linkResult.rows[0].expires_at).getTime() <= Date.now()) {
+        await client.query("rollback");
+        await sendTelegramMessage("❌ El código no es válido o ha caducado. Genera uno nuevo desde Mi perfil en XProces.", { chatId: String(chatId) });
+        return res.json({ ok: true, linked: false });
+      }
+
+      const userId = linkResult.rows[0].user_id;
+      await client.query(
+        `insert into telegram_user_settings(user_id, chat_id, username, first_name, is_active, linked_at, disconnected_at, updated_at)
+         values($1,$2,$3,$4,true,now(),null,now())
+         on conflict(user_id) do update set chat_id=excluded.chat_id, username=excluded.username, first_name=excluded.first_name,
+           is_active=true, linked_at=now(), disconnected_at=null, updated_at=now()`,
+        [userId, String(chatId), message?.from?.username || null, message?.from?.first_name || null]
+      );
+      await client.query(`update telegram_link_codes set used_at=now() where code=$1`, [code]);
+      await client.query(`delete from telegram_link_codes where user_id=$1 and code<>$2`, [userId, code]);
+      await client.query("commit");
+
+      await sendTelegramMessage("✅ <b>Cuenta vinculada</b>\n\nTelegram ya está conectado con tu cuenta de XProces.", { chatId: String(chatId) });
+      return res.json({ ok: true, linked: true });
+    } catch (e) {
+      await client.query("rollback").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error("telegram webhook error", e);
+    res.status(500).json({ ok: false, error: "telegram_webhook_error" });
+  }
+});
+
+app.get("/admin/telegram/webhook", requireAdmin, async (_req, res) => {
+  try {
+    const token = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
+    if (!token) return res.status(503).json({ ok: false, error: "telegram_not_configured" });
+    const response = await fetch(`https://api.telegram.org/bot${encodeURIComponent(token)}/getWebhookInfo`);
+    const data = await response.json().catch(() => ({}));
+    res.status(response.ok && data?.ok ? 200 : 502).json({ ok: Boolean(response.ok && data?.ok), webhook: data?.result || null, telegram: data });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "telegram_webhook_info_error" });
+  }
+});
+
+app.post("/admin/telegram/webhook", requireAdmin, async (req, res) => {
+  try {
+    const token = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
+    const url = String(req.body?.url || "").trim();
+    if (!token) return res.status(503).json({ ok: false, error: "telegram_not_configured" });
+    if (!/^https:\/\//i.test(url)) return res.status(400).json({ ok: false, error: "invalid_webhook_url", message: "La URL debe usar HTTPS" });
+    const payload = { url, allowed_updates: ["message", "edited_message"] };
+    if (TELEGRAM_WEBHOOK_SECRET) payload.secret_token = TELEGRAM_WEBHOOK_SECRET;
+    const response = await fetch(`https://api.telegram.org/bot${encodeURIComponent(token)}/setWebhook`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
+    });
+    const data = await response.json().catch(() => ({}));
+    res.status(response.ok && data?.ok ? 200 : 502).json({ ok: Boolean(response.ok && data?.ok), telegram: data });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "telegram_set_webhook_error" });
+  }
+});
+
 app.get("/admin/telegram/config", requireAdmin, (_req, res) => {
   res.json({
     ok: true,
@@ -2758,6 +3139,15 @@ app.post("/jobs/:id/paypal/capture-order", async (req, res) => {
           captureId,
           error: telegramResult.error
         });
+      }
+
+      try {
+        const userTelegramResult = await notifyUserPaymentReceived(job, { captureId, amount, currency, payerId, payerEmail, paymentDate });
+        if (!userTelegramResult.ok && !userTelegramResult.skipped) {
+          console.error("Pago confirmado, pero no se pudo avisar al usuario por Telegram", userTelegramResult.error);
+        }
+      } catch (telegramUserError) {
+        console.error("Error en aviso Telegram del usuario tras el pago", telegramUserError?.message || telegramUserError);
       }
     }
 
@@ -4302,7 +4692,8 @@ app.patch("/jobs/:id", async (req, res) => {
 
     const currentJobResult = await pool.query(
       `select id, status, stage, progress, started_at, finished_at, created_at,
-              processing_started_at, processing_finished_at, exif_summary
+              processing_started_at, processing_finished_at, exif_summary,
+              user_id, project_name, project_type, message, error
          from jobs
         where id = $1`,
       [id]
@@ -4494,6 +4885,15 @@ app.patch("/jobs/:id", async (req, res) => {
     );
 
     if (!rows.length) return res.status(404).json({ error: "not found" });
+
+    try {
+      const telegramTransition = await notifyUserJobTransition(currentJob, rows[0]);
+      if (!telegramTransition.ok && !telegramTransition.skipped) {
+        console.error("No se pudo enviar el cambio de estado por Telegram", telegramTransition.error);
+      }
+    } catch (telegramTransitionError) {
+      console.error("Error enviando transición del trabajo por Telegram", telegramTransitionError?.message || telegramTransitionError);
+    }
 
     if (terminalStatus) {
       await finalizeJobStageMetrics(pool, id);
