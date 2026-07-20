@@ -3301,7 +3301,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
       estimated_total_human: formatEtaSeconds(estimatedSeconds),
       prediction_method: "locked_web_quote",
       prediction_neighbors: null,
-      confidence: timingPlan.confidence,
+      confidence: job?.exif_summary?._xproces?.timing_prediction?.confidence || null,
       estimated_low_seconds: estimatedSeconds,
       estimated_high_seconds: estimatedSeconds,
       estimated_total_low_seconds: estimatedSeconds,
