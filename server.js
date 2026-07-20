@@ -1819,7 +1819,7 @@ const outputStorage = multer.diskStorage({
 
 const uploadOutput = multer({
   storage: outputStorage,
-  limits: { fileSize: 5 * 1024 * 1024 * 1024 }, // 5GB
+  limits: { fileSize: 10 * 1024 * 1024 * 1024 }, // 10GB
 });
 
 // XPROCES LIVE VIEWPORT: upload pequeño en memoria, no crea históricos.
