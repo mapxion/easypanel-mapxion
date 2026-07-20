@@ -9,6 +9,7 @@ import archiver from "archiver";
 import cors from "cors";
 import bcrypt from "bcryptjs";
 import { randomBytes, createHmac } from "crypto";
+import { telegramIsConfigured, sendTelegramMessage, notifyPaymentReceived } from "./telegram.js";
 
 
 const { Pool } = pkg;
@@ -2517,6 +2518,35 @@ app.get("/jobs/:id", async (req, res) => {
 // =====================
 // PAYPAL CHECKOUT
 // =====================
+// =====================
+// TELEGRAM NOTIFICATIONS
+// =====================
+app.get("/admin/telegram/config", requireAdmin, (_req, res) => {
+  res.json({
+    ok: true,
+    enabled: telegramIsConfigured(),
+    chat_id_configured: Boolean(String(process.env.TELEGRAM_CHAT_ID || "").trim()),
+    bot_token_configured: Boolean(String(process.env.TELEGRAM_BOT_TOKEN || "").trim())
+  });
+});
+
+app.post("/admin/telegram/test", requireAdmin, async (_req, res) => {
+  const result = await sendTelegramMessage(
+    [
+      "✅ <b>Telegram conectado con XProces</b>",
+      "",
+      "Este es un mensaje de prueba enviado desde el servidor.",
+      `🕒 ${new Intl.DateTimeFormat("es-ES", { timeZone: "Europe/Madrid", dateStyle: "short", timeStyle: "medium" }).format(new Date())}`
+    ].join("\n")
+  );
+
+  if (!result.ok) {
+    return res.status(result.skipped ? 503 : 502).json(result);
+  }
+
+  return res.json(result);
+});
+
 app.get("/paypal/config", (_req, res) => {
   res.json({
     ok: true,
@@ -2706,6 +2736,30 @@ app.post("/jobs/:id/paypal/capture-order", async (req, res) => {
                   coalesce(payment_date, paid_at) as payment_date`,
       [job.id, captureId, amount, currency, payerId, payerEmail, paymentDate]
     );
+
+    // Solo la petición que cambia realmente el estado a paid envía el aviso.
+    // Un fallo de Telegram nunca revierte ni bloquea el pago confirmado.
+    if (updateResult.rows.length) {
+      const telegramResult = await notifyPaymentReceived({
+        job,
+        payment: {
+          captureId,
+          amount,
+          currency,
+          payerId,
+          payerEmail,
+          paymentDate
+        }
+      });
+
+      if (!telegramResult.ok && !telegramResult.skipped) {
+        console.error("Pago confirmado, pero no se pudo enviar el aviso de Telegram", {
+          jobId: job.id,
+          captureId,
+          error: telegramResult.error
+        });
+      }
+    }
 
     // Si dos peticiones llegaron a la vez, la segunda se trata como respuesta idempotente.
     if (!updateResult.rows.length) {
