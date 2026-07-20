@@ -1819,7 +1819,7 @@ const outputStorage = multer.diskStorage({
 
 const uploadOutput = multer({
   storage: outputStorage,
-  limits: { fileSize: 20 * 1024 * 1024 * 1024 }, // 20GB
+  limits: { fileSize: 5 * 1024 * 1024 * 1024 }, // 5GB
 });
 
 // XPROCES LIVE VIEWPORT: upload pequeño en memoria, no crea históricos.
@@ -6265,7 +6265,6 @@ setInterval(async () => {
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
-
 
 
 
