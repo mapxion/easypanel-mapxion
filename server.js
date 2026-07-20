@@ -3090,8 +3090,48 @@ app.post("/jobs/:id/submit", async (req, res) => {
     // El precio y el tiempo quedaron fijados cuando la web terminó de analizar
     // todas las fotografías. Al finalizar la subida solo guardamos las métricas
     // reales de entrada para enriquecer el histórico; no se recalcula la cotización.
-    const estimatedSeconds = Math.max(0, Number(job.estimated_processing_seconds || 0));
-    const price = Math.max(0, Number(job.price || 0));
+    const storedEstimatedSeconds = Number(job.estimated_processing_seconds);
+    const exifEstimatedSeconds = Number(job?.exif_summary?._xproces?.quoted_processing_seconds);
+    const estimatedSeconds = Math.max(
+      0,
+      Number.isFinite(storedEstimatedSeconds) && storedEstimatedSeconds > 0
+        ? storedEstimatedSeconds
+        : (Number.isFinite(exifEstimatedSeconds) ? exifEstimatedSeconds : 0)
+    );
+
+    const storedPrice = Number(job.price);
+    const exifQuotedPrice = Number(job?.exif_summary?._xproces?.quoted_price);
+    const paidAmountForRecovery = Number(job.payment_amount);
+
+    let price =
+      Number.isFinite(storedPrice) && storedPrice > 0
+        ? storedPrice
+        : (Number.isFinite(exifQuotedPrice) && exifQuotedPrice > 0
+            ? exifQuotedPrice
+            : 0);
+
+    // Si el pago ya fue capturado y la cotización quedó a cero por una versión
+    // anterior del servidor, el importe confirmado por PayPal es la referencia
+    // autoritativa. Se repara el precio del job antes de validar el submit.
+    if (
+      String(job.payment_status || "").toLowerCase() === "paid" &&
+      price <= 0 &&
+      Number.isFinite(paidAmountForRecovery) &&
+      paidAmountForRecovery > 0
+    ) {
+      price = paidAmountForRecovery;
+      await pool.query(
+        `update jobs
+            set price=$2,
+                estimated_processing_seconds=case
+                  when coalesce(estimated_processing_seconds, 0) > 0 then estimated_processing_seconds
+                  else $3
+                end,
+                updated_at=now()
+          where id=$1`,
+        [id, price, estimatedSeconds]
+      );
+    }
 
     updatedExifSummary = stripNullCharsDeep({
       ...(updatedExifSummary || {}),
