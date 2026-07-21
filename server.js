@@ -2647,6 +2647,45 @@ app.get("/jobs/mine", async (req, res) => {
   }
 });
 
+function getJobUploadProgress(job) {
+  const expectedPhotos = Number(job?.exif_summary?._xproces?.totalPhotos || 0) || 0;
+  const expectedBytes = Number(job?.exif_summary?._xproces?.totalBytes || 0) || 0;
+  const files = listInputImages(job.id);
+  const receivedPhotos = files.length;
+  const receivedBytes = getInputTotalBytes(job.id);
+
+  let lastReceivedAt = null;
+  for (const filename of files) {
+    try {
+      const mtime = fs.statSync(path.join(inputDir(job.id), filename)).mtime;
+      if (!lastReceivedAt || mtime > lastReceivedAt) lastReceivedAt = mtime;
+    } catch (_) {}
+  }
+
+  const idleSeconds = lastReceivedAt
+    ? Math.max(0, Math.floor((Date.now() - lastReceivedAt.getTime()) / 1000))
+    : null;
+
+  let percent = 0;
+  if (expectedBytes > 0) percent = Math.min(100, (receivedBytes / expectedBytes) * 100);
+  else if (expectedPhotos > 0) percent = Math.min(100, (receivedPhotos / expectedPhotos) * 100);
+
+  return {
+    received_photos: receivedPhotos,
+    expected_photos: expectedPhotos,
+    received_bytes: receivedBytes,
+    expected_bytes: expectedBytes,
+    percent: Number(percent.toFixed(1)),
+    last_received_at: lastReceivedAt ? lastReceivedAt.toISOString() : null,
+    idle_seconds: idleSeconds,
+    complete: Boolean(
+      expectedPhotos > 0 &&
+      receivedPhotos >= expectedPhotos &&
+      (expectedBytes <= 0 || receivedBytes === expectedBytes)
+    )
+  };
+}
+
 app.get("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -2661,7 +2700,10 @@ app.get("/jobs/:id", async (req, res) => {
     res.json({
       ...job,
       ok: true,
-      quality_mode: normalizeQualityMode(job.quality_mode || job?.exif_summary?._xproces?.quality_mode || "normal")
+      quality_mode: normalizeQualityMode(job.quality_mode || job?.exif_summary?._xproces?.quality_mode || "normal"),
+      upload_progress: ["created", "pending_payment", "receiving"].includes(String(job.status || "").toLowerCase())
+        ? getJobUploadProgress(job)
+        : null
     });
   } catch (e) {
     console.error("get job error", e);
@@ -5164,7 +5206,13 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
        limit 10`
     );
 
-    res.json({ ok: true, jobs: rows });
+    res.json({
+      ok: true,
+      jobs: rows.map((job) => ({
+        ...job,
+        upload_progress: getJobUploadProgress(job)
+      }))
+    });
   } catch (e) {
     console.error("worker receiving error", e);
     res.status(500).json({ ok: false, error: "worker receiving error" });
