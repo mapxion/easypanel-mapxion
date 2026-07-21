@@ -538,3 +538,60 @@
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init, { once: true });
   else init();
 })();
+
+/* XProces - acceso visible a Comunidad Telegram */
+(() => {
+  "use strict";
+  const COMMUNITY_URL = "https://t.me/+9UL6gcS_wys2NmIx";
+
+  function injectCommunityButton() {
+    const actions = document.getElementById("topbarActions");
+    if (!actions || document.getElementById("xptgCommunityBtn")) return;
+
+    const button = document.createElement("a");
+    button.id = "xptgCommunityBtn";
+    button.className = "btn btn-secondary xptg-top-btn";
+    button.href = COMMUNITY_URL;
+    button.target = "_blank";
+    button.rel = "noopener noreferrer";
+    button.textContent = "Comunidad";
+    button.title = "Comunidad XProces: ayuda, sugerencias, drones, toma de datos y procesado";
+
+    const firstButton = actions.querySelector("button, a");
+    if (firstButton) actions.insertBefore(button, firstButton);
+    else actions.appendChild(button);
+  }
+
+  function injectCommunityCard() {
+    if (document.getElementById("xptgCommunityCard")) return;
+    const app = document.querySelector(".app");
+    const topbar = document.querySelector(".topbar");
+    if (!app || !topbar) return;
+
+    const card = document.createElement("section");
+    card.id = "xptgCommunityCard";
+    card.style.cssText = "display:none;background:#fff;border:1px solid #dde5df;border-radius:18px;padding:16px 18px;box-shadow:0 10px 30px rgba(24,33,29,.08);";
+    card.innerHTML = `
+      <div style="display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap">
+        <div style="min-width:240px;flex:1">
+          <div style="font-size:17px;font-weight:900;color:#18211d;margin-bottom:5px">Comunidad XProces</div>
+          <div style="font-size:13px;line-height:1.45;color:#6f7d75">Ayuda entre usuarios y administrador, sugerencias, drones, toma de datos, fotogrametría, nubes de puntos, ortofotos, DSM, DTM y modelos 3D.</div>
+        </div>
+        <a href="${COMMUNITY_URL}" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="text-decoration:none;white-space:nowrap">Unirme a la comunidad</a>
+      </div>`;
+    topbar.insertAdjacentElement("afterend", card);
+  }
+
+  function ensureCommunity() {
+    injectCommunityButton();
+    injectCommunityCard();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", ensureCommunity, { once: true });
+  } else {
+    ensureCommunity();
+  }
+
+  new MutationObserver(ensureCommunity).observe(document.documentElement, { childList: true, subtree: true });
+})();
