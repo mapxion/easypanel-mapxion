@@ -2745,8 +2745,8 @@ app.post("/telegram/link-code", async (req, res) => {
       link_code: code,
       expires_in_minutes: TELEGRAM_LINK_CODE_TTL_MINUTES,
       bot_username: TELEGRAM_BOT_USERNAME,
-      command: `/vincular ${code}`,
-      bot_url: `https://t.me/${TELEGRAM_BOT_USERNAME}`
+      command: `/start ${code}`,
+      bot_url: `https://t.me/${TELEGRAM_BOT_USERNAME}?start=${encodeURIComponent(code)}`
     });
   } catch (e) {
     console.error("telegram link-code error", e);
@@ -2823,10 +2823,12 @@ app.post("/telegram/webhook", async (req, res) => {
     const chatId = message?.chat?.id;
     if (!message || !chatId || !text) return res.json({ ok: true, ignored: true });
 
-    const match = text.match(/^\/vincular(?:@\w+)?\s+(XP-\d{6})\s*$/i);
+    const startMatch = text.match(/^\/start(?:@\w+)?\s+(XP-\d{6})\s*$/i);
+    const legacyMatch = text.match(/^\/vincular(?:@\w+)?\s+(XP-\d{6})\s*$/i);
+    const match = startMatch || legacyMatch;
     if (!match) {
-      if (/^\/start(?:@\w+)?/i.test(text)) {
-        await sendTelegramMessage("Hola. Para conectar tu cuenta de XProces, abre Mi perfil en la web y envía aquí el comando /vincular seguido del código mostrado.", { chatId: String(chatId) });
+      if (/^\/start(?:@\w+)?(?:\s*)$/i.test(text)) {
+        await sendTelegramMessage("Hola. Para conectar tu cuenta, abre «Mi perfil» en XProces y pulsa «Conectar Telegram».", { chatId: String(chatId) });
       }
       return res.json({ ok: true, ignored: true });
     }
@@ -6665,6 +6667,7 @@ setInterval(async () => {
 app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
+
 
 
 
