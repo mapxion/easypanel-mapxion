@@ -1412,11 +1412,45 @@ function canUsePaidJob(job) {
   return ["paid", "exempt"].includes(String(job?.payment_status || "").toLowerCase());
 }
 
+async function recoverInviteExemption(job) {
+  if (!job || canUsePaidJob(job)) return canUsePaidJob(job);
+
+  const email = String(job.client_email || "").trim().toLowerCase();
+  if (!email) return false;
+
+  const inviteResult = await pool.query(
+    `select id
+       from invite_codes
+      where is_used = true
+        and lower(coalesce(used_by_email, '')) = lower($1)
+      order by used_at desc nulls last
+      limit 1`,
+    [email]
+  );
+
+  if (!inviteResult.rows.length) return false;
+
+  await pool.query(
+    `update jobs
+        set payment_status='exempt',
+            status=case when status='pending_payment' then 'created' else status end,
+            stage=case when stage='pending_payment' then 'created' else stage end,
+            message=case when message='Pendiente de pago' then 'Procesado sin coste por código invitado' else message end,
+            updated_at=now()
+      where id=$1`,
+    [job.id]
+  );
+
+  job.payment_status = "exempt";
+  if (job.status === "pending_payment") job.status = "created";
+  return true;
+}
+
 async function requirePaidJobBeforeUpload(req, res, next) {
   try {
     await ensurePaymentColumns();
     const { rows } = await pool.query(
-      `select id, status, payment_status, user_id from jobs where id=$1`,
+      `select id, status, payment_status, user_id, client_email from jobs where id=$1`,
       [req.params.id]
     );
     if (!rows.length) return res.status(404).json({ ok: false, error: "job_not_found" });
@@ -1424,6 +1458,9 @@ async function requirePaidJobBeforeUpload(req, res, next) {
     const requestUserId = String(req.headers["x-user-id"] || "").trim();
     if (job.user_id && String(job.user_id) !== requestUserId) {
       return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+    if (!canUsePaidJob(job)) {
+      await recoverInviteExemption(job);
     }
     if (!canUsePaidJob(job)) {
       return res.status(402).json({
@@ -3333,27 +3370,17 @@ const userId = req.body?.user_id || null;
     // Los usuarios que han accedido mediante un código invitado válido pueden
     // iniciar el trabajo sin PayPal. El precio se conserva solo como referencia.
     let invitePaymentExempt = false;
-    if (req.body?.invite_exempt === true) {
-      const inviteResult = await pool.query(
-        `select id
-           from invite_codes
-          where is_used = true
-            and lower(coalesce(used_by_email, '')) = lower($1)
-          order by used_at desc nulls last
-          limit 1`,
-        [clientEmail]
-      );
+    const inviteResult = await pool.query(
+      `select id
+         from invite_codes
+        where is_used = true
+          and lower(coalesce(used_by_email, '')) = lower($1)
+        order by used_at desc nulls last
+        limit 1`,
+      [clientEmail]
+    );
 
-      invitePaymentExempt = inviteResult.rows.length > 0;
-
-      if (!invitePaymentExempt) {
-        return res.status(403).json({
-          ok: false,
-          error: "invite_not_valid",
-          message: "No se ha podido validar el código invitado para este usuario."
-        });
-      }
-    }
+    invitePaymentExempt = inviteResult.rows.length > 0;
 
     await ensurePaymentColumns();
     await ensureTimingAnalyticsSchema();
@@ -3469,7 +3496,7 @@ app.post("/jobs/:id/submit", async (req, res) => {
     await ensureTimingAnalyticsSchema();
 
     const { rows } = await pool.query(
-      `select id, status, photos_count, quality, exif_summary,
+      `select id, status, photos_count, quality, exif_summary, client_email,
               price, estimated_processing_seconds,
               created_at, upload_started_at, upload_completed_at,
               payment_status, payment_amount, payment_currency
@@ -3484,6 +3511,10 @@ app.post("/jobs/:id/submit", async (req, res) => {
     const ownerResult = await pool.query("select user_id from jobs where id=$1", [id]);
     if (ownerResult.rows?.[0]?.user_id && String(ownerResult.rows[0].user_id) !== requestUserId) {
       return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+    if (!canUsePaidJob(job)) {
+      job.client_email = String(req.body?.client_email || job.client_email || "").trim();
+      await recoverInviteExemption(job);
     }
     if (!canUsePaidJob(job)) {
       return res.status(402).json({
