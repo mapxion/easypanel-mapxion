@@ -5696,7 +5696,8 @@ async function estimateProcessingDetailsHistorical(pool, targetInput) {
       const seconds = Number(row.processing_seconds || 0);
       if (!Number.isFinite(seconds) || seconds <= 0) return null;
       if (features.qualityMode !== target.qualityMode) return null;
-      if (!outputSetsEqual(features.outputsRequested, target.outputsRequested)) return null;
+      // Respaldo global: permite trabajos con otros entregables. La similitud
+      // del conjunto de salidas ya forma parte de processingFeatureDistance.
       if (features.projectType !== target.projectType) return null;
       if (!!features.tamsExport !== !!target.tamsExport) return null;
 
@@ -5970,7 +5971,6 @@ function stageFeatureDistance(stageInput, target, candidate, row = {}) {
     distance += logRatioDistance(target.totalMegapixels, candidate.totalMegapixels) * 2.8;
     distance += logRatioDistance(target.photosCount, candidate.photosCount) * 1.5;
     distance += logRatioDistance(target.processingLoadScore, candidate.processingLoadScore) * 1.2;
-    distance += outputSetDistance(target.outputsRequested, candidate.outputsRequested) * 0.8;
     return distance;
   }
 
@@ -5981,7 +5981,6 @@ function stageFeatureDistance(stageInput, target, candidate, row = {}) {
     if (Number(target.pointCount || 0) > 0 && Number(row.point_count || 0) > 0) {
       distance += logRatioDistance(target.pointCount, row.point_count) * 1.8;
     }
-    distance += outputSetDistance(target.outputsRequested, candidate.outputsRequested) * 0.8;
     return distance;
   }
 
@@ -5994,7 +5993,6 @@ function stageFeatureDistance(stageInput, target, candidate, row = {}) {
       distance += logRatioDistance(target.processingLoadScore, candidate.processingLoadScore) * 1.8;
       distance += logRatioDistance(target.totalMegapixels, candidate.totalMegapixels) * 1.0;
     }
-    distance += outputSetDistance(target.outputsRequested, candidate.outputsRequested) * 2.0;
     return distance;
   }
 
@@ -6051,7 +6049,9 @@ function estimateStageFromMetricRows(stage, targetInput, rows, fallbackSeconds) 
 
     const candidate = metricRowFeatures(row);
     if (candidate.qualityMode !== target.qualityMode) return null;
-    if (!outputSetsEqual(candidate.outputsRequested, target.outputsRequested)) return null;
+    // La muestra ya está filtrada por la misma fase. No se exige que el
+    // conjunto completo de entregables sea idéntico: una fase válida puede
+    // reutilizarse aunque el trabajo histórico generase otros productos.
     if (candidate.projectType !== target.projectType) return null;
     if (!!candidate.tamsExport !== !!target.tamsExport) return null;
     const distance = stageFeatureDistance(stage, target, candidate, row);
