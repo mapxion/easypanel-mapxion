@@ -927,6 +927,7 @@ pool
   .then(async () => {
     console.log("Postgres conectado");
     await ensurePaymentColumns();
+    await ensureInvoiceColumns();
     await ensureDownloadCleanupColumns();
     await ensureTelegramSchema();
     await ensureTimingAnalyticsSchema();
@@ -1405,6 +1406,25 @@ async function ensurePaymentColumns() {
     create unique index if not exists jobs_payment_capture_id_unique
       on jobs (payment_capture_id)
       where payment_capture_id is not null and payment_capture_id <> ''
+  `);
+}
+
+async function ensureInvoiceColumns() {
+  await pool.query(`
+    alter table jobs
+      add column if not exists invoice_status varchar(30) not null default 'none',
+      add column if not exists invoice_requested_at timestamptz,
+      add column if not exists invoice_issued_at timestamptz,
+      add column if not exists invoice_company_name varchar(240),
+      add column if not exists invoice_tax_id varchar(40),
+      add column if not exists invoice_address text,
+      add column if not exists invoice_postal_code varchar(20),
+      add column if not exists invoice_city varchar(120),
+      add column if not exists invoice_province varchar(120),
+      add column if not exists invoice_country varchar(120),
+      add column if not exists invoice_email varchar(320),
+      add column if not exists invoice_number varchar(80),
+      add column if not exists invoice_admin_note text
   `);
 }
 
@@ -2056,7 +2076,20 @@ app.get("/admin/jobs", requireAdmin, async (_req, res) => {
         payment_currency,
         paypal_payer_id,
         paypal_payer_email,
-        coalesce(payment_date, paid_at) as payment_date
+        coalesce(payment_date, paid_at) as payment_date,
+        invoice_status,
+        invoice_requested_at,
+        invoice_issued_at,
+        invoice_company_name,
+        invoice_tax_id,
+        invoice_address,
+        invoice_postal_code,
+        invoice_city,
+        invoice_province,
+        invoice_country,
+        invoice_email,
+        invoice_number,
+        invoice_admin_note
         ${jobsHasQualityMode ? ", quality_mode" : ""}
       from jobs
       order by created_at desc
@@ -2599,6 +2632,8 @@ app.get("/jobs", async (_req, res) => {
 app.get("/jobs/mine", async (req, res) => {
   try {
     await ensureDownloadCleanupColumns();
+    await ensurePaymentColumns();
+    await ensureInvoiceColumns();
 
     const userIdRaw =
       req.headers["x-user-id"] ||
@@ -2630,7 +2665,22 @@ app.get("/jobs/mine", async (req, res) => {
           download_verified,
           output_purged,
           archived_summary_saved_at,
-          archived_outputs
+          archived_outputs,
+          payment_status,
+          payment_amount,
+          payment_currency,
+          invoice_status,
+          invoice_requested_at,
+          invoice_issued_at,
+          invoice_company_name,
+          invoice_tax_id,
+          invoice_address,
+          invoice_postal_code,
+          invoice_city,
+          invoice_province,
+          invoice_country,
+          invoice_email,
+          invoice_number
         from jobs
         where user_id = $1
         order by created_at desc`
@@ -2646,7 +2696,22 @@ app.get("/jobs/mine", async (req, res) => {
           download_verified,
           output_purged,
           archived_summary_saved_at,
-          archived_outputs
+          archived_outputs,
+          payment_status,
+          payment_amount,
+          payment_currency,
+          invoice_status,
+          invoice_requested_at,
+          invoice_issued_at,
+          invoice_company_name,
+          invoice_tax_id,
+          invoice_address,
+          invoice_postal_code,
+          invoice_city,
+          invoice_province,
+          invoice_country,
+          invoice_email,
+          invoice_number
         from jobs
         where user_id = $1
         order by created_at desc`;
@@ -2708,6 +2773,128 @@ function getJobUploadProgress(job) {
     )
   };
 }
+
+
+app.post("/jobs/:id/invoice-request", async (req, res) => {
+  try {
+    await ensurePaymentColumns();
+    await ensureInvoiceColumns();
+
+    const userId = String(req.headers["x-user-id"] || "").trim();
+    const { rows } = await pool.query(
+      `select id, user_id, payment_status, payment_amount, price, invoice_status
+         from jobs where id=$1`,
+      [req.params.id]
+    );
+
+    if (!rows.length) return res.status(404).json({ ok: false, error: "job_not_found" });
+
+    const job = rows[0];
+    if (!userId || !job.user_id || String(job.user_id) !== userId) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+
+    if (String(job.payment_status || "").toLowerCase() !== "paid" ||
+        Number(job.payment_amount ?? job.price ?? 0) <= 0) {
+      return res.status(409).json({
+        ok: false,
+        error: "invoice_not_available",
+        message: "La factura solo puede solicitarse para trabajos pagados."
+      });
+    }
+
+    const body = req.body || {};
+    const companyName = String(body.company_name || "").trim();
+    const taxId = String(body.tax_id || "").trim().toUpperCase();
+    const address = String(body.address || "").trim();
+    const postalCode = String(body.postal_code || "").trim();
+    const city = String(body.city || "").trim();
+    const province = String(body.province || "").trim();
+    const country = String(body.country || "España").trim();
+    const invoiceEmail = String(body.email || "").trim().toLowerCase();
+
+    if (!companyName || !taxId || !address || !postalCode || !city || !province || !country ||
+        !isValidEmail(invoiceEmail)) {
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_invoice_data",
+        message: "Complete correctamente todos los datos fiscales."
+      });
+    }
+
+    if (String(job.invoice_status || "").toLowerCase() === "issued") {
+      return res.status(409).json({
+        ok: false,
+        error: "invoice_already_issued",
+        message: "La factura ya está marcada como emitida."
+      });
+    }
+
+    const updated = await pool.query(
+      `update jobs
+          set invoice_status='requested',
+              invoice_requested_at=now(),
+              invoice_company_name=$2,
+              invoice_tax_id=$3,
+              invoice_address=$4,
+              invoice_postal_code=$5,
+              invoice_city=$6,
+              invoice_province=$7,
+              invoice_country=$8,
+              invoice_email=$9,
+              updated_at=now()
+        where id=$1
+      returning invoice_status, invoice_requested_at`,
+      [job.id, companyName, taxId, address, postalCode, city, province, country, invoiceEmail]
+    );
+
+    res.json({ ok: true, invoice: updated.rows[0] });
+  } catch (e) {
+    console.error("invoice request error", e);
+    res.status(500).json({ ok: false, error: "invoice_request_error", message: e?.message || String(e) });
+  }
+});
+
+app.post("/admin/jobs/:id/invoice-issued", requireAdmin, async (req, res) => {
+  try {
+    await ensureInvoiceColumns();
+    const invoiceNumber = String(req.body?.invoice_number || "").trim();
+    const adminNote = String(req.body?.admin_note || "").trim();
+
+    if (!invoiceNumber) {
+      return res.status(400).json({
+        ok: false,
+        error: "invoice_number_required",
+        message: "Indique el número de factura."
+      });
+    }
+
+    const { rows } = await pool.query(
+      `update jobs
+          set invoice_status='issued',
+              invoice_number=$2,
+              invoice_admin_note=$3,
+              invoice_issued_at=now(),
+              updated_at=now()
+        where id=$1 and invoice_status in ('requested','issued')
+      returning id, invoice_status, invoice_number, invoice_issued_at`,
+      [req.params.id, invoiceNumber, adminNote]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        ok: false,
+        error: "invoice_request_not_found",
+        message: "No existe una solicitud de factura para este trabajo."
+      });
+    }
+
+    res.json({ ok: true, invoice: rows[0] });
+  } catch (e) {
+    console.error("invoice issued error", e);
+    res.status(500).json({ ok: false, error: "invoice_issued_error" });
+  }
+});
 
 app.get("/jobs/:id", async (req, res) => {
   try {
