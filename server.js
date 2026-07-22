@@ -3330,6 +3330,31 @@ const userId = req.body?.user_id || null;
       });
     }
 
+    // Los usuarios que han accedido mediante un código invitado válido pueden
+    // iniciar el trabajo sin PayPal. El precio se conserva solo como referencia.
+    let invitePaymentExempt = false;
+    if (req.body?.invite_exempt === true) {
+      const inviteResult = await pool.query(
+        `select id
+           from invite_codes
+          where is_used = true
+            and lower(coalesce(used_by_email, '')) = lower($1)
+          order by used_at desc nulls last
+          limit 1`,
+        [clientEmail]
+      );
+
+      invitePaymentExempt = inviteResult.rows.length > 0;
+
+      if (!invitePaymentExempt) {
+        return res.status(403).json({
+          ok: false,
+          error: "invite_not_valid",
+          message: "No se ha podido validar el código invitado para este usuario."
+        });
+      }
+    }
+
     await ensurePaymentColumns();
     await ensureTimingAnalyticsSchema();
 
@@ -3367,10 +3392,11 @@ const userId = req.body?.user_id || null;
         pricing_quote_issued_at: pricingQuote?.issued_at || null,
         pricing_quote_expires_at: pricingQuote?.expires_at || null,
         prediction_method: "locked_web_quote",
-        predictor_version: pricingQuote?.predictor_version || TIMING_PREDICTOR_VERSION
+        predictor_version: pricingQuote?.predictor_version || TIMING_PREDICTOR_VERSION,
+        invite_payment_exempt: invitePaymentExempt
       }
     });
-    const initialPaymentStatus = initialPrice <= 0 ? "exempt" : "pending";
+    const initialPaymentStatus = (invitePaymentExempt || initialPrice <= 0) ? "exempt" : "pending";
 
     const insertSql = `insert into jobs (
         status,
@@ -3401,7 +3427,7 @@ const userId = req.body?.user_id || null;
       returning *`;
 
     const insertParams = [
-      initialPrice <= 0 ? "created" : "pending_payment",
+      (invitePaymentExempt || initialPrice <= 0) ? "created" : "pending_payment",
       0,
       initialPrice,
       exifSummary,
