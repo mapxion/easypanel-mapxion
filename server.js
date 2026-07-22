@@ -647,7 +647,16 @@ async function finalizeJobStageMetrics(db, jobId) {
   if (!jobRows.length) return;
 
   const job = jobRows[0];
-  const done = String(job.status || "").toLowerCase() === "done";
+  const status = String(job.status || "").toLowerCase();
+  const done = status === "done";
+  const xproces = job?.exif_summary?._xproces || {};
+  const outputMetrics = xproces?.output_metrics || {};
+  const hasZipArtifact =
+    Number(outputMetrics?.zip_bytes || 0) > 0 ||
+    (Array.isArray(outputMetrics?.files) && outputMetrics.files.some((file) =>
+      String(file?.category || "").toLowerCase() === "zip" &&
+      Number(file?.bytes || 0) > 0
+    ));
   const features = buildJobFeatures(job);
   // Si Metashape ejecutó una fase real y quedó bien medida, esa muestra es
   // útil aunque la fase sea una dependencia interna y no una salida elegida
@@ -666,13 +675,27 @@ async function finalizeJobStageMetrics(db, jobId) {
     [jobId]
   );
 
+  const processingCompleted =
+    done ||
+    hasZipArtifact ||
+    metricsRows.some((metric) => normalizeProcessingStage(metric.stage) === "processing_complete");
+
   for (const metric of metricsRows) {
     const stage = normalizeProcessingStage(metric.stage);
     let reason = metric.invalid_reason || null;
     const durationMs = Number(metric.duration_ms || 0);
+    const postProcessingTransferStage = stage === "zip_upload";
 
-    if (!done) reason = String(job.status || "job_not_done").toLowerCase();
-    else if (job.error) reason = "job_has_error";
+    // Un fallo posterior a Metashape no debe borrar horas de aprendizaje válidas.
+    // Si el procesado terminó y existe el ZIP, conservamos las fases reales.
+    // La subida final del ZIP fallida queda fuera y se estima con trabajos
+    // históricos similares que sí completaron esa transferencia.
+    if (!done && !(processingCompleted && !postProcessingTransferStage)) {
+      reason = status || "job_not_done";
+    }
+    else if (job.error && !(processingCompleted && !postProcessingTransferStage)) {
+      reason = "job_has_error";
+    }
     else if (
       Number(metric.start_events || 0) < 1 ||
       Number(metric.end_events || 0) < 1 ||
