@@ -45,6 +45,56 @@ const PRICING_QUOTE_SECRET = String(
 );
 const PRICING_QUOTE_TTL_SECONDS = 60 * 60;
 
+// Vista temporal de cliente desde el panel administrador.
+// Solo crea una sesión de lectura y no modifica el trabajo ni el worker.
+const CLIENT_PREVIEW_TTL_SECONDS = 15 * 60;
+const CLIENT_PREVIEW_SECRET = String(
+  process.env.CLIENT_PREVIEW_SECRET || ADMIN_TOKEN
+);
+
+function createClientPreviewToken(payload = {}) {
+  const body = {
+    user_id: String(payload.user_id || ""),
+    job_id: String(payload.job_id || ""),
+    email: String(payload.email || ""),
+    name: String(payload.name || ""),
+    exp: Math.floor(Date.now() / 1000) + CLIENT_PREVIEW_TTL_SECONDS
+  };
+  const encoded = Buffer.from(JSON.stringify(body), "utf8").toString("base64url");
+  const signature = createHmac("sha256", CLIENT_PREVIEW_SECRET)
+    .update(encoded)
+    .digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+function verifyClientPreviewToken(token) {
+  const raw = String(token || "").trim();
+  const [encoded, signature] = raw.split(".");
+  if (!encoded || !signature) return null;
+
+  const expected = createHmac("sha256", CLIENT_PREVIEW_SECRET)
+    .update(encoded)
+    .digest("base64url");
+
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return null;
+
+  let same = 0;
+  for (let i = 0; i < a.length; i += 1) same |= a[i] ^ b[i];
+  if (same !== 0) return null;
+
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    if (!payload?.user_id || Number(payload?.exp || 0) < Math.floor(Date.now() / 1000)) {
+      return null;
+    }
+    return payload;
+  } catch (_) {
+    return null;
+  }
+}
+
 // =====================
 // PAYPAL CHECKOUT
 // =====================
@@ -2044,9 +2094,11 @@ app.get("/admin/jobs", requireAdmin, async (_req, res) => {
     const { rows } = await pool.query(`
       select
         id,
+        user_id,
         client_email,
         project_name,
         client_name,
+        exif_summary,
         status,
         stage,
         photos_count,
@@ -2113,6 +2165,109 @@ app.get("/admin/jobs", requireAdmin, async (_req, res) => {
   }
 });
 
+
+app.post("/admin/jobs/:id/client-preview", requireAdmin, async (req, res) => {
+  try {
+    const jobId = String(req.params?.id || "").trim();
+    if (!isValidUuid(jobId)) {
+      return res.status(400).json({ ok: false, error: "invalid_job_id" });
+    }
+
+    const { rows } = await pool.query(
+      `select j.id, j.user_id, j.client_email, j.client_name,
+              u.email as user_email, u.name as user_name
+         from jobs j
+         left join users u on u.id = j.user_id
+        where j.id = $1
+        limit 1`,
+      [jobId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: "job_not_found" });
+    }
+
+    const job = rows[0];
+    if (!job.user_id) {
+      return res.status(409).json({
+        ok: false,
+        error: "job_without_user",
+        message: "Este trabajo no está asociado a un usuario registrado."
+      });
+    }
+
+    const email = job.user_email || job.client_email || "";
+    const name = job.user_name || job.client_name || "";
+    const token = createClientPreviewToken({
+      user_id: job.user_id,
+      job_id: job.id,
+      email,
+      name
+    });
+
+    const publicBase = String(process.env.PUBLIC_WEB_URL || "https://xproces.com").replace(/\/$/, "");
+    return res.json({
+      ok: true,
+      expires_in: CLIENT_PREVIEW_TTL_SECONDS,
+      preview_url: `${publicBase}/?client_preview=${encodeURIComponent(token)}`,
+      user: { id: job.user_id, email, name },
+      job_id: job.id
+    });
+  } catch (e) {
+    console.error("client preview create error", e);
+    return res.status(500).json({
+      ok: false,
+      error: "client_preview_create_error",
+      message: e?.message || String(e)
+    });
+  }
+});
+
+app.get("/admin/client-preview/session", async (req, res) => {
+  try {
+    const payload = verifyClientPreviewToken(req.query?.token);
+    if (!payload) {
+      return res.status(401).json({
+        ok: false,
+        error: "invalid_or_expired_preview",
+        message: "La vista temporal ha caducado o no es válida."
+      });
+    }
+
+    const { rows } = await pool.query(
+      `select id, email, name
+         from users
+        where id = $1
+        limit 1`,
+      [payload.user_id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: "preview_user_not_found" });
+    }
+
+    return res.json({
+      ok: true,
+      read_only: true,
+      expires_at: new Date(Number(payload.exp) * 1000).toISOString(),
+      job_id: payload.job_id || null,
+      user: {
+        id: rows[0].id,
+        email: rows[0].email || payload.email || "",
+        name: rows[0].name || payload.name || "",
+        auth_type: "admin_preview",
+        read_only: true
+      }
+    });
+  } catch (e) {
+    console.error("client preview session error", e);
+    return res.status(500).json({
+      ok: false,
+      error: "client_preview_session_error",
+      message: e?.message || String(e)
+    });
+  }
+});
 
 app.get("/admin/users", requireAdmin, async (_req, res) => {
   try {
