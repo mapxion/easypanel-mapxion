@@ -647,16 +647,7 @@ async function finalizeJobStageMetrics(db, jobId) {
   if (!jobRows.length) return;
 
   const job = jobRows[0];
-  const status = String(job.status || "").toLowerCase();
-  const done = status === "done";
-  const xproces = job?.exif_summary?._xproces || {};
-  const outputMetrics = xproces?.output_metrics || {};
-  const hasZipArtifact =
-    Number(outputMetrics?.zip_bytes || 0) > 0 ||
-    (Array.isArray(outputMetrics?.files) && outputMetrics.files.some((file) =>
-      String(file?.category || "").toLowerCase() === "zip" &&
-      Number(file?.bytes || 0) > 0
-    ));
+  const done = String(job.status || "").toLowerCase() === "done";
   const features = buildJobFeatures(job);
   // Si Metashape ejecutó una fase real y quedó bien medida, esa muestra es
   // útil aunque la fase sea una dependencia interna y no una salida elegida
@@ -675,27 +666,13 @@ async function finalizeJobStageMetrics(db, jobId) {
     [jobId]
   );
 
-  const processingCompleted =
-    done ||
-    hasZipArtifact ||
-    metricsRows.some((metric) => normalizeProcessingStage(metric.stage) === "processing_complete");
-
   for (const metric of metricsRows) {
     const stage = normalizeProcessingStage(metric.stage);
     let reason = metric.invalid_reason || null;
     const durationMs = Number(metric.duration_ms || 0);
-    const postProcessingTransferStage = stage === "zip_upload";
 
-    // Un fallo posterior a Metashape no debe borrar horas de aprendizaje válidas.
-    // Si el procesado terminó y existe el ZIP, conservamos las fases reales.
-    // La subida final del ZIP fallida queda fuera y se estima con trabajos
-    // históricos similares que sí completaron esa transferencia.
-    if (!done && !(processingCompleted && !postProcessingTransferStage)) {
-      reason = status || "job_not_done";
-    }
-    else if (job.error && !(processingCompleted && !postProcessingTransferStage)) {
-      reason = "job_has_error";
-    }
+    if (!done) reason = String(job.status || "job_not_done").toLowerCase();
+    else if (job.error) reason = "job_has_error";
     else if (
       Number(metric.start_events || 0) < 1 ||
       Number(metric.end_events || 0) < 1 ||
@@ -1931,25 +1908,13 @@ function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qua
   // TAMS mantiene su precio fijo independiente del tiempo estimado.
   if (type === "tams") return 100;
 
-  // XProces se cobra únicamente según el tiempo estimado de procesamiento.
-  // Tramos acumulativos, sin coste mínimo y sin redondeo a euros enteros:
-  //   minutos 1-45:    0,50 EUR/min
-  //   minutos 46-120:  0,40 EUR/min
-  //   desde minuto 121: 0,30 EUR/min
+  // XProces: 12 EUR por hora estimada, con un mínimo de 8 EUR.
+  // Equivale a 0,20 EUR por minuto.
   const minutes = Math.max(0, Number(estimatedSeconds || 0) / 60);
-
-  let price = 0;
-
-  if (minutes <= 45) {
-    price = minutes * 0.50;
-  } else if (minutes <= 120) {
-    price = (45 * 0.50) + ((minutes - 45) * 0.40);
-  } else {
-    price = (45 * 0.50) + (75 * 0.40) + ((minutes - 120) * 0.30);
-  }
+  const price = Math.max(8, minutes * 0.20);
 
   // Se conservan céntimos exactos para la base de datos y PayPal.
-  return Math.max(0, Math.round((price + Number.EPSILON) * 100) / 100);
+  return Math.round((price + Number.EPSILON) * 100) / 100;
 }
 
 // ✅ helper: status “bloqueado” (no permitir más uploads)
@@ -2131,12 +2096,10 @@ app.get("/admin/config", requireAdmin, (_req, res) => {
       support_email: "soportetams@intelsi.es",
       auto_refresh_seconds: 5,
       pricing_model: "estimated_processing_time",
-      minimum_price: 0,
+      minimum_price: 8,
       rounding: "cents_only",
       time_rates: [
-        { from_minute: 0, to_minute: 45, eur_per_minute: 0.50 },
-        { from_minute: 45, to_minute: 120, eur_per_minute: 0.40 },
-        { from_minute: 120, to_minute: null, eur_per_minute: 0.30 }
+        { from_minute: 0, to_minute: null, eur_per_minute: 0.20 }
       ],
       tams_fixed_price: 100
     }
