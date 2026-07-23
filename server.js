@@ -2061,8 +2061,8 @@ const outputStorage = multer.diskStorage({
     cb(null, outputDir(id));
   },
   filename: (_req, _file, cb) => {
-    // Nombre interno fijo: toda la lógica de validación y descarga espera outputs.zip.
-    cb(null, "outputs.zip");
+    // Mientras se recibe, no debe existir el nombre final descargable.
+    cb(null, "outputs.zip.uploading");
   },
 });
 
@@ -4772,7 +4772,26 @@ app.post("/jobs/:id/output", uploadOutput.single("file"), async (req, res) => {
     if (!req.file)
       return res.status(400).json({ error: "missing file field (file)" });
 
-    // Multer solo entra aquí cuando el ZIP final ya se ha guardado completo en el VPS.
+    // Multer solo entra aquí cuando el archivo temporal se ha recibido por completo.
+    // En ese momento lo hacemos visible de forma atómica con el nombre definitivo.
+    const temporaryZipPath = path.join(outputDir(id), "outputs.zip.uploading");
+    const finalZipPath = path.join(outputDir(id), "outputs.zip");
+
+    if (!fs.existsSync(temporaryZipPath)) {
+      return res.status(500).json({
+        ok: false,
+        error: "temporary_output_missing",
+        message: "El ZIP temporal no existe tras finalizar la recepción."
+      });
+    }
+
+    if (fs.existsSync(finalZipPath)) {
+      fs.unlinkSync(finalZipPath);
+    }
+
+    fs.renameSync(temporaryZipPath, finalZipPath);
+    const finalZipStat = fs.statSync(finalZipPath);
+
     await pool.query(
       `update jobs
           set results_ready_at = coalesce(results_ready_at, now()),
@@ -4782,12 +4801,12 @@ app.post("/jobs/:id/output", uploadOutput.single("file"), async (req, res) => {
     );
     await recordJobStageEvent(pool, id, "zip_upload", "end");
     await upsertJobStageMetric(pool, id, "zip_upload", {
-      inputBytes: req.file.size,
-      outputBytes: req.file.size,
+      inputBytes: finalZipStat.size,
+      outputBytes: finalZipStat.size,
       itemCount: 1,
       metrics: {
-        filename: req.file.filename,
-        received_bytes: req.file.size
+        filename: "outputs.zip",
+        received_bytes: finalZipStat.size
       }
     });
 
@@ -4809,7 +4828,7 @@ app.post("/jobs/:id/output", uploadOutput.single("file"), async (req, res) => {
 
     res.json({
       ok: true,
-      saved: { filename: req.file.filename, size: req.file.size },
+      saved: { filename: "outputs.zip", size: finalZipStat.size },
       inputPurged: inputCleanupOk,
     });
   } catch (e) {
@@ -7097,9 +7116,15 @@ setInterval(async () => {
   }
 }, 60 * 60 * 1000);
 
-app.listen(port, "0.0.0.0", () => {
+const server = app.listen(port, "0.0.0.0", () => {
   console.log(`mapxion api listening on ${port}`);
 });
+
+// Un ZIP de varios GB puede tardar mucho más que el timeout HTTP por defecto.
+// El worker controla sus propios reintentos; Node no debe cortar una recepción activa.
+server.requestTimeout = 0;
+server.headersTimeout = 0;
+server.keepAliveTimeout = 65 * 1000;
 
 
 
