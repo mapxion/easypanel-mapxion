@@ -3881,10 +3881,18 @@ app.post("/jobs/:id/submit", async (req, res) => {
     });
 
     if (isLockedStatus(job.status)) {
-      return res.status(409).json({
-        ok: false,
-        error: "job_locked",
-        message: `Job ya está en estado ${job.status}`,
+      // Submit idempotente: si la petición anterior llegó al servidor pero la
+      // respuesta se perdió, el navegador puede repetirla sin crear otra cola
+      // ni mostrar un falso error al cliente.
+      const normalizedStatus = String(job.status || "").toLowerCase();
+      return res.json({
+        ok: true,
+        already_submitted: true,
+        enqueued: ["queued", "running", "done"].includes(normalizedStatus),
+        download_pending: ["tams_pending_download", "tams_downloaded"].includes(normalizedStatus),
+        jobId: id,
+        status: normalizedStatus,
+        message: `El trabajo ya está en estado ${normalizedStatus}.`
       });
     }
 
@@ -5512,8 +5520,11 @@ app.post("/worker/claim", requireWorkerAuth, async (_req, res) => {
 });
 app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
   try {
+    // La web tiene prioridad para cerrar la subida mediante /complete-upload
+    // y /submit. El watchdog solo interviene como recuperación cuando el job
+    // lleva varios minutos sin cambios; así no compite con el último lote.
     const MAX_IDLE_MINUTES = 15;
-    const MAX_STUCK_RECEIVING_MINUTES = 5;
+    const RECOVERY_IDLE_MINUTES = 5;
 
     const staleResult = await pool.query(
       `select id, photos_count, updated_at, exif_summary
@@ -5523,7 +5534,8 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
 
     for (const job of staleResult.rows) {
       const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || null;
-      const totalPhotos = Number(job.photos_count || 0);
+      const expectedBytes = Number(job.exif_summary?._xproces?.totalBytes || 0) || null;
+      const recordedPhotos = Number(job.photos_count || 0);
       const serverFilesCount = listInputImages(job.id).length;
       const serverBytes = getInputTotalBytes(job.id);
       const updatedAtMs = job.updated_at ? new Date(job.updated_at).getTime() : null;
@@ -5531,10 +5543,72 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
       const projectType = String(job.exif_summary?._xproces?.project_type || "fotogrametria").toLowerCase();
       const isTams = projectType === "tams" || !!job.exif_summary?._xproces?.tams_export;
 
-      const readyByExpected = expectedPhotos && totalPhotos >= expectedPhotos && serverFilesCount >= expectedPhotos;
-      const readyByIdle = !expectedPhotos && totalPhotos > 0 && serverFilesCount >= totalPhotos && idleMinutes > MAX_STUCK_RECEIVING_MINUTES;
+      const expectedCountComplete = expectedPhotos
+        ? recordedPhotos >= expectedPhotos && serverFilesCount >= expectedPhotos
+        : recordedPhotos > 0 && serverFilesCount >= recordedPhotos;
 
-      if (readyByExpected || readyByIdle) {
+      const expectedBytesComplete = expectedBytes
+        ? serverBytes === expectedBytes
+        : true;
+
+      const readyForRecovery =
+        idleMinutes > RECOVERY_IDLE_MINUTES &&
+        expectedCountComplete &&
+        expectedBytesComplete;
+
+      if (readyForRecovery) {
+        // La ruta normal /complete-upload ya valida los JPG. Como esta vía
+        // puede cerrarlos sin pasar por ella, repetimos la misma validación
+        // antes de poner el trabajo en cola.
+        const validation = validateUploadedJobImages(job.id);
+        const validCount = validation.validCount;
+        const validBytes = validation.validBytes;
+        const validCountComplete = expectedPhotos
+          ? validCount === expectedPhotos
+          : validCount > 0;
+        const validBytesComplete = expectedBytes
+          ? validBytes === expectedBytes
+          : true;
+
+        if (
+          validation.invalidFiles.length > 0 ||
+          !validCountComplete ||
+          !validBytesComplete
+        ) {
+          const invalidNames = validation.invalidFiles
+            .map((item) => item.filename)
+            .filter(Boolean);
+
+          const message = validation.invalidFiles.length > 0
+            ? `Subida inválida: ${validation.invalidFiles.length} archivo(s) corrupto(s) o incompleto(s)${invalidNames.length ? `: ${invalidNames.join(", ")}` : ""}.`
+            : `Subida todavía no verificable: ${validCount}/${expectedPhotos || recordedPhotos} fotos y ${validBytes}/${expectedBytes || validBytes} bytes.`;
+
+          await pool.query(
+            `update jobs
+               set status = 'receiving',
+                   stage = $2,
+                   photos_count = $3,
+                   input_total_bytes = $4,
+                   message = $5,
+                   error = $6,
+                   updated_at = now()
+             where id = $1 and status = 'receiving'`,
+            [
+              job.id,
+              validation.invalidFiles.length > 0 ? "upload_invalid" : "upload_waiting",
+              validCount,
+              validBytes,
+              message,
+              validation.invalidFiles.length > 0
+                ? JSON.stringify(validation.invalidFiles)
+                : null
+            ]
+          );
+
+          console.log("⏳ Watchdog no promociona job todavía:", job.id, message);
+          continue;
+        }
+
         if (isTams) {
           await pool.query(
             `update jobs
@@ -5549,9 +5623,9 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
                    upload_completed_at = coalesce(upload_completed_at, now()),
                    updated_at = now()
              where id = $1 and status = 'receiving'`,
-            [job.id, serverFilesCount, serverBytes]
+            [job.id, validCount, validBytes]
           );
-          console.log("📥 TAMS pendiente de descarga al PC:", job.id, `${serverFilesCount}/${expectedPhotos || totalPhotos}`);
+          console.log("📥 TAMS pendiente de descarga al PC:", job.id, `${validCount}/${expectedPhotos || recordedPhotos}`);
         } else {
           await pool.query(
             `update jobs
@@ -5563,41 +5637,60 @@ app.get("/worker/receiving", requireWorkerAuth, async (_req, res) => {
                    upload_completed_at = coalesce(upload_completed_at, now()),
                    updated_at = now()
              where id = $1 and status = 'receiving'`,
-            [job.id, serverFilesCount, serverBytes]
+            [job.id, validCount, validBytes]
           );
-          console.log("🚀 Job promovido a queued:", job.id, `${serverFilesCount}/${expectedPhotos || totalPhotos}`);
+          console.log("🚀 Job promovido a queued por recuperación:", job.id, `${validCount}/${expectedPhotos || recordedPhotos}`);
         }
 
-        // Esta ruta de vigilancia puede cerrar la subida sin pasar por
-        // /complete-upload. Registrar igualmente la fase evita perder las
-        // muestras de subida de los trabajos promovidos automáticamente.
         await recordJobStageEvent(pool, job.id, "uploading", "end");
         await upsertJobStageMetric(pool, job.id, "uploading", {
-          inputBytes: serverBytes,
-          outputBytes: serverBytes,
-          itemCount: serverFilesCount,
+          inputBytes: validBytes,
+          outputBytes: validBytes,
+          itemCount: validCount,
           metrics: {
             completion_source: "receiving_watchdog",
+            recovery_idle_minutes: RECOVERY_IDLE_MINUTES,
             expected_photos: expectedPhotos,
-            valid_files: serverFilesCount
+            expected_bytes: expectedBytes,
+            valid_files: validCount
           }
         });
         continue;
       }
 
-      if (expectedPhotos && totalPhotos > 0 && totalPhotos < expectedPhotos && idleMinutes > MAX_IDLE_MINUTES) {
+      const staleCountMismatch =
+        expectedPhotos &&
+        (recordedPhotos < expectedPhotos || serverFilesCount < expectedPhotos);
+
+      const staleBytesMismatch =
+        expectedBytes &&
+        serverBytes !== expectedBytes;
+
+      if (
+        idleMinutes > MAX_IDLE_MINUTES &&
+        (staleCountMismatch || staleBytesMismatch)
+      ) {
+        const message = staleCountMismatch
+          ? `Subida incompleta: esperadas ${expectedPhotos} fotos y recibidas ${serverFilesCount}.`
+          : `Subida incompleta o alterada: esperados ${expectedBytes} bytes y recibidos ${serverBytes}.`;
+
         await pool.query(
           `update jobs
              set status = 'failed',
-                 message = 'Subida incompleta: faltan fotografías',
-                 error = 'upload_incomplete',
+                 stage = 'failed',
+                 message = $2,
+                 error = $3,
                  finished_at = now(),
                  total_seconds = greatest(0, extract(epoch from (now() - created_at))::int),
                  updated_at = now()
            where id = $1 and status = 'receiving'`,
-          [job.id]
+          [
+            job.id,
+            message,
+            staleCountMismatch ? "upload_incomplete" : "upload_bytes_mismatch"
+          ]
         );
-        console.log("❌ Job marcado como failed por subida incompleta:", job.id, `${totalPhotos}/${expectedPhotos}`);
+        console.log("❌ Job marcado como failed por subida incompleta:", job.id, message);
       }
     }
 
