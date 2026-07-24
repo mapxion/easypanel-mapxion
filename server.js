@@ -4910,6 +4910,95 @@ app.get("/jobs/:id/log", async (req, res) => {
   }
 });
 
+
+// Comprobación ligera previa a la descarga.
+// No transmite el ZIP ni activa la limpieza del resultado.
+app.get("/jobs/:id/download-status", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidUuid(id)) {
+      return res.status(400).json({
+        ok: false,
+        available: false,
+        error: "invalid_job_id",
+        message: "ID de trabajo no válido."
+      });
+    }
+
+    await ensureDownloadCleanupColumns();
+
+    const { rows } = await pool.query(
+      `select id,
+              status,
+              coalesce(download_verified, false) as download_verified,
+              coalesce(output_purged, false) as output_purged
+         from jobs
+        where id = $1`,
+      [id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        ok: false,
+        available: false,
+        error: "job_not_found",
+        message: "Trabajo no encontrado."
+      });
+    }
+
+    const job = rows[0];
+    const status = String(job.status || "").toLowerCase();
+    const zipPath = path.join(outputDir(id), "outputs.zip");
+    const uploadingPath = path.join(outputDir(id), "outputs.zip.uploading");
+
+    if (status !== "done") {
+      return res.status(409).json({
+        ok: false,
+        available: false,
+        uploading: fs.existsSync(uploadingPath),
+        error: "results_not_ready",
+        message: "Los resultados todavía se están preparando."
+      });
+    }
+
+    if (!fs.existsSync(zipPath)) {
+      return res.status(410).json({
+        ok: false,
+        available: false,
+        purged: Boolean(job.output_purged),
+        error: "outputs_not_available",
+        message: "Este trabajo no está disponible para descarga directa. Contacte con soporte para recuperarlo."
+      });
+    }
+
+    const stat = fs.statSync(zipPath);
+    if (!stat.isFile() || stat.size <= 0) {
+      return res.status(410).json({
+        ok: false,
+        available: false,
+        error: "outputs_invalid",
+        message: "El paquete final no está disponible correctamente."
+      });
+    }
+
+    return res.json({
+      ok: true,
+      available: true,
+      filename: `xproces-${id}.zip`,
+      size: stat.size
+    });
+  } catch (e) {
+    console.error("download status error", e);
+    return res.status(500).json({
+      ok: false,
+      available: false,
+      error: "download_status_error",
+      message: "No se pudo comprobar la disponibilidad de la descarga."
+    });
+  }
+});
+
 app.get("/jobs/:id/download", async (req, res) => {
   try {
     const { id } = req.params;
