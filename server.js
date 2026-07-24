@@ -4913,6 +4913,61 @@ app.get("/jobs/:id/log", async (req, res) => {
 
 // Comprobación ligera previa a la descarga.
 // No transmite el ZIP ni activa la limpieza del resultado.
+
+const OUTPUT_RETENTION_HOURS = Math.max(
+  48,
+  Number.parseInt(process.env.OUTPUT_RETENTION_HOURS || "48", 10) || 48
+);
+const OUTPUT_RETENTION_MS = OUTPUT_RETENTION_HOURS * 60 * 60 * 1000;
+
+function getOutputExpiryDate(job) {
+  const baseValue =
+    job?.results_ready_at ||
+    job?.processing_finished_at ||
+    job?.finished_at ||
+    job?.updated_at;
+
+  const base = baseValue ? new Date(baseValue) : null;
+  if (!base || Number.isNaN(base.getTime())) return null;
+
+  return new Date(base.getTime() + OUTPUT_RETENTION_MS);
+}
+
+async function purgeExpiredOutputIfNeeded(jobId, job, zipPath) {
+  const expiresAt = getOutputExpiryDate(job);
+  if (!expiresAt || Date.now() < expiresAt.getTime()) {
+    return { expired: false, expiresAt };
+  }
+
+  let removed = false;
+  try {
+    if (fs.existsSync(zipPath)) {
+      fs.unlinkSync(zipPath);
+      removed = true;
+    }
+  } catch (error) {
+    console.error("No se pudo eliminar el ZIP caducado:", jobId, error?.message || error);
+  }
+
+  try {
+    await ensureDownloadCleanupColumns();
+    await pool.query(
+      `update jobs
+          set output_purged = true,
+              output_purged_at = coalesce(output_purged_at, now()),
+              stage = 'download_expired',
+              message = 'El plazo de descarga ha caducado sin que se haya descargado el archivo. Solicite su reactivación.',
+              updated_at = now()
+        where id = $1`,
+      [jobId]
+    );
+  } catch (error) {
+    console.error("No se pudo marcar el ZIP como caducado:", jobId, error?.message || error);
+  }
+
+  return { expired: true, expiresAt, removed };
+}
+
 app.get("/jobs/:id/download-status", async (req, res) => {
   try {
     const { id } = req.params;
@@ -4932,7 +4987,11 @@ app.get("/jobs/:id/download-status", async (req, res) => {
       `select id,
               status,
               coalesce(download_verified, false) as download_verified,
-              coalesce(output_purged, false) as output_purged
+              coalesce(output_purged, false) as output_purged,
+              results_ready_at,
+              processing_finished_at,
+              finished_at,
+              updated_at
          from jobs
         where id = $1`,
       [id]
@@ -4951,6 +5010,17 @@ app.get("/jobs/:id/download-status", async (req, res) => {
     const status = String(job.status || "").toLowerCase();
     const zipPath = path.join(outputDir(id), "outputs.zip");
     const uploadingPath = path.join(outputDir(id), "outputs.zip.uploading");
+
+    const expiry = await purgeExpiredOutputIfNeeded(id, job, zipPath);
+    if (expiry.expired) {
+      return res.status(410).json({
+        ok: false,
+        available: false,
+        expired: true,
+        error: "outputs_expired",
+        message: "El plazo de descarga ha caducado sin que se haya descargado el archivo. Solicite de nuevo su activación."
+      });
+    }
 
     if (status !== "done") {
       return res.status(409).json({
@@ -4986,7 +5056,9 @@ app.get("/jobs/:id/download-status", async (req, res) => {
       ok: true,
       available: true,
       filename: `xproces-${id}.zip`,
-      size: stat.size
+      size: stat.size,
+      expires_at: expiry.expiresAt ? expiry.expiresAt.toISOString() : null,
+      retention_hours: OUTPUT_RETENTION_HOURS
     });
   } catch (e) {
     console.error("download status error", e);
@@ -5009,7 +5081,11 @@ app.get("/jobs/:id/download", async (req, res) => {
       `select id,
               status,
               coalesce(download_verified, false) as download_verified,
-              coalesce(output_purged, false) as output_purged
+              coalesce(output_purged, false) as output_purged,
+              results_ready_at,
+              processing_finished_at,
+              finished_at,
+              updated_at
          from jobs
         where id = $1`,
       [id]
@@ -5021,6 +5097,15 @@ app.get("/jobs/:id/download", async (req, res) => {
 
     const jobForDownload = rows[0];
     const zipPath = path.join(outputDir(id), "outputs.zip");
+
+    const expiry = await purgeExpiredOutputIfNeeded(id, jobForDownload, zipPath);
+    if (expiry.expired) {
+      return res.status(410).json({
+        ok: false,
+        error: "outputs_expired",
+        message: "El plazo de descarga ha caducado sin que se haya descargado el archivo. Solicite de nuevo su activación."
+      });
+    }
 
     if (String(jobForDownload.status || "").toLowerCase() !== "done") {
       return res.status(409).json({
@@ -5055,11 +5140,14 @@ app.get("/jobs/:id/download", async (req, res) => {
       }
 
       try {
-        // Guardamos resumen/log/listado de outputs ANTES de borrar los archivos del VPS.
+        // La descarga terminó correctamente: guardamos el resumen y eliminamos
+        // inmediatamente el ZIP del VPS. La retención de 48 h solo aplica
+        // cuando el cliente todavía no lo ha descargado.
         await saveArchivedJobSummary(id);
 
         const cleanup = cleanupJobStorage(id, { input: true, output: true });
         console.log("Cleanup tras descarga completada:", id, cleanup);
+
         await markDownloadCompletedAndPurged(id, cleanup);
       } catch (cleanupError) {
         console.error("cleanup tras descarga error", id, cleanupError?.message || cleanupError);
