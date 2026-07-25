@@ -2015,6 +2015,11 @@ function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qua
   // TAMS mantiene su precio fijo independiente del tiempo estimado.
   if (type === "tams") return 100;
 
+  // Elegir solo la calidad no constituye un pedido.
+  // Sin ningún entregable seleccionado no se muestra tiempo ni se cobra mínimo.
+  const normalizedOutputs = normalizeOutputList(outputsRequested);
+  if (!normalizedOutputs.length) return 0;
+
   // XProces: 12 EUR por hora estimada, con un mínimo de 8 EUR.
   // Equivale a 0,20 EUR por minuto.
   const minutes = Math.max(0, Number(estimatedSeconds || 0) / 60);
@@ -2333,7 +2338,7 @@ app.get("/admin/config", requireAdmin, (_req, res) => {
 
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v42-stage-timing-predictor-v5", predictor_version: TIMING_PREDICTOR_VERSION })
+  res.json({ version: "v42-stage-timing-predictor-v6-output-net", predictor_version: TIMING_PREDICTOR_VERSION })
 );
 
 app.get("/redis", (_req, res) =>
@@ -2406,11 +2411,49 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       totalMegapixels: previewStats.totalMegapixels,
       processingLoadScore: previewLoadScore
     };
+    const hasRequestedOutputs = outputsRequested.length > 0;
+
     const previewFallback = await estimateProcessingDetailsHistorical(pool, previewFeatures);
     const timingPlan = await estimateStageTimingPlan(pool, previewFeatures, previewFallback);
-    const estimatedSeconds = timingPlan.estimated_processing_seconds;
 
-    console.log("PRICING PREVIEW estimatedSeconds:", estimatedSeconds);
+    let baseTimingPlan = null;
+    let estimatedSeconds = 0;
+
+    if (hasRequestedOutputs) {
+      // Calculamos con las mismas fotos y la misma calidad, pero sin entregables.
+      // Ese bloque representa la estimación que antes aparecía solo al elegir
+      // Fast/Normal/Full y se estaba sumando íntegramente al pedido.
+      const baseFeatures = {
+        ...previewFeatures,
+        outputsRequested: [],
+        processingLoadScore: calculateProcessingLoadScore({
+          photosCount,
+          totalBytes,
+          avgMegapixels: previewStats.avgMegapixels,
+          totalMegapixels: previewStats.totalMegapixels,
+          qualityMode,
+          outputsRequested: [],
+          projectType
+        })
+      };
+      const baseFallback = await estimateProcessingDetailsHistorical(pool, baseFeatures);
+      baseTimingPlan = await estimateStageTimingPlan(pool, baseFeatures, baseFallback);
+
+      estimatedSeconds = Math.max(
+        60,
+        Math.round(
+          Number(timingPlan.estimated_processing_seconds || 0) -
+          Number(baseTimingPlan.estimated_processing_seconds || 0)
+        )
+      );
+    }
+
+    console.log("PRICING PREVIEW estimatedSeconds:", {
+      billable: estimatedSeconds,
+      technical: timingPlan.estimated_processing_seconds,
+      quality_base: baseTimingPlan?.estimated_processing_seconds || 0,
+      outputs: outputsRequested
+    });
 
     const price = calculatePriceFromInputs(
       photosCount,
@@ -2441,6 +2484,8 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       total_megapixels: previewStats.totalMegapixels,
       processing_load_score: previewLoadScore,
       estimated_seconds: estimatedSeconds,
+      technical_estimated_seconds: Number(timingPlan.estimated_processing_seconds || 0),
+      quality_base_seconds: Number(baseTimingPlan?.estimated_processing_seconds || 0),
       price
     };
     const pricingQuote = createPricingQuote(quotePayload);
@@ -2456,13 +2501,15 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       pricing_quote: pricingQuote,
       quote_expires_at: quotePayload.expires_at,
       estimated_seconds: estimatedSeconds,
-      estimated_low_seconds: timingPlan.estimated_processing_low_seconds,
-      estimated_high_seconds: timingPlan.estimated_processing_high_seconds,
-      estimated_human: formatEtaSeconds(estimatedSeconds),
-      estimated_total_seconds: timingPlan.estimated_total_service_seconds,
-      estimated_total_low_seconds: timingPlan.estimated_total_low_seconds,
-      estimated_total_high_seconds: timingPlan.estimated_total_high_seconds,
-      estimated_total_human: formatEtaSeconds(timingPlan.estimated_total_service_seconds),
+      estimated_low_seconds: hasRequestedOutputs ? estimatedSeconds : 0,
+      estimated_high_seconds: hasRequestedOutputs ? estimatedSeconds : 0,
+      estimated_human: hasRequestedOutputs ? formatEtaSeconds(estimatedSeconds) : "Seleccione una salida",
+      technical_estimated_seconds: Number(timingPlan.estimated_processing_seconds || 0),
+      quality_base_seconds: Number(baseTimingPlan?.estimated_processing_seconds || 0),
+      estimated_total_seconds: hasRequestedOutputs ? timingPlan.estimated_total_service_seconds : 0,
+      estimated_total_low_seconds: hasRequestedOutputs ? timingPlan.estimated_total_low_seconds : 0,
+      estimated_total_high_seconds: hasRequestedOutputs ? timingPlan.estimated_total_high_seconds : 0,
+      estimated_total_human: hasRequestedOutputs ? formatEtaSeconds(timingPlan.estimated_total_service_seconds) : "Seleccione una salida",
       confidence: timingPlan.confidence,
       timing_prediction: timingPlan
     });
