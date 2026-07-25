@@ -2338,7 +2338,7 @@ app.get("/admin/config", requireAdmin, (_req, res) => {
 
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v42-stage-timing-predictor-v7-monotonic-stages", predictor_version: TIMING_PREDICTOR_VERSION })
+  res.json({ version: "v42-stage-timing-predictor-v8-real-billable-time", predictor_version: TIMING_PREDICTOR_VERSION })
 );
 
 app.get("/redis", (_req, res) =>
@@ -2416,52 +2416,27 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
     const previewFallback = await estimateProcessingDetailsHistorical(pool, previewFeatures);
     const timingPlan = await estimateStageTimingPlan(pool, previewFeatures, previewFallback);
 
-    let baseTimingPlan = null;
-    let estimatedSeconds = 0;
-
-    if (hasRequestedOutputs) {
-      // Calculamos con las mismas fotos y la misma calidad, pero sin entregables.
-      // Ese bloque representa la estimación que antes aparecía solo al elegir
-      // Fast/Normal/Full y se estaba sumando íntegramente al pedido.
-      const baseFeatures = {
-        ...previewFeatures,
-        outputsRequested: [],
-        processingLoadScore: calculateProcessingLoadScore({
-          photosCount,
-          totalBytes,
-          avgMegapixels: previewStats.avgMegapixels,
-          totalMegapixels: previewStats.totalMegapixels,
-          qualityMode,
-          outputsRequested: [],
-          projectType
-        })
-      };
-      const baseFallback = await estimateProcessingDetailsHistorical(pool, baseFeatures);
-      baseTimingPlan = await estimateStageTimingPlan(pool, baseFeatures, baseFallback);
-
-      const baseStageSeconds = new Map(
-        (Array.isArray(baseTimingPlan?.stages) ? baseTimingPlan.stages : [])
-          .map((item) => [normalizeProcessingStage(item.stage), Math.max(0, Number(item.seconds || 0))])
-      );
-
-      const marginalStageSeconds = (Array.isArray(timingPlan?.stages) ? timingPlan.stages : [])
-        .reduce((sum, item) => {
-          const stage = normalizeProcessingStage(item.stage);
-          const fullSeconds = Math.max(0, Number(item.seconds || 0));
-          const baseSeconds = Math.max(0, Number(baseStageSeconds.get(stage) || 0));
-
-          // Una fase nueva suma todo su tiempo. Una fase compartida solo puede
-          // aportar un incremento positivo; nunca se permite que reste tiempo.
-          return sum + Math.max(0, fullSeconds - baseSeconds);
-        }, 0);
-
-      estimatedSeconds = Math.max(60, Math.round(marginalStageSeconds));
-    }
+    // El tiempo mostrado y facturado debe ser el tiempo técnico real completo
+    // del servicio solicitado. No se descuenta ninguna "base de calidad":
+    // preparación, procesamiento, exportaciones, ZIP y entrega forman parte
+    // del trabajo real y deben aparecer tanto antes de pagar como al procesar.
+    const estimatedSeconds = hasRequestedOutputs
+      ? Math.max(
+          60,
+          Math.round(
+            Number(
+              timingPlan.estimated_total_service_seconds ||
+              timingPlan.estimated_processing_seconds ||
+              0
+            )
+          )
+        )
+      : 0;
 
     console.log("PRICING PREVIEW estimatedSeconds:", {
-      billable: estimatedSeconds,
-      technical: timingPlan.estimated_processing_seconds,
-      quality_base: baseTimingPlan?.estimated_processing_seconds || 0,
+      billable_and_visible: estimatedSeconds,
+      processing: timingPlan.estimated_processing_seconds,
+      total_service: timingPlan.estimated_total_service_seconds,
       outputs: outputsRequested
     });
 
@@ -2495,7 +2470,7 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       processing_load_score: previewLoadScore,
       estimated_seconds: estimatedSeconds,
       technical_estimated_seconds: Number(timingPlan.estimated_processing_seconds || 0),
-      quality_base_seconds: Number(baseTimingPlan?.estimated_processing_seconds || 0),
+      quality_base_seconds: 0,
       price
     };
     const pricingQuote = createPricingQuote(quotePayload);
@@ -2515,7 +2490,7 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       estimated_high_seconds: hasRequestedOutputs ? estimatedSeconds : 0,
       estimated_human: hasRequestedOutputs ? formatEtaSeconds(estimatedSeconds) : "Seleccione una salida",
       technical_estimated_seconds: Number(timingPlan.estimated_processing_seconds || 0),
-      quality_base_seconds: Number(baseTimingPlan?.estimated_processing_seconds || 0),
+      quality_base_seconds: 0,
       estimated_total_seconds: hasRequestedOutputs ? timingPlan.estimated_total_service_seconds : 0,
       estimated_total_low_seconds: hasRequestedOutputs ? timingPlan.estimated_total_low_seconds : 0,
       estimated_total_high_seconds: hasRequestedOutputs ? timingPlan.estimated_total_high_seconds : 0,
