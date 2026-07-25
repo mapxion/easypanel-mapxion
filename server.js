@@ -7310,10 +7310,96 @@ async function estimateProcessingSeconds(pool, job) {
   return plan.estimated_processing_seconds;
 }
 
-async function estimateRemainingServiceSeconds(pool, job) {
-  if (!job) return 0;
+async function getJobStageRuntimeState(pool, jobId, currentStageInput) {
+  const currentStage = normalizeProcessingStage(currentStageInput);
+
+  const { rows } = await pool.query(
+    `select stage, event_type, created_at
+       from job_stage_events
+      where job_id = $1
+      order by id asc`,
+    [jobId]
+  );
+
+  const completedStages = new Set();
+  let currentStartedAt = null;
+  let currentEndedAt = null;
+
+  for (const row of rows) {
+    const stage = normalizeProcessingStage(row.stage);
+    const eventType = String(row.event_type || "").toLowerCase();
+
+    if (eventType === "end") completedStages.add(stage);
+
+    if (stage === currentStage) {
+      if (eventType === "start") {
+        currentStartedAt = new Date(row.created_at);
+        currentEndedAt = null;
+      } else if (eventType === "end" && currentStartedAt) {
+        currentEndedAt = new Date(row.created_at);
+      }
+    }
+  }
+
+  const currentIsActive =
+    currentStartedAt &&
+    !Number.isNaN(currentStartedAt.getTime()) &&
+    (!currentEndedAt || currentEndedAt < currentStartedAt);
+
+  const currentElapsedSeconds = currentIsActive
+    ? Math.max(0, Math.floor((Date.now() - currentStartedAt.getTime()) / 1000))
+    : 0;
+
+  return {
+    currentStage,
+    completedStages,
+    currentStartedAt: currentIsActive ? currentStartedAt : null,
+    currentElapsedSeconds
+  };
+}
+
+function getPlanStageEstimate(plan, stageInput) {
+  const stage = normalizeProcessingStage(stageInput);
+  const stages = Array.isArray(plan?.stages) ? plan.stages : [];
+
+  if (stage === "zip_upload") {
+    const zipUpload = plan?.service_segments?.zip_upload || {};
+    return {
+      stage,
+      seconds: Math.max(0, Number(
+        zipUpload.seconds ??
+        plan?.service_segments?.zip_upload_seconds ??
+        0
+      )),
+      low_seconds: Math.max(0, Number(zipUpload.low_seconds || 0)),
+      high_seconds: Math.max(0, Number(zipUpload.high_seconds || 0)),
+      confidence: zipUpload.confidence || "low",
+      sample_count: Number(zipUpload.sample_count || 0)
+    };
+  }
+
+  return stages.find(
+    (item) => normalizeProcessingStage(item.stage) === stage
+  ) || null;
+}
+
+async function estimateRemainingServiceSeconds(pool, job, options = {}) {
+  if (!job) return options?.details ? { seconds: 0 } : 0;
+
   const status = String(job.status || "").toLowerCase();
-  if (["done", "failed", "cancelled"].includes(status)) return 0;
+  if (["done", "failed", "cancelled"].includes(status)) {
+    const result = {
+      seconds: 0,
+      current_stage: normalizeProcessingStage(job.stage),
+      current_stage_elapsed_seconds: 0,
+      current_stage_estimated_seconds: 0,
+      current_stage_remaining_seconds: 0,
+      pending_stages_seconds: 0,
+      pending_stages: [],
+      method: "terminal"
+    };
+    return options?.details ? result : 0;
+  }
 
   let plan = job?.exif_summary?._xproces?.timing_prediction || null;
   if (!plan) {
@@ -7323,29 +7409,107 @@ async function estimateRemainingServiceSeconds(pool, job) {
   }
 
   const segments = plan?.service_segments || {};
-  const totalService = Math.max(1, Number(
-    plan?.estimated_total_service_seconds ||
-    segments.total_service_seconds ||
-    plan?.estimated_processing_seconds ||
-    1
-  ));
 
   if (["queued", "tams_pending_download"].includes(status)) {
-    // La subida inicial ya ha terminado cuando el trabajo entra en cola.
-    return Math.max(1, Math.round(
+    const seconds = Math.max(1, Math.round(
       Number(segments.download_seconds || segments.download?.seconds || 0) +
       Number(segments.processing_seconds || segments.processing?.seconds || plan?.estimated_processing_seconds || 0) +
       Number(segments.zip_upload_seconds || segments.zip_upload?.seconds || 0)
     ));
+    const result = {
+      seconds,
+      current_stage: "queued",
+      current_stage_elapsed_seconds: 0,
+      current_stage_estimated_seconds: 0,
+      current_stage_remaining_seconds: 0,
+      pending_stages_seconds: seconds,
+      pending_stages: [],
+      method: "queued_stage_sum"
+    };
+    return options?.details ? result : seconds;
   }
 
-  if (status === "running") {
-    // El porcentaje nuevo representa el servicio completo y nunca retrocede.
-    const progress = clampNumber(Number(job.progress || 0), 0, 100);
-    return Math.max(1, Math.round(totalService * (1 - progress / 100)));
+  if (status !== "running") {
+    const seconds = Math.max(1, Math.round(
+      Number(plan?.estimated_total_service_seconds ||
+        segments.total_service_seconds ||
+        plan?.estimated_processing_seconds ||
+        1)
+    ));
+    const result = {
+      seconds,
+      current_stage: normalizeProcessingStage(job.stage),
+      current_stage_elapsed_seconds: 0,
+      current_stage_estimated_seconds: 0,
+      current_stage_remaining_seconds: seconds,
+      pending_stages_seconds: 0,
+      pending_stages: [],
+      method: "status_total_fallback"
+    };
+    return options?.details ? result : seconds;
   }
 
-  return Math.max(1, Math.round(totalService));
+  const runtime = await getJobStageRuntimeState(pool, job.id, job.stage);
+  const planStages = Array.isArray(plan?.stages) ? plan.stages : [];
+  const orderedStages = planStages.map((item) => normalizeProcessingStage(item.stage));
+
+  if (Number(segments.zip_upload_seconds || segments.zip_upload?.seconds || 0) > 0) {
+    orderedStages.push("zip_upload");
+  }
+
+  const currentStage = runtime.currentStage;
+  const currentIndex = orderedStages.indexOf(currentStage);
+  const currentEstimate = getPlanStageEstimate(plan, currentStage);
+  const currentEstimatedSeconds = Math.max(0, Number(currentEstimate?.seconds || 0));
+  const currentElapsedSeconds = Math.max(0, Number(runtime.currentElapsedSeconds || 0));
+  const currentRemainingSeconds = Math.max(
+    0,
+    Math.round(currentEstimatedSeconds - currentElapsedSeconds)
+  );
+
+  const pendingStages = [];
+  let pendingStagesSeconds = 0;
+
+  for (let i = 0; i < orderedStages.length; i += 1) {
+    const stage = orderedStages[i];
+    if (stage === currentStage) continue;
+    if (runtime.completedStages.has(stage)) continue;
+    if (currentIndex >= 0 && i < currentIndex) continue;
+
+    const estimate = getPlanStageEstimate(plan, stage);
+    const seconds = Math.max(0, Number(estimate?.seconds || 0));
+    if (seconds <= 0) continue;
+
+    pendingStages.push({
+      stage,
+      seconds: Math.round(seconds),
+      confidence: estimate?.confidence || "low",
+      sample_count: Number(estimate?.sample_count || 0)
+    });
+    pendingStagesSeconds += seconds;
+  }
+
+  // Si la fase actual no pertenece al plan, no volvemos al porcentaje global:
+  // sumamos exclusivamente las fases aún no terminadas.
+  const seconds = Math.max(
+    1,
+    Math.round(currentRemainingSeconds + pendingStagesSeconds)
+  );
+
+  const result = {
+    seconds,
+    current_stage: currentStage,
+    current_stage_elapsed_seconds: currentElapsedSeconds,
+    current_stage_estimated_seconds: Math.round(currentEstimatedSeconds),
+    current_stage_remaining_seconds: currentRemainingSeconds,
+    current_stage_confidence: currentEstimate?.confidence || "low",
+    current_stage_samples: Number(currentEstimate?.sample_count || 0),
+    pending_stages_seconds: Math.round(pendingStagesSeconds),
+    pending_stages: pendingStages,
+    method: "current_stage_plus_pending_stages"
+  };
+
+  return options?.details ? result : seconds;
 }
 
 function formatEtaSeconds(seconds) {
@@ -7362,7 +7526,7 @@ app.get("/jobs/:id/eta", async (req, res) => {
     const { id } = req.params;
 
     const { rows } = await pool.query(
-      `select id, status, progress, photos_count, input_total_bytes, created_at,
+      `select id, status, progress, stage, photos_count, input_total_bytes, created_at,
               quality, project_type, outputs, exif_summary,
               avg_photo_mb, avg_width, avg_height, avg_megapixels,
               total_megapixels, processing_load_score
@@ -7378,7 +7542,7 @@ app.get("/jobs/:id/eta", async (req, res) => {
     const targetJob = rows[0];
 
     const allRows = await pool.query(
-      `select id, status, progress, photos_count, input_total_bytes, created_at,
+      `select id, status, progress, stage, photos_count, input_total_bytes, created_at,
               quality, project_type, outputs, exif_summary,
               avg_photo_mb, avg_width, avg_height, avg_megapixels,
               total_megapixels, processing_load_score
@@ -7398,19 +7562,30 @@ app.get("/jobs/:id/eta", async (req, res) => {
     }
 
     const ownProcessingSeconds = await estimateProcessingSeconds(pool, targetJob);
-    const ownServiceSeconds = await estimateRemainingServiceSeconds(pool, targetJob);
+    const ownRemaining = await estimateRemainingServiceSeconds(pool, targetJob, { details: true });
+    const ownServiceSeconds = Number(ownRemaining.seconds || 0);
     const totalSeconds = waitSeconds + ownServiceSeconds;
 
     res.json({
       ok: true,
       job_id: id,
       status: targetJob.status,
+      stage: targetJob.stage,
       quality_mode: getJobQualityMode(targetJob),
       quality_mode_label: getQualityModeLabel(getJobQualityMode(targetJob)),
       queue_wait_seconds: waitSeconds,
       own_processing_seconds: ownProcessingSeconds,
       own_remaining_service_seconds: ownServiceSeconds,
       total_estimated_seconds: totalSeconds,
+      current_stage: ownRemaining.current_stage || null,
+      current_stage_elapsed_seconds: Number(ownRemaining.current_stage_elapsed_seconds || 0),
+      current_stage_estimated_seconds: Number(ownRemaining.current_stage_estimated_seconds || 0),
+      current_stage_remaining_seconds: Number(ownRemaining.current_stage_remaining_seconds || 0),
+      current_stage_confidence: ownRemaining.current_stage_confidence || null,
+      current_stage_samples: Number(ownRemaining.current_stage_samples || 0),
+      pending_stages_seconds: Number(ownRemaining.pending_stages_seconds || 0),
+      pending_stages: ownRemaining.pending_stages || [],
+      eta_method: ownRemaining.method || null,
       queue_wait_human: formatEtaSeconds(waitSeconds),
       own_processing_human: formatEtaSeconds(ownProcessingSeconds),
       own_remaining_service_human: formatEtaSeconds(ownServiceSeconds),
