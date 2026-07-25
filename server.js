@@ -8,7 +8,7 @@ import pkg from "pg";
 import archiver from "archiver";
 import cors from "cors";
 import bcrypt from "bcryptjs";
-import { randomBytes, createHmac } from "crypto";
+import { randomBytes, createHmac, createHash } from "crypto";
 import { telegramIsConfigured, sendTelegramMessage, notifyPaymentReceived } from "./telegram.js";
 
 
@@ -4249,34 +4249,23 @@ app.post("/jobs/:id/submit", async (req, res) => {
 // =====================
 
 // ✅ acepta "photos" y "photos[]"
+// Actualización incremental segura:
+// - no recorre toda la carpeta después de cada lote;
+// - serializa las actualizaciones concurrentes por job;
+// - evita contar dos veces un lote repetido tras un timeout de red;
+// - la validación completa continúa realizándose en /complete-upload.
 app.post("/jobs/:id/upload", requirePaidJobBeforeUpload, uploadInput.any(), async (req, res) => {
+  const db = await pool.connect();
+
   try {
     const { id } = req.params;
-
-    const { rows } = await pool.query(
-      "select id, status, created_at, exif_summary from jobs where id = $1",
-      [id]
-    );
-    if (!rows.length) return res.status(404).json({ error: "job not found" });
-
-    const job = rows[0];
-
-    if (isLockedStatus(job.status)) {
-      return res.status(409).json({
-        ok: false,
-        error: "job_locked",
-        message: `No se pueden subir más fotos: estado ${job.status}`,
-      });
-    }
-
-    ensureJobDirs(id);
 
     const files = (req.files || [])
       .filter((f) => f.fieldname === "photos" || f.fieldname === "photos[]")
       .map((f) => ({
         field: f.fieldname,
         filename: f.filename,
-        size: f.size,
+        size: Number(f.size || 0),
       }));
 
     if (!files.length) {
@@ -4286,53 +4275,154 @@ app.post("/jobs/:id/upload", requirePaidJobBeforeUpload, uploadInput.any(), asyn
       });
     }
 
-    const totalPhotos = listInputImages(id).length;
-    const totalBytes = getInputTotalBytes(id);
-    const expectedPhotos = Number(job.exif_summary?._xproces?.totalPhotos || 0) || null;
-    const persistedTotalBytes = totalBytes;
+    ensureJobDirs(id);
+
+    const batchSignature = createHash("sha256")
+      .update(
+        files
+          .map((file) => `${file.filename}\u0000${file.size}`)
+          .sort()
+          .join("\u0001")
+      )
+      .digest("hex");
+
+    const batchPhotos = files.length;
+    const batchBytes = files.reduce(
+      (sum, file) => sum + Number(file.size || 0),
+      0
+    );
+
+    await db.query("begin");
+
+    // Un solo actualizador por trabajo aunque lleguen varios lotes a la vez.
+    await db.query(
+      "select pg_advisory_xact_lock(hashtext($1))",
+      [String(id)]
+    );
+
+    const { rows } = await db.query(
+      `select id, status, created_at, exif_summary,
+              photos_count, input_total_bytes
+         from jobs
+        where id = $1
+        for update`,
+      [id]
+    );
+
+    if (!rows.length) {
+      await db.query("rollback");
+      return res.status(404).json({ error: "job not found" });
+    }
+
+    const job = rows[0];
+
+    if (isLockedStatus(job.status)) {
+      await db.query("rollback");
+      return res.status(409).json({
+        ok: false,
+        error: "job_locked",
+        message: `No se pueden subir más fotos: estado ${job.status}`,
+      });
+    }
+
+    const exifSummary =
+      job.exif_summary && typeof job.exif_summary === "object"
+        ? { ...job.exif_summary }
+        : {};
+
+    const xprocesMeta =
+      exifSummary._xproces && typeof exifSummary._xproces === "object"
+        ? { ...exifSummary._xproces }
+        : {};
+
+    const previousSignatures = Array.isArray(xprocesMeta.upload_batch_signatures)
+      ? xprocesMeta.upload_batch_signatures.map(String)
+      : [];
+
+    const duplicatedBatch = previousSignatures.includes(batchSignature);
+
+    let totalPhotos = Math.max(0, Number(job.photos_count || 0));
+    let totalBytes = Math.max(0, Number(job.input_total_bytes || 0));
+
+    if (!duplicatedBatch) {
+      totalPhotos += batchPhotos;
+      totalBytes += batchBytes;
+
+      previousSignatures.push(batchSignature);
+      xprocesMeta.upload_batch_signatures = previousSignatures.slice(-5000);
+      exifSummary._xproces = xprocesMeta;
+    }
+
+    const expectedPhotos = Number(xprocesMeta.totalPhotos || 0) || null;
 
     let nextStatus = String(job.status || "").toLowerCase();
-    let nextMessage = "Recibiendo fotos";
+    let nextMessage = duplicatedBatch
+      ? "Lote ya recibido; subida continúa"
+      : "Recibiendo fotos";
 
-    const uploadWasAlreadyActive = String(job.status || "").toLowerCase() === "receiving";
+    const uploadWasAlreadyActive = nextStatus === "receiving";
 
-    if (nextStatus === "created") {
-      nextStatus = "receiving";
-    } else if (!nextStatus) {
+    if (nextStatus === "created" || !nextStatus) {
       nextStatus = "receiving";
     }
 
     if (!uploadWasAlreadyActive && nextStatus === "receiving") {
-      await recordJobStageEvent(pool, id, "uploading", "start");
+      await recordJobStageEvent(db, id, "uploading", "start");
     }
 
     if (expectedPhotos && totalPhotos >= expectedPhotos) {
-      console.log("📥 Upload completo detectado en servidor:", id, `${totalPhotos}/${expectedPhotos}`);
+      console.log(
+        "📥 Upload completo detectado por contador incremental:",
+        id,
+        `${totalPhotos}/${expectedPhotos}`
+      );
     }
 
-    await pool.query(
+    await db.query(
       `update jobs
-         set photos_count = $1,
-             input_total_bytes = $2,
-             upload_started_at = coalesce(upload_started_at, now()),
-             status = $3,
-             message = $4,
-             updated_at = now()
-       where id = $5`,
-      [totalPhotos, persistedTotalBytes, nextStatus, nextMessage, id]
+          set photos_count = $1,
+              input_total_bytes = $2,
+              exif_summary = $3::jsonb,
+              upload_started_at = coalesce(upload_started_at, now()),
+              status = $4,
+              message = $5,
+              updated_at = now()
+        where id = $6`,
+      [
+        totalPhotos,
+        totalBytes,
+        JSON.stringify(exifSummary),
+        nextStatus,
+        nextMessage,
+        id,
+      ]
     );
 
-    res.json({
+    await db.query("commit");
+
+    return res.json({
       ok: true,
-      uploaded: files.length,
+      uploaded: duplicatedBatch ? 0 : batchPhotos,
+      duplicatedBatch,
       totalPhotos,
+      totalBytes,
       expectedPhotos,
       status: nextStatus,
       files,
     });
   } catch (e) {
+    try {
+      await db.query("rollback");
+    } catch (_) {}
+
     console.error("upload error", e);
-    res.status(500).json({ ok: false, error: "upload error" });
+    return res.status(500).json({
+      ok: false,
+      error: "upload error",
+      message: e?.message || String(e),
+    });
+  } finally {
+    db.release();
   }
 });
 
