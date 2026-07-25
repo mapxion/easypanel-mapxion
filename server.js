@@ -2338,7 +2338,7 @@ app.get("/admin/config", requireAdmin, (_req, res) => {
 
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v42-stage-timing-predictor-v6-output-net", predictor_version: TIMING_PREDICTOR_VERSION })
+  res.json({ version: "v42-stage-timing-predictor-v7-monotonic-stages", predictor_version: TIMING_PREDICTOR_VERSION })
 );
 
 app.get("/redis", (_req, res) =>
@@ -2439,13 +2439,23 @@ console.log("[XPROCES QUALITY] NORMALIZED:", qualityMode);
       const baseFallback = await estimateProcessingDetailsHistorical(pool, baseFeatures);
       baseTimingPlan = await estimateStageTimingPlan(pool, baseFeatures, baseFallback);
 
-      estimatedSeconds = Math.max(
-        60,
-        Math.round(
-          Number(timingPlan.estimated_processing_seconds || 0) -
-          Number(baseTimingPlan.estimated_processing_seconds || 0)
-        )
+      const baseStageSeconds = new Map(
+        (Array.isArray(baseTimingPlan?.stages) ? baseTimingPlan.stages : [])
+          .map((item) => [normalizeProcessingStage(item.stage), Math.max(0, Number(item.seconds || 0))])
       );
+
+      const marginalStageSeconds = (Array.isArray(timingPlan?.stages) ? timingPlan.stages : [])
+        .reduce((sum, item) => {
+          const stage = normalizeProcessingStage(item.stage);
+          const fullSeconds = Math.max(0, Number(item.seconds || 0));
+          const baseSeconds = Math.max(0, Number(baseStageSeconds.get(stage) || 0));
+
+          // Una fase nueva suma todo su tiempo. Una fase compartida solo puede
+          // aportar un incremento positivo; nunca se permite que reste tiempo.
+          return sum + Math.max(0, fullSeconds - baseSeconds);
+        }, 0);
+
+      estimatedSeconds = Math.max(60, Math.round(marginalStageSeconds));
     }
 
     console.log("PRICING PREVIEW estimatedSeconds:", {
@@ -6779,18 +6789,17 @@ function stageFeatureDistance(stageInput, target, candidate, row = {}) {
   }
 
   if (["depth_maps", "model", "uv", "texture", "tiled_model", "point_cloud"].includes(stage)) {
-    distance += logRatioDistance(target.totalMegapixels, candidate.totalMegapixels) * 2.8;
-    distance += logRatioDistance(target.photosCount, candidate.photosCount) * 1.5;
-    distance += logRatioDistance(target.processingLoadScore, candidate.processingLoadScore) * 1.2;
+    distance += logRatioDistance(target.totalMegapixels, candidate.totalMegapixels) * 3.2;
+    distance += logRatioDistance(target.photosCount, candidate.photosCount) * 1.8;
+    distance += logRatioDistance(target.avgMegapixels, candidate.avgMegapixels) * 0.7;
     return distance;
   }
 
   if (["ground_classification", "dem", "dtm", "orthomosaic", "colorize_model"].includes(stage)) {
-    distance += logRatioDistance(target.totalMegapixels, candidate.totalMegapixels) * 1.8;
-    distance += logRatioDistance(target.photosCount, candidate.photosCount) * 1.0;
-    distance += logRatioDistance(target.processingLoadScore, candidate.processingLoadScore) * 1.4;
+    distance += logRatioDistance(target.totalMegapixels, candidate.totalMegapixels) * 2.2;
+    distance += logRatioDistance(target.photosCount, candidate.photosCount) * 1.3;
     if (Number(target.pointCount || 0) > 0 && Number(row.point_count || 0) > 0) {
-      distance += logRatioDistance(target.pointCount, row.point_count) * 1.8;
+      distance += logRatioDistance(target.pointCount, row.point_count) * 2.2;
     }
     return distance;
   }
@@ -6830,12 +6839,16 @@ function stageScaleFactor(stageInput, target, candidate, row = {}) {
     scale = Math.pow(ratio(target.totalMegapixels, candidate.totalMegapixels), 0.98) *
       Math.pow(getQualityModeTimeFactor(target.qualityMode) / getQualityModeTimeFactor(candidate.qualityMode), 0.85);
   } else if (["model", "uv", "texture", "tiled_model", "point_cloud"].includes(stage)) {
-    scale = Math.pow(ratio(target.processingLoadScore, candidate.processingLoadScore), 0.82);
+    scale =
+      Math.pow(ratio(target.totalMegapixels, candidate.totalMegapixels), 0.78) *
+      Math.pow(ratio(target.photosCount, candidate.photosCount), 0.18);
   } else if (["ground_classification", "dem", "dtm", "orthomosaic", "colorize_model"].includes(stage)) {
     if (Number(target.pointCount || 0) > 0 && Number(row.point_count || 0) > 0) {
       scale = Math.pow(ratio(target.pointCount, row.point_count), 0.78);
     } else {
-      scale = Math.pow(ratio(target.processingLoadScore, candidate.processingLoadScore), 0.72);
+      scale =
+        Math.pow(ratio(target.totalMegapixels, candidate.totalMegapixels), 0.64) *
+        Math.pow(ratio(target.photosCount, candidate.photosCount), 0.16);
     }
   } else if (isExportStage(stage)) {
     const targetOutputBytes = Number(target.targetOutputBytes || 0);
