@@ -533,6 +533,79 @@ async function readStageEventAggregate(db, jobId, stage) {
   };
 }
 
+function getTimingPredictionForStage(job, stageInput) {
+  const stage = normalizeProcessingStage(stageInput);
+  const prediction = job?.exif_summary?._xproces?.timing_prediction || {};
+  const stages = Array.isArray(prediction?.stages) ? prediction.stages : [];
+
+  if (stage === "zip_upload") {
+    const segment = prediction?.service_segments?.zip_upload || {};
+    const seconds = Number(
+      segment.seconds ??
+      prediction?.service_segments?.zip_upload_seconds ??
+      0
+    );
+    return {
+      stage,
+      seconds: Number.isFinite(seconds) ? Math.max(0, seconds) : null,
+      low_seconds: Number(segment.low_seconds || 0) || null,
+      high_seconds: Number(segment.high_seconds || 0) || null,
+      confidence: segment.confidence || null,
+      sample_count: Number(segment.sample_count || 0),
+      predictor_version: prediction.predictor_version || TIMING_PREDICTOR_VERSION
+    };
+  }
+
+  const found = stages.find(
+    (item) => normalizeProcessingStage(item?.stage) === stage
+  );
+
+  if (!found) return null;
+
+  return {
+    stage,
+    seconds: Number.isFinite(Number(found.seconds))
+      ? Math.max(0, Number(found.seconds))
+      : null,
+    low_seconds: Number(found.low_seconds || 0) || null,
+    high_seconds: Number(found.high_seconds || 0) || null,
+    confidence: found.confidence || null,
+    sample_count: Number(found.sample_count || 0),
+    predictor_version: prediction.predictor_version || TIMING_PREDICTOR_VERSION,
+    source: found.source || null
+  };
+}
+
+function buildStageInputSnapshot(job, stageInput, extra = {}) {
+  const stage = normalizeProcessingStage(stageInput);
+  const xproces = job?.exif_summary?._xproces || {};
+  const outputMetrics = xproces?.output_metrics || {};
+
+  return stripNullCharsDeep({
+    stage,
+    photos_count: Number(job?.photos_count || 0),
+    input_bytes: Number(job?.input_total_bytes || 0),
+    avg_photo_mb: Number(job?.avg_photo_mb || 0) || null,
+    avg_width: Number(job?.avg_width || 0) || null,
+    avg_height: Number(job?.avg_height || 0) || null,
+    avg_megapixels: Number(job?.avg_megapixels || 0) || null,
+    total_megapixels: Number(job?.total_megapixels || 0) || null,
+    point_count: Number(job?.point_count || 0) || null,
+    face_count: Number(extra.faceCount ?? xproces.face_count ?? outputMetrics.face_count ?? 0) || null,
+    texture_count: Number(extra.textureCount ?? xproces.texture_count ?? outputMetrics.texture_count ?? 0) || null,
+    pixel_count: Number(extra.pixelCount ?? xproces.pixel_count ?? outputMetrics.pixel_count ?? 0) || null,
+    processing_load_score: Number(job?.processing_load_score || 0) || null,
+    project_type: String(job?.project_type || xproces.project_type || "fotogrametria").toLowerCase(),
+    quality: normalizeQualityMode(job?.quality || xproces.quality_mode || "normal"),
+    outputs: normalizeOutputList(job?.outputs || xproces.outputs_requested || []),
+    profile_version: extra.profileVersion || xproces.profile_version || null,
+    worker_version: extra.workerVersion || xproces.worker_version || null,
+    retry_count: Number(extra.retryCount ?? 0) || 0,
+    output_bytes: Number(extra.outputBytes || 0) || null,
+    item_count: Number(extra.itemCount || 0) || null
+  });
+}
+
 async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
   const normalizedStage = normalizeProcessingStage(stage);
   if (!normalizedStage) return null;
@@ -587,13 +660,63 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
     ? Math.max(0, Math.round(Number(extra.itemCount)))
     : Math.max(0, Number(job.photos_count || 0));
 
+  const prediction = getTimingPredictionForStage(job, normalizedStage);
+  const estimatedSeconds = Number.isFinite(Number(extra.estimatedSeconds))
+    ? Math.max(0, Number(extra.estimatedSeconds))
+    : (Number.isFinite(Number(prediction?.seconds)) ? Math.max(0, Number(prediction.seconds)) : null);
+  const actualSeconds = durationMs > 0 ? durationMs / 1000 : null;
+  const errorSeconds =
+    estimatedSeconds !== null && actualSeconds !== null
+      ? actualSeconds - estimatedSeconds
+      : null;
+  const errorRatio =
+    estimatedSeconds !== null && estimatedSeconds > 0 && actualSeconds !== null
+      ? actualSeconds / estimatedSeconds
+      : null;
+
+  const faceCount = Number.isFinite(Number(extra.faceCount))
+    ? Math.max(0, Math.round(Number(extra.faceCount)))
+    : Math.max(0, Number(xproces.face_count || xproces?.output_metrics?.face_count || 0)) || null;
+  const textureCount = Number.isFinite(Number(extra.textureCount))
+    ? Math.max(0, Math.round(Number(extra.textureCount)))
+    : Math.max(0, Number(xproces.texture_count || xproces?.output_metrics?.texture_count || 0)) || null;
+  const pixelCount = Number.isFinite(Number(extra.pixelCount))
+    ? Math.max(0, Math.round(Number(extra.pixelCount)))
+    : Math.max(0, Number(xproces.pixel_count || xproces?.output_metrics?.pixel_count || 0)) || null;
+  const retryCount = Number.isFinite(Number(extra.retryCount))
+    ? Math.max(0, Math.round(Number(extra.retryCount)))
+    : 0;
+
+  const hardwareProfile = stripNullCharsDeep(
+    extra.hardwareProfile ||
+    xproces.hardware_profile ||
+    xproces.hardware ||
+    {}
+  );
+  const stageInputs = buildStageInputSnapshot(job, normalizedStage, {
+    ...extra,
+    faceCount,
+    textureCount,
+    pixelCount,
+    retryCount
+  });
+  const predictionSnapshot = stripNullCharsDeep({
+    ...(prediction || {}),
+    captured_at: new Date().toISOString(),
+    timing_prediction_version:
+      job?.exif_summary?._xproces?.timing_prediction?.predictor_version ||
+      TIMING_PREDICTOR_VERSION
+  });
+
   const result = await db.query(
     `insert into job_stage_metrics (
        job_id, stage, started_at, finished_at, duration_ms,
        photos_count, input_bytes, output_bytes, item_count,
        avg_photo_mb, avg_width, avg_height, avg_megapixels,
-       total_megapixels, point_count, processing_load_score,
-       project_type, quality, outputs,
+       total_megapixels, point_count, face_count, texture_count, pixel_count,
+       processing_load_score, project_type, quality, outputs,
+       estimated_seconds, error_seconds, error_ratio, retry_count,
+       hardware_profile, stage_inputs, prediction_snapshot,
        profile_version, worker_version, predictor_version, metrics_version,
        start_events, end_events, valid_for_training, invalid_reason, metrics,
        created_at, updated_at
@@ -601,10 +724,12 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
        $1,$2,$3,$4,$5,
        $6,$7,$8,$9,
        $10,$11,$12,$13,
-       $14,$15,$16,
-       $17,$18,$19::jsonb,
-       $20,$21,$22,$23,
-       $24,$25,false,$26,$27::jsonb,
+       $14,$15,$16,$17,$18,
+       $19,$20,$21,$22::jsonb,
+       $23,$24,$25,$26,
+       $27::jsonb,$28::jsonb,$29::jsonb,
+       $30,$31,$32,$33,
+       $34,$35,false,$36,$37::jsonb,
        now(),now()
      )
      on conflict (job_id, stage) do update set
@@ -621,10 +746,20 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
        avg_megapixels = excluded.avg_megapixels,
        total_megapixels = excluded.total_megapixels,
        point_count = coalesce(excluded.point_count, job_stage_metrics.point_count),
+       face_count = coalesce(excluded.face_count, job_stage_metrics.face_count),
+       texture_count = coalesce(excluded.texture_count, job_stage_metrics.texture_count),
+       pixel_count = coalesce(excluded.pixel_count, job_stage_metrics.pixel_count),
        processing_load_score = excluded.processing_load_score,
        project_type = excluded.project_type,
        quality = excluded.quality,
        outputs = excluded.outputs,
+       estimated_seconds = coalesce(excluded.estimated_seconds, job_stage_metrics.estimated_seconds),
+       error_seconds = coalesce(excluded.error_seconds, job_stage_metrics.error_seconds),
+       error_ratio = coalesce(excluded.error_ratio, job_stage_metrics.error_ratio),
+       retry_count = greatest(job_stage_metrics.retry_count, excluded.retry_count),
+       hardware_profile = coalesce(job_stage_metrics.hardware_profile, '{}'::jsonb) || excluded.hardware_profile,
+       stage_inputs = coalesce(job_stage_metrics.stage_inputs, '{}'::jsonb) || excluded.stage_inputs,
+       prediction_snapshot = coalesce(job_stage_metrics.prediction_snapshot, '{}'::jsonb) || excluded.prediction_snapshot,
        profile_version = coalesce(excluded.profile_version, job_stage_metrics.profile_version),
        worker_version = coalesce(excluded.worker_version, job_stage_metrics.worker_version),
        predictor_version = excluded.predictor_version,
@@ -652,10 +787,20 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
       job.avg_megapixels,
       job.total_megapixels,
       job.point_count,
+      faceCount,
+      textureCount,
+      pixelCount,
       job.processing_load_score,
       String(job.project_type || xproces.project_type || "fotogrametria").toLowerCase(),
       normalizeQualityMode(job.quality || xproces.quality_mode || "normal"),
       JSON.stringify(normalizeOutputList(job.outputs || xproces.outputs_requested || [])),
+      estimatedSeconds,
+      errorSeconds,
+      errorRatio,
+      retryCount,
+      JSON.stringify(hardwareProfile),
+      JSON.stringify(stageInputs),
+      JSON.stringify(predictionSnapshot),
       extra.profileVersion || xproces.profile_version || null,
       extra.workerVersion || xproces.worker_version || null,
       TIMING_PREDICTOR_VERSION,
@@ -750,6 +895,18 @@ async function finalizeJobStageMetrics(db, jobId) {
       `update job_stage_metrics
           set valid_for_training = $2,
               invalid_reason = $3,
+              error_seconds = case
+                when estimated_seconds is not null and duration_ms is not null
+                then (duration_ms / 1000.0) - estimated_seconds
+                else error_seconds
+              end,
+              error_ratio = case
+                when estimated_seconds is not null
+                 and estimated_seconds > 0
+                 and duration_ms is not null
+                then (duration_ms / 1000.0) / estimated_seconds
+                else error_ratio
+              end,
               updated_at = now()
         where id = $1`,
       [metric.id, !reason, reason]
@@ -1174,10 +1331,21 @@ async function ensureTimingAnalyticsSchema() {
       avg_megapixels numeric,
       total_megapixels numeric,
       point_count bigint,
+      face_count bigint,
+      texture_count integer,
+      pixel_count bigint,
       processing_load_score numeric,
       project_type text,
       quality text,
       outputs jsonb not null default '[]'::jsonb,
+
+      estimated_seconds numeric,
+      error_seconds numeric,
+      error_ratio numeric,
+      retry_count integer not null default 0,
+      hardware_profile jsonb not null default '{}'::jsonb,
+      stage_inputs jsonb not null default '{}'::jsonb,
+      prediction_snapshot jsonb not null default '{}'::jsonb,
 
       profile_version text,
       worker_version text,
@@ -1213,10 +1381,20 @@ async function ensureTimingAnalyticsSchema() {
       add column if not exists avg_megapixels numeric,
       add column if not exists total_megapixels numeric,
       add column if not exists point_count bigint,
+      add column if not exists face_count bigint,
+      add column if not exists texture_count integer,
+      add column if not exists pixel_count bigint,
       add column if not exists processing_load_score numeric,
       add column if not exists project_type text,
       add column if not exists quality text,
       add column if not exists outputs jsonb not null default '[]'::jsonb,
+      add column if not exists estimated_seconds numeric,
+      add column if not exists error_seconds numeric,
+      add column if not exists error_ratio numeric,
+      add column if not exists retry_count integer not null default 0,
+      add column if not exists hardware_profile jsonb not null default '{}'::jsonb,
+      add column if not exists stage_inputs jsonb not null default '{}'::jsonb,
+      add column if not exists prediction_snapshot jsonb not null default '{}'::jsonb,
       add column if not exists profile_version text,
       add column if not exists worker_version text,
       add column if not exists predictor_version text,
@@ -1245,6 +1423,11 @@ async function ensureTimingAnalyticsSchema() {
       on job_stage_metrics (job_id, stage)
   `);
 
+  await pool.query(`
+    create index if not exists idx_job_stage_metrics_error_analysis
+      on job_stage_metrics (stage, quality, valid_for_training, error_ratio, created_at desc)
+  `);
+
   // Vista directa para revisar, exportar o analizar los historicos por fase.
   await pool.query(`
     create or replace view job_stage_training_data as
@@ -1269,7 +1452,17 @@ async function ensureTimingAnalyticsSchema() {
       m.avg_megapixels,
       m.total_megapixels,
       m.point_count,
+      m.face_count,
+      m.texture_count,
+      m.pixel_count,
       m.processing_load_score,
+      m.estimated_seconds,
+      m.error_seconds,
+      m.error_ratio,
+      m.retry_count,
+      m.hardware_profile,
+      m.stage_inputs,
+      m.prediction_snapshot,
       m.profile_version,
       m.worker_version,
       m.predictor_version,
@@ -2337,8 +2530,44 @@ app.get("/admin/config", requireAdmin, (_req, res) => {
 });
 
 
+app.get("/admin/timing-learning-summary", requireAdmin, async (_req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      select
+        stage,
+        count(*)::int as samples,
+        count(*) filter (where valid_for_training)::int as valid_samples,
+        round(avg(duration_ms / 1000.0) filter (where valid_for_training), 2) as avg_actual_seconds,
+        round(avg(estimated_seconds) filter (where valid_for_training and estimated_seconds is not null), 2) as avg_estimated_seconds,
+        round(avg(error_seconds) filter (where valid_for_training and error_seconds is not null), 2) as avg_error_seconds,
+        round(avg(error_ratio) filter (where valid_for_training and error_ratio is not null), 3) as avg_error_ratio,
+        round(percentile_cont(0.5) within group (order by error_ratio)
+          filter (where valid_for_training and error_ratio is not null)::numeric, 3) as median_error_ratio,
+        round(percentile_cont(0.9) within group (order by error_ratio)
+          filter (where valid_for_training and error_ratio is not null)::numeric, 3) as p90_error_ratio
+      from job_stage_metrics
+      group by stage
+      order by stage
+    `);
+
+    res.json({
+      ok: true,
+      predictor_version: TIMING_PREDICTOR_VERSION,
+      metrics_version: TIMING_METRICS_VERSION,
+      stages: rows
+    });
+  } catch (e) {
+    console.error("timing learning summary error", e);
+    res.status(500).json({
+      ok: false,
+      error: "timing_learning_summary_error",
+      message: e?.message || String(e)
+    });
+  }
+});
+
 app.get("/version", (_req, res) =>
-  res.json({ version: "v42-stage-timing-predictor-v8-real-billable-time", predictor_version: TIMING_PREDICTOR_VERSION })
+  res.json({ version: "v42-stage-timing-predictor-v9-rich-stage-learning", predictor_version: TIMING_PREDICTOR_VERSION })
 );
 
 app.get("/redis", (_req, res) =>
