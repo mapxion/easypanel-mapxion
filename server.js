@@ -28,7 +28,7 @@ const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 // Versiones estables del sistema de tiempos. Se guardan junto a cada muestra
 // para no mezclar historicos incompatibles si cambian perfiles o predictor.
 const TIMING_PREDICTOR_VERSION = "stage-v5-2026-07-19";
-const TIMING_METRICS_VERSION = "metrics-v2-2026-07-19";
+const TIMING_METRICS_VERSION = "metrics-v3-phase-validation-history-2026-07-26";
 const SHORT_STAGE_MIN_DURATION_MS = 500;
 const SHORT_STAGE_EXCLUDED_FROM_TRAINING = new Set([
   "export_dem", "export_dtm", "colorize_model",
@@ -606,6 +606,61 @@ function buildStageInputSnapshot(job, stageInput, extra = {}) {
   });
 }
 
+
+function evaluateCompletedStageMetric(job, metric) {
+  const stage = normalizeProcessingStage(metric?.stage);
+  const durationMs = Number(metric?.durationMs ?? metric?.duration_ms ?? 0);
+  const startEvents = Number(metric?.startEvents ?? metric?.start_events ?? 0);
+  const endEvents = Number(metric?.endEvents ?? metric?.end_events ?? 0);
+  const unmatchedStarts = Number(metric?.unmatchedStarts ?? metric?.unmatched_starts ?? 0);
+  const unmatchedEnds = Number(metric?.unmatchedEnds ?? metric?.unmatched_ends ?? 0);
+  const xproces = job?.exif_summary?._xproces || {};
+  const qualityMode = normalizeQualityMode(job?.quality || xproces.quality_mode || "normal");
+  const photosCount = Number(job?.photos_count || 0);
+
+  const controlStages = new Set([
+    "final", "running", "done", "failed", "cancelled",
+    "processing_complete", "created", "receiving", "queued"
+  ]);
+  const trainableStages = new Set([
+    "uploading", "predownloading", "downloading", "zip_upload",
+    ...TIMING_STAGE_ORDER
+  ]);
+
+  let reason = null;
+
+  if (!stage) reason = "missing_stage";
+  else if (controlStages.has(stage)) reason = "control_stage";
+  else if (!trainableStages.has(stage)) reason = "unknown_stage";
+  else if (
+    startEvents < 1 ||
+    endEvents < 1 ||
+    startEvents !== endEvents ||
+    unmatchedStarts > 0 ||
+    unmatchedEnds > 0
+  ) reason = "unpaired_or_incomplete_events";
+  else if (!(durationMs >= 100 && durationMs <= 7 * 24 * 3600 * 1000)) {
+    reason = "duration_out_of_range";
+  } else if (!qualityMode) {
+    reason = "missing_quality";
+  } else if (photosCount <= 0 && !["zip_upload"].includes(stage)) {
+    reason = "missing_photo_count";
+  } else if (
+    SHORT_STAGE_EXCLUDED_FROM_TRAINING.has(stage) &&
+    durationMs < SHORT_STAGE_MIN_DURATION_MS
+  ) {
+    reason = "duration_too_short";
+  }
+
+  // Una versión antigua no invalida una duración real bien medida.
+  // Se conserva la versión disponible en la muestra para que el predictor
+  // pueda ponderar y comparar trabajos compatibles.
+  return {
+    valid: !reason,
+    reason
+  };
+}
+
 async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
   const normalizedStage = normalizeProcessingStage(stage);
   if (!normalizedStage) return null;
@@ -708,6 +763,16 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
       TIMING_PREDICTOR_VERSION
   });
 
+  const phaseValidation = evaluateCompletedStageMetric(job, {
+    stage: normalizedStage,
+    durationMs,
+    startEvents,
+    endEvents,
+    unmatchedStarts: Number(aggregate.unmatched_starts || 0),
+    unmatchedEnds: Number(aggregate.unmatched_ends || 0)
+  });
+  invalidReason = phaseValidation.reason;
+
   const result = await db.query(
     `insert into job_stage_metrics (
        job_id, stage, started_at, finished_at, duration_ms,
@@ -729,7 +794,7 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
        $23,$24,$25,$26,
        $27::jsonb,$28::jsonb,$29::jsonb,
        $30,$31,$32,$33,
-       $34,$35,false,$36,$37::jsonb,
+       $34,$35,$36,$37,$38::jsonb,
        now(),now()
      )
      on conflict (job_id, stage) do update set
@@ -766,7 +831,7 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
        metrics_version = excluded.metrics_version,
        start_events = excluded.start_events,
        end_events = excluded.end_events,
-       valid_for_training = false,
+       valid_for_training = excluded.valid_for_training,
        invalid_reason = excluded.invalid_reason,
        metrics = coalesce(job_stage_metrics.metrics, '{}'::jsonb) || excluded.metrics,
        updated_at = now()
@@ -807,6 +872,7 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
       TIMING_METRICS_VERSION,
       startEvents,
       endEvents,
+      phaseValidation.valid,
       invalidReason,
       JSON.stringify(metrics)
     ]
@@ -830,66 +896,42 @@ async function refreshCompletedStageMetrics(db, jobId) {
 }
 
 async function finalizeJobStageMetrics(db, jobId) {
+  // Reconstruye todas las fases cerradas y valida cada una por sus propios
+  // eventos y duración. El resultado global del trabajo no invalida fases
+  // anteriores que terminaron correctamente.
   await refreshCompletedStageMetrics(db, jobId);
 
   const { rows: jobRows } = await db.query(
-    `select id, status, error, photos_count, quality, project_type, outputs,
-            avg_width, avg_height, avg_megapixels, total_megapixels,
-            processing_load_score, exif_summary
-       from jobs where id = $1`,
+    `select id, status, error, photos_count, input_total_bytes,
+            avg_photo_mb, avg_width, avg_height, avg_megapixels,
+            total_megapixels, point_count, processing_load_score,
+            project_type, quality, outputs, exif_summary
+       from jobs
+      where id = $1`,
     [jobId]
   );
   if (!jobRows.length) return;
 
   const job = jobRows[0];
-  const done = String(job.status || "").toLowerCase() === "done";
-  const features = buildJobFeatures(job);
-  // Si Metashape ejecutó una fase real y quedó bien medida, esa muestra es
-  // útil aunque la fase sea una dependencia interna y no una salida elegida
-  // expresamente por el cliente. Los outputs quedan guardados en la propia
-  // muestra y el predictor ya los usa para comparar trabajos compatibles.
-  const trainableStages = new Set([
-    "uploading", "predownloading", "downloading", "zip_upload",
-    ...TIMING_STAGE_ORDER
-  ]);
-
   const { rows: metricsRows } = await db.query(
-    `select id, stage, duration_ms, start_events, end_events, invalid_reason,
-            profile_version, worker_version
+    `select id, stage, duration_ms, start_events, end_events, metrics
        from job_stage_metrics
       where job_id = $1`,
     [jobId]
   );
 
   for (const metric of metricsRows) {
-    const stage = normalizeProcessingStage(metric.stage);
-    let reason = metric.invalid_reason || null;
-    const durationMs = Number(metric.duration_ms || 0);
-
-    if (!done) reason = String(job.status || "job_not_done").toLowerCase();
-    else if (job.error) reason = "job_has_error";
-    else if (
-      Number(metric.start_events || 0) < 1 ||
-      Number(metric.end_events || 0) < 1 ||
-      Number(metric.start_events || 0) !== Number(metric.end_events || 0)
-    ) reason = "unpaired_or_incomplete_events";
-    else if (!(durationMs >= 100 && durationMs <= 7 * 24 * 3600 * 1000)) reason = "duration_out_of_range";
-    else if (!features.qualityMode) reason = "missing_quality";
-    else if (features.photosCount <= 0 && !["zip_upload"].includes(stage)) reason = "missing_photo_count";
-    else if (!trainableStages.has(stage) && !["final", "running"].includes(stage)) reason = "unknown_stage";
-    else if (!isTransferStage(stage) && !metric.profile_version) reason = "missing_profile_version";
-    else if (stage !== "uploading" && !metric.worker_version) reason = "missing_worker_version";
-    else if (
-      SHORT_STAGE_EXCLUDED_FROM_TRAINING.has(stage) &&
-      durationMs > 0 &&
-      durationMs < SHORT_STAGE_MIN_DURATION_MS
-    ) reason = "duration_too_short";
-    else reason = null;
-
-    // final/running son estados de control, no muestras de calculo.
-    if (["final", "running", "done", "failed", "cancelled", "processing_complete"].includes(stage)) {
-      reason = "control_stage";
-    }
+    const detail = metric.metrics && typeof metric.metrics === "object"
+      ? metric.metrics
+      : {};
+    const validation = evaluateCompletedStageMetric(job, {
+      stage: metric.stage,
+      durationMs: metric.duration_ms,
+      startEvents: metric.start_events,
+      endEvents: metric.end_events,
+      unmatchedStarts: detail.unmatched_starts || 0,
+      unmatchedEnds: detail.unmatched_ends || 0
+    });
 
     await db.query(
       `update job_stage_metrics
@@ -909,29 +951,111 @@ async function finalizeJobStageMetrics(db, jobId) {
               end,
               updated_at = now()
         where id = $1`,
-      [metric.id, !reason, reason]
+      [metric.id, validation.valid, validation.reason]
     );
   }
 }
 
-function categorizeOutputFile(file) {
-  const name = String(file?.relative_path || file?.name || file?.filename || "").replace(/\\/g, "/").toLowerCase();
-  if (!name) return "other";
-  if (/resultado\.zip$|outputs\.zip$/.test(name)) return "zip";
-  if (/\.(las|laz|ply)$/.test(name) || /nube|point.?cloud/.test(name)) return "point_cloud";
-  if (/mdt|dtm/.test(name)) return "dtm";
-  if (/mde|dem|dsm/.test(name)) return "dem";
-  if (/orto|orthomosaic/.test(name)) return "orthomosaic";
-  if (/informe|report/.test(name) && /\.pdf$/.test(name)) return "report";
-  if (/\.3tz$|tesela|tiled/.test(name)) return "tiled_model";
-  // La extensión manda: model_textured.obj es modelo y
-  // model_texture.jpg es una textura.
-  if (/\.(obj|fbx|glb|gltf|3ds|dae)$/.test(name)) return "model";
-  if (/\.mtl$|\.(jpg|jpeg|png|webp)$/.test(name)) return "texture";
-  if (/modelo|model/.test(name)) return "model";
-  if (/textur|texture/.test(name)) return "texture";
-  if (/curva|contour|\.dxf$/.test(name)) return "contours";
-  return "other";
+
+let historicalTimingBackfillRunning = false;
+
+async function backfillHistoricalStageMetrics(db, options = {}) {
+  if (historicalTimingBackfillRunning) {
+    return { ok: true, skipped: true, reason: "already_running" };
+  }
+
+  historicalTimingBackfillRunning = true;
+  const batchSize = Math.max(25, Math.min(1000, Number(options.batchSize || 250)));
+  const maxPairs = Math.max(batchSize, Math.min(50000, Number(options.maxPairs || 20000)));
+  let processed = 0;
+  let updated = 0;
+  let failed = 0;
+  let lastJobId = null;
+  let lastStage = null;
+
+  try {
+    // Evita que dos réplicas de la API ejecuten el mismo backfill a la vez.
+    const lock = await db.query(
+      `select pg_try_advisory_lock(hashtext('xproces_timing_history_backfill')) as locked`
+    );
+    if (!lock.rows?.[0]?.locked) {
+      return { ok: true, skipped: true, reason: "lock_not_acquired" };
+    }
+
+    try {
+      while (processed < maxPairs) {
+        const { rows } = await db.query(
+          `select distinct e.job_id, e.stage
+             from job_stage_events e
+            where e.event_type in ('start','end')
+              and (
+                $1::uuid is null
+                or e.job_id > $1::uuid
+                or (e.job_id = $1::uuid and e.stage > $2::text)
+              )
+            order by e.job_id, e.stage
+            limit $3`,
+          [lastJobId, lastStage, Math.min(batchSize, maxPairs - processed)]
+        );
+
+        if (!rows.length) break;
+
+        for (const row of rows) {
+          processed += 1;
+          lastJobId = row.job_id;
+          lastStage = row.stage;
+          try {
+            const metric = await upsertJobStageMetric(db, row.job_id, row.stage, {
+              metrics: {
+                historical_backfill: true,
+                historical_backfill_at: new Date().toISOString()
+              }
+            });
+            if (metric) updated += 1;
+          } catch (error) {
+            failed += 1;
+            console.error(
+              "historical timing backfill item error",
+              row.job_id,
+              row.stage,
+              error?.message || error
+            );
+          }
+        }
+
+        // Cede el control al event loop para no perjudicar trabajos activos.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      return {
+        ok: true,
+        processed,
+        updated,
+        failed,
+        limit_reached: processed >= maxPairs
+      };
+    } finally {
+      await db.query(
+        `select pg_advisory_unlock(hashtext('xproces_timing_history_backfill'))`
+      ).catch(() => null);
+    }
+  } finally {
+    historicalTimingBackfillRunning = false;
+  }
+}
+
+async function scheduleHistoricalTimingBackfill() {
+  setTimeout(async () => {
+    try {
+      const result = await backfillHistoricalStageMetrics(pool, {
+        batchSize: 250,
+        maxPairs: 20000
+      });
+      console.log("Historical timing backfill:", result);
+    } catch (error) {
+      console.error("Historical timing backfill error", error?.message || error);
+    }
+  }, 5000);
 }
 
 async function applyTimingManifest(db, jobId, manifestInput) {
@@ -1139,6 +1263,7 @@ pool
     await ensureTelegramSchema();
     await ensureTimingAnalyticsSchema();
     await refreshSchemaFlags();
+    scheduleHistoricalTimingBackfill();
   })
   .catch((err) => console.error("Error Postgres", err));
 
@@ -2537,6 +2662,27 @@ app.get("/admin/config", requireAdmin, (_req, res) => {
 });
 
 
+app.post("/admin/timing-learning-backfill", requireAdmin, async (req, res) => {
+  try {
+    const result = await backfillHistoricalStageMetrics(pool, {
+      batchSize: Number(req.body?.batch_size || 250),
+      maxPairs: Number(req.body?.max_pairs || 20000)
+    });
+    res.json({
+      ...result,
+      predictor_version: TIMING_PREDICTOR_VERSION,
+      metrics_version: TIMING_METRICS_VERSION
+    });
+  } catch (error) {
+    console.error("timing historical backfill endpoint error", error);
+    res.status(500).json({
+      ok: false,
+      error: "timing_historical_backfill_error",
+      message: error?.message || String(error)
+    });
+  }
+});
+
 app.get("/admin/timing-learning-summary", requireAdmin, async (_req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -2574,7 +2720,7 @@ app.get("/admin/timing-learning-summary", requireAdmin, async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v42-stage-timing-predictor-v9-rich-stage-learning", predictor_version: TIMING_PREDICTOR_VERSION })
+  res.json({ version: "v42-stage-timing-predictor-v10-phase-validation-history", predictor_version: TIMING_PREDICTOR_VERSION })
 );
 
 app.get("/redis", (_req, res) =>
