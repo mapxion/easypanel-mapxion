@@ -28,7 +28,7 @@ const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 // Versiones estables del sistema de tiempos. Se guardan junto a cada muestra
 // para no mezclar historicos incompatibles si cambian perfiles o predictor.
 const TIMING_PREDICTOR_VERSION = "stage-v5-2026-07-19";
-const TIMING_METRICS_VERSION = "metrics-v3-phase-validation-history-2026-07-26";
+const TIMING_METRICS_VERSION = "metrics-v4-protected-original-prediction-2026-07-26";
 const SHORT_STAGE_MIN_DURATION_MS = 500;
 const SHORT_STAGE_EXCLUDED_FROM_TRAINING = new Set([
   "export_dem", "export_dtm", "colorize_model",
@@ -715,11 +715,38 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
     ? Math.max(0, Math.round(Number(extra.itemCount)))
     : Math.max(0, Number(job.photos_count || 0));
 
-  const prediction = getTimingPredictionForStage(job, normalizedStage);
-  const estimatedSeconds = Number.isFinite(Number(extra.estimatedSeconds))
-    ? Math.max(0, Number(extra.estimatedSeconds))
-    : (Number.isFinite(Number(prediction?.seconds)) ? Math.max(0, Number(prediction.seconds)) : null);
+  const isHistoricalBackfill =
+    extra.historicalBackfill === true ||
+    extra.metrics?.historical_backfill === true;
+
+  const prediction = isHistoricalBackfill
+    ? null
+    : getTimingPredictionForStage(job, normalizedStage);
+
+  // estimated_seconds representa exclusivamente la predicción disponible
+  // antes de ejecutar la fase. El backfill nunca fabrica ni sustituye este dato.
+  const estimatedSeconds = isHistoricalBackfill
+    ? null
+    : (
+        Number.isFinite(Number(extra.estimatedSeconds))
+          ? Math.max(0, Number(extra.estimatedSeconds))
+          : (
+              Number.isFinite(Number(prediction?.seconds))
+                ? Math.max(0, Number(prediction.seconds))
+                : null
+            )
+      );
+
   const actualSeconds = durationMs > 0 ? durationMs / 1000 : null;
+  const historicalObservedSeconds =
+    isHistoricalBackfill && actualSeconds !== null
+      ? actualSeconds
+      : null;
+  const predictionOrigin =
+    estimatedSeconds !== null
+      ? "before_stage_start"
+      : (isHistoricalBackfill ? "historical_observation_only" : null);
+
   const errorSeconds =
     estimatedSeconds !== null && actualSeconds !== null
       ? actualSeconds - estimatedSeconds
@@ -755,13 +782,15 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
     pixelCount,
     retryCount
   });
-  const predictionSnapshot = stripNullCharsDeep({
-    ...(prediction || {}),
-    captured_at: new Date().toISOString(),
-    timing_prediction_version:
-      job?.exif_summary?._xproces?.timing_prediction?.predictor_version ||
-      TIMING_PREDICTOR_VERSION
-  });
+  const predictionSnapshot = isHistoricalBackfill
+    ? {}
+    : stripNullCharsDeep({
+        ...(prediction || {}),
+        captured_at: new Date().toISOString(),
+        timing_prediction_version:
+          job?.exif_summary?._xproces?.timing_prediction?.predictor_version ||
+          TIMING_PREDICTOR_VERSION
+      });
 
   const phaseValidation = evaluateCompletedStageMetric(job, {
     stage: normalizedStage,
@@ -782,6 +811,7 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
        processing_load_score, project_type, quality, outputs,
        estimated_seconds, error_seconds, error_ratio, retry_count,
        hardware_profile, stage_inputs, prediction_snapshot,
+       historical_observed_seconds, prediction_origin,
        profile_version, worker_version, predictor_version, metrics_version,
        start_events, end_events, valid_for_training, invalid_reason, metrics,
        created_at, updated_at
@@ -793,8 +823,9 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
        $19,$20,$21,$22::jsonb,
        $23,$24,$25,$26,
        $27::jsonb,$28::jsonb,$29::jsonb,
-       $30,$31,$32,$33,
-       $34,$35,$36,$37,$38::jsonb,
+       $30,$31,
+       $32,$33,$34,$35,
+       $36,$37,$38,$39,$40::jsonb,
        now(),now()
      )
      on conflict (job_id, stage) do update set
@@ -818,13 +849,37 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
        project_type = excluded.project_type,
        quality = excluded.quality,
        outputs = excluded.outputs,
-       estimated_seconds = coalesce(excluded.estimated_seconds, job_stage_metrics.estimated_seconds),
-       error_seconds = coalesce(excluded.error_seconds, job_stage_metrics.error_seconds),
-       error_ratio = coalesce(excluded.error_ratio, job_stage_metrics.error_ratio),
+       estimated_seconds = coalesce(job_stage_metrics.estimated_seconds, excluded.estimated_seconds),
+       error_seconds = case
+         when coalesce(job_stage_metrics.estimated_seconds, excluded.estimated_seconds) is not null
+          and excluded.duration_ms is not null
+         then (excluded.duration_ms / 1000.0)
+              - coalesce(job_stage_metrics.estimated_seconds, excluded.estimated_seconds)
+         else job_stage_metrics.error_seconds
+       end,
+       error_ratio = case
+         when coalesce(job_stage_metrics.estimated_seconds, excluded.estimated_seconds) > 0
+          and excluded.duration_ms is not null
+         then (excluded.duration_ms / 1000.0)
+              / coalesce(job_stage_metrics.estimated_seconds, excluded.estimated_seconds)
+         else job_stage_metrics.error_ratio
+       end,
        retry_count = greatest(job_stage_metrics.retry_count, excluded.retry_count),
        hardware_profile = coalesce(job_stage_metrics.hardware_profile, '{}'::jsonb) || excluded.hardware_profile,
        stage_inputs = coalesce(job_stage_metrics.stage_inputs, '{}'::jsonb) || excluded.stage_inputs,
-       prediction_snapshot = coalesce(job_stage_metrics.prediction_snapshot, '{}'::jsonb) || excluded.prediction_snapshot,
+       prediction_snapshot = case
+         when coalesce(job_stage_metrics.prediction_snapshot, '{}'::jsonb) <> '{}'::jsonb
+         then job_stage_metrics.prediction_snapshot
+         else excluded.prediction_snapshot
+       end,
+       historical_observed_seconds = coalesce(
+         excluded.historical_observed_seconds,
+         job_stage_metrics.historical_observed_seconds
+       ),
+       prediction_origin = coalesce(
+         job_stage_metrics.prediction_origin,
+         excluded.prediction_origin
+       ),
        profile_version = coalesce(excluded.profile_version, job_stage_metrics.profile_version),
        worker_version = coalesce(excluded.worker_version, job_stage_metrics.worker_version),
        predictor_version = excluded.predictor_version,
@@ -866,6 +921,8 @@ async function upsertJobStageMetric(db, jobId, stage, extra = {}) {
       JSON.stringify(hardwareProfile),
       JSON.stringify(stageInputs),
       JSON.stringify(predictionSnapshot),
+      historicalObservedSeconds,
+      predictionOrigin,
       extra.profileVersion || xproces.profile_version || null,
       extra.workerVersion || xproces.worker_version || null,
       TIMING_PREDICTOR_VERSION,
@@ -1006,6 +1063,7 @@ async function backfillHistoricalStageMetrics(db, options = {}) {
           lastStage = row.stage;
           try {
             const metric = await upsertJobStageMetric(db, row.job_id, row.stage, {
+              historicalBackfill: true,
               metrics: {
                 historical_backfill: true,
                 historical_backfill_at: new Date().toISOString()
@@ -1471,6 +1529,8 @@ async function ensureTimingAnalyticsSchema() {
       hardware_profile jsonb not null default '{}'::jsonb,
       stage_inputs jsonb not null default '{}'::jsonb,
       prediction_snapshot jsonb not null default '{}'::jsonb,
+      historical_observed_seconds numeric,
+      prediction_origin text,
 
       profile_version text,
       worker_version text,
@@ -1520,6 +1580,8 @@ async function ensureTimingAnalyticsSchema() {
       add column if not exists hardware_profile jsonb not null default '{}'::jsonb,
       add column if not exists stage_inputs jsonb not null default '{}'::jsonb,
       add column if not exists prediction_snapshot jsonb not null default '{}'::jsonb,
+      add column if not exists historical_observed_seconds numeric,
+      add column if not exists prediction_origin text,
       add column if not exists profile_version text,
       add column if not exists worker_version text,
       add column if not exists predictor_version text,
@@ -1595,6 +1657,8 @@ async function ensureTimingAnalyticsSchema() {
       m.hardware_profile,
       m.stage_inputs,
       m.prediction_snapshot,
+      m.historical_observed_seconds,
+      m.prediction_origin,
       m.profile_version,
       m.worker_version,
       m.predictor_version,
@@ -2720,7 +2784,7 @@ app.get("/admin/timing-learning-summary", requireAdmin, async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v42-stage-timing-predictor-v10-phase-validation-history", predictor_version: TIMING_PREDICTOR_VERSION })
+  res.json({ version: "v42-stage-timing-predictor-v11-protected-original-prediction", predictor_version: TIMING_PREDICTOR_VERSION })
 );
 
 app.get("/redis", (_req, res) =>
