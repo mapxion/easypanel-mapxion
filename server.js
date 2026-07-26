@@ -1428,9 +1428,16 @@ async function ensureTimingAnalyticsSchema() {
       on job_stage_metrics (stage, quality, valid_for_training, error_ratio, created_at desc)
   `);
 
+  // PostgreSQL no permite que CREATE OR REPLACE VIEW inserte columnas en
+  // medio de una vista existente. Eliminamos y recreamos esta vista de
+  // diagnóstico; no contiene datos propios y las métricas permanecen intactas.
+  await pool.query(`
+    drop view if exists job_stage_training_data
+  `);
+
   // Vista directa para revisar, exportar o analizar los historicos por fase.
   await pool.query(`
-    create or replace view job_stage_training_data as
+    create view job_stage_training_data as
     select
       m.job_id,
       j.created_at as job_created_at,
