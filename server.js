@@ -27,7 +27,7 @@ const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 
 // Versiones estables del sistema de tiempos. Se guardan junto a cada muestra
 // para no mezclar historicos incompatibles si cambian perfiles o predictor.
-const TIMING_PREDICTOR_VERSION = "stage-v5-2026-07-19";
+const TIMING_PREDICTOR_VERSION = "stage-v6-local-phase-learning-2026-07-31";
 const TIMING_METRICS_VERSION = "metrics-v4-protected-original-prediction-2026-07-26";
 const SHORT_STAGE_MIN_DURATION_MS = 500;
 const SHORT_STAGE_EXCLUDED_FROM_TRAINING = new Set([
@@ -2784,7 +2784,7 @@ app.get("/admin/timing-learning-summary", requireAdmin, async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v42-stage-timing-predictor-v11-protected-original-prediction", predictor_version: TIMING_PREDICTOR_VERSION })
+  res.json({ version: "v43-stage-timing-predictor-v12-local-phase-learning", predictor_version: TIMING_PREDICTOR_VERSION })
 );
 
 app.get("/redis", (_req, res) =>
@@ -7284,53 +7284,116 @@ function stageScaleFactor(stageInput, target, candidate, row = {}) {
   return clampNumber(scale, 0.18, 5.5);
 }
 
+function stageSimilarityWindow(stageInput) {
+  const stage = normalizeProcessingStage(stageInput);
+  if (["texture", "tiled_model", "point_cloud", "orthomosaic", "depth_maps", "model", "aligning"].includes(stage)) {
+    return { minRatio: 0.50, maxRatio: 2.00, maxDistanceGap: 0.70, maxDistance: 1.65, maxNeighbors: 8 };
+  }
+  if (isTransferStage(stage)) {
+    return { minRatio: 0.35, maxRatio: 2.80, maxDistanceGap: 0.85, maxDistance: 2.20, maxNeighbors: 10 };
+  }
+  return { minRatio: 0.35, maxRatio: 2.80, maxDistanceGap: 0.90, maxDistance: 2.40, maxNeighbors: 10 };
+}
+
+function stagePrimaryLoad(stageInput, features, row = {}) {
+  const stage = normalizeProcessingStage(stageInput);
+  if (isTransferStage(stage)) return Math.max(1, Number(row.input_bytes || features.totalBytes || 0));
+  if (["matching", "aligning"].includes(stage)) return Math.max(1, Number(features.photosCount || 0));
+  if (["depth_maps", "model", "uv", "texture", "tiled_model", "point_cloud", "orthomosaic"].includes(stage)) {
+    return Math.max(1, Number(features.totalMegapixels || 0));
+  }
+  if (["ground_classification", "dem", "dtm", "colorize_model"].includes(stage) && Number(row.point_count || features.pointCount || 0) > 0) {
+    return Math.max(1, Number(row.point_count || features.pointCount || 0));
+  }
+  if (isExportStage(stage) && Number(row.output_bytes || features.targetOutputBytes || 0) > 0) {
+    return Math.max(1, Number(row.output_bytes || features.targetOutputBytes || 0));
+  }
+  return Math.max(1, Number(features.processingLoadScore || 0));
+}
+
+function applyStageSanityBounds(stageInput, secondsInput) {
+  const stage = normalizeProcessingStage(stageInput);
+  let seconds = Math.max(1, Number(secondsInput || 0));
+  if (stage === "report") seconds = clampNumber(seconds, 2, 60);
+  else if (stage === "closing_metashape") seconds = clampNumber(seconds, 10, 180);
+  else if (stage === "preparing") seconds = clampNumber(seconds, 5, 600);
+  else if (stage === "exporting") seconds = clampNumber(seconds, 3, 180);
+  return seconds;
+}
+
 function estimateStageFromMetricRows(stage, targetInput, rows, fallbackSeconds) {
   const target = { ...buildJobFeatures(targetInput), ...targetInput };
   const now = Date.now();
+  const window = stageSimilarityWindow(stage);
+  const targetLoad = stagePrimaryLoad(stage, target, target);
 
-  let candidates = (rows || []).map((row) => {
+  let allCandidates = (rows || []).map((row) => {
     const durationSeconds = Number(row.duration_ms || 0) / 1000;
     if (!(durationSeconds > 0) || durationSeconds > 7 * 24 * 3600) return null;
 
     const candidate = metricRowFeatures(row);
     if (candidate.qualityMode !== target.qualityMode) return null;
-    // La muestra ya está filtrada por la misma fase. No se exige que el
-    // conjunto completo de entregables sea idéntico: una fase válida puede
-    // reutilizarse aunque el trabajo histórico generase otros productos.
     if (candidate.projectType !== target.projectType) return null;
     if (!!candidate.tamsExport !== !!target.tamsExport) return null;
+
     const distance = stageFeatureDistance(stage, target, candidate, row);
     const scale = stageScaleFactor(stage, target, candidate, row);
     const predictedSeconds = durationSeconds * scale;
+    const candidateLoad = stagePrimaryLoad(stage, candidate, row);
+    const loadRatio = targetLoad / Math.max(1, candidateLoad);
     const ageDays = Math.max(0, (now - new Date(row.created_at || row.finished_at || now).getTime()) / 86400000);
-    const recencyWeight = 1 / (1 + ageDays / 180);
-    const weight = recencyWeight / Math.pow(0.30 + distance, 2);
+    const recencyWeight = 1 / (1 + ageDays / 240);
+
+    // La cercanía manda. Dos trabajos parecidos deben pesar mucho más que
+    // muchos históricos pequeños o lejanos.
+    const proximityWeight = 1 / Math.pow(0.10 + distance, 3);
+    const localBoost = loadRatio >= 0.70 && loadRatio <= 1.45 ? 2.4 :
+      (loadRatio >= 0.50 && loadRatio <= 2.00 ? 1.35 : 1.0);
+    const weight = recencyWeight * proximityWeight * localBoost;
 
     return {
       id: row.job_id,
       predictedSeconds,
       distance,
       weight,
+      loadRatio,
       outputBytes: Number(row.output_bytes || 0),
       candidate,
       row
     };
-  }).filter(Boolean).sort((a, b) => a.distance - b.distance).slice(0, 16);
+  }).filter(Boolean).sort((a, b) => a.distance - b.distance);
 
-  if (candidates.length >= 3) {
+  let candidates = [];
+  if (allCandidates.length) {
+    const bestDistance = allCandidates[0].distance;
+    const local = allCandidates.filter((item) =>
+      item.loadRatio >= window.minRatio &&
+      item.loadRatio <= window.maxRatio &&
+      item.distance <= Math.min(window.maxDistance, bestDistance + window.maxDistanceGap)
+    );
+
+    // Con dos referencias locales válidas ya no se diluyen contra históricos
+    // lejanos. Si solo hay una, se amplía suavemente el vecindario.
+    candidates = (local.length >= 2 ? local : allCandidates)
+      .slice(0, window.maxNeighbors);
+  }
+
+  if (candidates.length >= 4) {
     const ordered = candidates.map((item) => item.predictedSeconds).sort((a, b) => a - b);
     const median = ordered[Math.floor(ordered.length / 2)] || 1;
-    const filtered = candidates.filter((item) => item.predictedSeconds >= median * 0.22 && item.predictedSeconds <= median * 4.5);
+    const filtered = candidates.filter((item) =>
+      item.predictedSeconds >= median * 0.35 && item.predictedSeconds <= median * 3.0
+    );
     if (filtered.length >= 3) candidates = filtered;
   }
 
   const sampleCount = candidates.length;
   if (!sampleCount) {
-    const seconds = Math.max(1, Math.round(fallbackSeconds));
+    const seconds = applyStageSanityBounds(stage, Math.max(1, Math.round(fallbackSeconds)));
     return {
-      seconds,
+      seconds: Math.round(seconds),
       low_seconds: Math.max(1, Math.round(seconds * 0.55)),
-      high_seconds: Math.max(seconds + 1, Math.round(seconds * 1.75)),
+      high_seconds: Math.max(Math.round(seconds) + 1, Math.round(seconds * 1.75)),
       sample_count: 0,
       average_distance: null,
       confidence: "low",
@@ -7344,8 +7407,10 @@ function estimateStageFromMetricRows(stage, targetInput, rows, fallbackSeconds) 
   const weightedAverage = candidates.reduce((sum, item) => sum + item.predictedSeconds * item.weight, 0) / weightSum;
   const ordered = candidates.map((item) => item.predictedSeconds).sort((a, b) => a - b);
   const median = ordered[Math.floor(ordered.length / 2)];
-  let seconds = (weightedAverage * 0.72) + (median * 0.28);
 
+  // La media local ponderada domina; la mediana solo estabiliza ruido.
+  let seconds = (weightedAverage * 0.88) + (median * 0.12);
+  seconds = applyStageSanityBounds(stage, seconds);
 
   const variance = candidates.reduce((sum, item) => {
     const diff = item.predictedSeconds - weightedAverage;
@@ -7363,8 +7428,8 @@ function estimateStageFromMetricRows(stage, targetInput, rows, fallbackSeconds) 
     const outputWeight = outputCandidates.reduce((sum, item) => sum + item.weight, 0) || 1;
     estimatedOutputBytes = Math.round(outputCandidates.reduce((sum, item) => {
       const sourceLoad = Math.max(1, item.candidate.processingLoadScore);
-      const targetLoad = Math.max(1, target.processingLoadScore);
-      const scaled = item.outputBytes * clampNumber(Math.pow(targetLoad / sourceLoad, 0.72), 0.20, 5);
+      const currentLoad = Math.max(1, target.processingLoadScore);
+      const scaled = item.outputBytes * clampNumber(Math.pow(currentLoad / sourceLoad, 0.72), 0.20, 5);
       return sum + scaled * item.weight;
     }, 0) / outputWeight);
   }
@@ -7377,7 +7442,7 @@ function estimateStageFromMetricRows(stage, targetInput, rows, fallbackSeconds) 
     average_distance: Math.round(averageDistance * 1000) / 1000,
     confidence,
     confidence_score: timingConfidenceScore(confidence, sampleCount),
-    method: sampleCount === 1 ? "stage_historical_exact_single" : "stage_historical_exact_neighbors",
+    method: sampleCount === 1 ? "stage_local_single" : "stage_local_neighbors",
     estimated_output_bytes: estimatedOutputBytes
   };
 }
