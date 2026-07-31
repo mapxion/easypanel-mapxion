@@ -27,7 +27,7 @@ const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 
 // Versiones estables del sistema de tiempos. Se guardan junto a cada muestra
 // para no mezclar historicos incompatibles si cambian perfiles o predictor.
-const TIMING_PREDICTOR_VERSION = "stage-v6-local-phase-learning-2026-07-31";
+const TIMING_PREDICTOR_VERSION = "stage-v7-texture-load-learning-2026-07-31";
 const TIMING_METRICS_VERSION = "metrics-v4-protected-original-prediction-2026-07-26";
 const SHORT_STAGE_MIN_DURATION_MS = 500;
 const SHORT_STAGE_EXCLUDED_FROM_TRAINING = new Set([
@@ -2784,7 +2784,7 @@ app.get("/admin/timing-learning-summary", requireAdmin, async (_req, res) => {
 });
 
 app.get("/version", (_req, res) =>
-  res.json({ version: "v43-stage-timing-predictor-v12-local-phase-learning", predictor_version: TIMING_PREDICTOR_VERSION })
+  res.json({ version: "v44-stage-timing-predictor-v13-texture-load-learning", predictor_version: TIMING_PREDICTOR_VERSION })
 );
 
 app.get("/redis", (_req, res) =>
@@ -6822,6 +6822,8 @@ function buildJobFeatures(job = {}) {
     avgMegapixels,
     totalMegapixels,
     pointCount: finiteNumber(job.point_count ?? job.pointCount, null),
+    faceCount: finiteNumber(job.face_count ?? job.faceCount, null),
+    textureCount: finiteNumber(job.texture_count ?? job.textureCount, null),
     processingLoadScore,
     qualityMode,
     outputsRequested,
@@ -7151,6 +7153,8 @@ function metricRowFeatures(row) {
     avg_megapixels: row.avg_megapixels,
     total_megapixels: row.total_megapixels,
     point_count: row.point_count,
+    face_count: row.face_count,
+    texture_count: row.texture_count,
     processing_load_score: row.processing_load_score,
     project_type: row.project_type,
     quality: row.quality,
@@ -7209,7 +7213,24 @@ function stageFeatureDistance(stageInput, target, candidate, row = {}) {
     return distance;
   }
 
-  if (["depth_maps", "model", "uv", "texture", "tiled_model", "point_cloud"].includes(stage)) {
+  if (stage === "texture") {
+    // Antes del procesado no siempre conocemos caras ni atlas finales.
+    // Para la cotización inicial deben mandar fotos, resolución y salidas.
+    distance += logRatioDistance(target.photosCount, candidate.photosCount) * 3.2;
+    distance += logRatioDistance(target.totalMegapixels, candidate.totalMegapixels) * 1.35;
+    distance += logRatioDistance(target.avgMegapixels, candidate.avgMegapixels) * 0.65;
+    distance += outputSetDistance(target.outputsRequested, candidate.outputsRequested) * 1.6;
+
+    if (Number(target.faceCount || 0) > 0 && Number(row.face_count || candidate.faceCount || 0) > 0) {
+      distance += logRatioDistance(target.faceCount, row.face_count || candidate.faceCount) * 2.8;
+    }
+    if (Number(target.textureCount || 0) > 0 && Number(row.texture_count || candidate.textureCount || 0) > 0) {
+      distance += logRatioDistance(target.textureCount, row.texture_count || candidate.textureCount) * 2.2;
+    }
+    return distance;
+  }
+
+  if (["depth_maps", "model", "uv", "tiled_model", "point_cloud"].includes(stage)) {
     distance += logRatioDistance(target.totalMegapixels, candidate.totalMegapixels) * 3.2;
     distance += logRatioDistance(target.photosCount, candidate.photosCount) * 1.8;
     distance += logRatioDistance(target.avgMegapixels, candidate.avgMegapixels) * 0.7;
@@ -7259,7 +7280,20 @@ function stageScaleFactor(stageInput, target, candidate, row = {}) {
   } else if (stage === "depth_maps") {
     scale = Math.pow(ratio(target.totalMegapixels, candidate.totalMegapixels), 0.98) *
       Math.pow(getQualityModeTimeFactor(target.qualityMode) / getQualityModeTimeFactor(candidate.qualityMode), 0.85);
-  } else if (["model", "uv", "texture", "tiled_model", "point_cloud"].includes(stage)) {
+  } else if (stage === "texture") {
+    // Evita que los megapíxeles totales disparen la textura en trabajos FULL
+    // parecidos. El escalado se apoya sobre todo en fotos y resolución media.
+    scale =
+      Math.pow(ratio(target.photosCount, candidate.photosCount), 0.88) *
+      Math.pow(ratio(target.avgMegapixels, candidate.avgMegapixels), 0.24);
+
+    if (Number(target.faceCount || 0) > 0 && Number(row.face_count || candidate.faceCount || 0) > 0) {
+      scale *= Math.pow(ratio(target.faceCount, row.face_count || candidate.faceCount), 0.42);
+    }
+    if (Number(target.textureCount || 0) > 0 && Number(row.texture_count || candidate.textureCount || 0) > 0) {
+      scale *= Math.pow(ratio(target.textureCount, row.texture_count || candidate.textureCount), 0.30);
+    }
+  } else if (["model", "uv", "tiled_model", "point_cloud"].includes(stage)) {
     scale =
       Math.pow(ratio(target.totalMegapixels, candidate.totalMegapixels), 0.78) *
       Math.pow(ratio(target.photosCount, candidate.photosCount), 0.18);
@@ -7286,7 +7320,10 @@ function stageScaleFactor(stageInput, target, candidate, row = {}) {
 
 function stageSimilarityWindow(stageInput) {
   const stage = normalizeProcessingStage(stageInput);
-  if (["texture", "tiled_model", "point_cloud", "orthomosaic", "depth_maps", "model", "aligning"].includes(stage)) {
+  if (stage === "texture") {
+    return { minRatio: 0.55, maxRatio: 1.80, maxDistanceGap: 0.55, maxDistance: 1.30, maxNeighbors: 6 };
+  }
+  if (["tiled_model", "point_cloud", "orthomosaic", "depth_maps", "model", "aligning"].includes(stage)) {
     return { minRatio: 0.50, maxRatio: 2.00, maxDistanceGap: 0.70, maxDistance: 1.65, maxNeighbors: 8 };
   }
   if (isTransferStage(stage)) {
@@ -7456,8 +7493,9 @@ async function loadTimingMetricRows(pool, stages) {
     const result = await pool.query(
       `select job_id, stage, duration_ms, input_bytes, output_bytes, item_count,
               photos_count, avg_photo_mb, avg_width, avg_height, avg_megapixels,
-              total_megapixels, point_count, processing_load_score,
-              project_type, quality, outputs, profile_version, worker_version,
+              total_megapixels, point_count, face_count, texture_count,
+              processing_load_score, project_type, quality, outputs,
+              profile_version, worker_version,
               created_at, finished_at
          from job_stage_metrics
         where valid_for_training = true
