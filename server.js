@@ -2584,8 +2584,64 @@ app.get("/admin/jobs", requireAdmin, async (_req, res) => {
       limit 100
     `);
 
+    const summaryResult = await pool.query(`
+      select
+        count(*) as total_count,
+        count(*) filter (where status = 'queued') as queued_count,
+        count(*) filter (where status = 'running') as running_count,
+        count(*) filter (where status in ('done', 'tams_downloaded')) as done_count,
+        count(*) filter (where status = 'failed') as failed_count,
+        coalesce(sum(photos_count), 0) as photos_count,
+        count(*) filter (
+          where lower(coalesce(nullif(project_type, ''), exif_summary->'_xproces'->>'project_type', ''))
+            in ('tams', 'telecom', 'tower')
+        ) as tams_count,
+        count(*) filter (
+          where lower(coalesce(nullif(project_type, ''), exif_summary->'_xproces'->>'project_type', ''))
+            in ('fotogrametria', 'photogrammetry', 'photo', 'survey', 'topography')
+        ) as photogrammetry_count,
+        count(*) filter (
+          where lower(coalesce(nullif(project_type, ''), exif_summary->'_xproces'->>'project_type', ''))
+            in ('3d', 'model3d', 'model_3d', 'modeling', 'modelo3d')
+        ) as model3d_count,
+        coalesce(sum(
+          case
+            when lower(coalesce(payment_status, '')) = 'paid'
+              then coalesce(payment_amount, price, 0)
+            else 0
+          end
+        ), 0) as revenue_total,
+        coalesce(sum(
+          case
+            when lower(coalesce(payment_status, '')) = 'paid'
+             and coalesce(payment_date, paid_at) >= date_trunc('month', now())
+             and coalesce(payment_date, paid_at) < date_trunc('month', now()) + interval '1 month'
+              then coalesce(payment_amount, price, 0)
+            else 0
+          end
+        ), 0) as revenue_month
+      from jobs
+    `);
+
+    const rawSummary = summaryResult.rows[0] || {};
+    const summary = {
+      total_count: Number(rawSummary.total_count || 0),
+      queued_count: Number(rawSummary.queued_count || 0),
+      running_count: Number(rawSummary.running_count || 0),
+      done_count: Number(rawSummary.done_count || 0),
+      failed_count: Number(rawSummary.failed_count || 0),
+      photos_count: Number(rawSummary.photos_count || 0),
+      tams_count: Number(rawSummary.tams_count || 0),
+      photogrammetry_count: Number(rawSummary.photogrammetry_count || 0),
+      model3d_count: Number(rawSummary.model3d_count || 0),
+      revenue_total: Number(rawSummary.revenue_total || 0),
+      revenue_month: Number(rawSummary.revenue_month || 0)
+    };
+
     res.json({
       ok: true,
+      total_count: summary.total_count,
+      summary,
       jobs: rows.map((job) => ({
         ...job,
         quality_mode: normalizeQualityMode(job.quality_mode || job?.exif_summary?._xproces?.quality_mode || "normal")
@@ -3263,24 +3319,17 @@ app.post("/admin/invite-codes/generate", requireAdmin, async (req, res) => {
 
 app.get("/admin/invite-codes", requireAdmin, async (_req, res) => {
   try {
-    await ensureInviteCodeJobColumn();
-
     const { rows } = await pool.query(
       `select
-         i.id,
-         i.code,
-         (i.is_used or i.used_job_id is not null) as is_used,
-         i.used_at,
-         i.used_by_email,
-         i.used_by_name,
-         i.created_at,
-         i.used_job_id,
-         j.project_name as used_project_name,
-         j.status as used_job_status,
-         j.created_at as used_job_created_at
-       from invite_codes i
-       left join jobs j on j.id = i.used_job_id
-       order by i.created_at desc
+         id,
+         code,
+         is_used,
+         used_at,
+         used_by_email,
+         used_by_name,
+         created_at
+       from invite_codes
+       order by created_at desc
        limit 500`
     );
 
@@ -3316,7 +3365,6 @@ app.get("/jobs/mine", async (req, res) => {
     await ensureDownloadCleanupColumns();
     await ensurePaymentColumns();
     await ensureInvoiceColumns();
-    await ensureInviteCodeJobColumn();
 
     const userIdRaw =
       req.headers["x-user-id"] ||
@@ -3363,11 +3411,7 @@ app.get("/jobs/mine", async (req, res) => {
           invoice_province,
           invoice_country,
           invoice_email,
-          invoice_number,
-          (select ic.code
-             from invite_codes ic
-            where ic.used_job_id = jobs.id
-            limit 1) as invite_code
+          invoice_number
         from jobs
         where user_id = $1
         order by created_at desc`
@@ -3398,11 +3442,7 @@ app.get("/jobs/mine", async (req, res) => {
           invoice_province,
           invoice_country,
           invoice_email,
-          invoice_number,
-          (select ic.code
-             from invite_codes ic
-            where ic.used_job_id = jobs.id
-            limit 1) as invite_code
+          invoice_number
         from jobs
         where user_id = $1
         order by created_at desc`;
@@ -3594,15 +3634,7 @@ app.get("/jobs/:id", async (req, res) => {
       return res.status(400).json({ ok: false, error: "invalid job id" });
     }
 
-    await ensureInviteCodeJobColumn();
-
-    const { rows } = await pool.query(
-      `select j.*, ic.code as invite_code
-         from jobs j
-         left join invite_codes ic on ic.used_job_id = j.id
-        where j.id = $1`,
-      [id]
-    );
+    const { rows } = await pool.query("select * from jobs where id = $1", [id]);
     if (!rows.length) return res.status(404).json({ ok: false, error: "not found" });
 
     const job = rows[0];
@@ -4297,7 +4329,7 @@ const inviteSessionExempt = req.body?.invite_exempt === true;
 
       if (inviteCode) {
         const inviteResult = await db.query(
-          `select id, code, is_used, used_job_id
+          `select id, is_used, used_job_id
              from invite_codes
             where code = $1
             limit 1
@@ -4326,7 +4358,7 @@ const inviteSessionExempt = req.body?.invite_exempt === true;
         inviteRow = inviteResult.rows[0];
       } else if (inviteSessionExempt) {
         const inviteResult = await db.query(
-          `select id, code, is_used, used_job_id
+          `select id, is_used, used_job_id
              from invite_codes
             where is_used = true
               and used_job_id is null
@@ -4461,7 +4493,6 @@ const inviteSessionExempt = req.body?.invite_exempt === true;
           [jobRow.id]
         );
         jobRow = updatedJob.rows[0];
-        jobRow.invite_code = String(inviteRow.code || inviteCode || "").trim().toUpperCase() || null;
       }
 
       await db.query("commit");
