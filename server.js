@@ -8262,11 +8262,12 @@ async function estimateRemainingServiceSeconds(pool, job, options = {}) {
 }
 
 function formatEtaSeconds(seconds) {
-  const s = Math.max(0, Math.round(seconds));
-  const h = Math.floor(s / 3600);
-  const m = Math.ceil((s % 3600) / 60);
+  const totalMinutes = Math.max(0, Math.ceil(Number(seconds || 0) / 60));
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
 
   if (h <= 0) return `${m} min`;
+  if (m <= 0) return `${h} h`;
   return `${h} h ${m} min`;
 }
 
@@ -8303,12 +8304,32 @@ app.get("/jobs/:id/eta", async (req, res) => {
     const activeJobs = allRows.rows;
 
     let waitSeconds = 0;
+    let jobsAhead = 0;
+    let queuePosition = null;
+    let targetFoundInActiveQueue = false;
 
     for (const j of activeJobs) {
-      if (j.id === id) break;
+      if (j.id === id) {
+        targetFoundInActiveQueue = true;
+        queuePosition = jobsAhead + 1;
+        break;
+      }
 
       waitSeconds += await estimateRemainingServiceSeconds(pool, j);
+      jobsAhead += 1;
     }
+
+    // Un trabajo que ya está procesándose no está esperando para comenzar.
+    if (String(targetJob.status || "").toLowerCase() === "running") {
+      waitSeconds = 0;
+      jobsAhead = 0;
+      queuePosition = 0;
+    }
+
+    const estimatedStartAt =
+      String(targetJob.status || "").toLowerCase() === "queued"
+        ? new Date(Date.now() + Math.max(0, waitSeconds) * 1000).toISOString()
+        : null;
 
     const ownProcessingSeconds = await estimateProcessingSeconds(pool, targetJob);
     const ownRemaining = await estimateRemainingServiceSeconds(pool, targetJob, { details: true });
@@ -8323,6 +8344,10 @@ app.get("/jobs/:id/eta", async (req, res) => {
       quality_mode: getJobQualityMode(targetJob),
       quality_mode_label: getQualityModeLabel(getJobQualityMode(targetJob)),
       queue_wait_seconds: waitSeconds,
+      jobs_ahead: jobsAhead,
+      queue_position: queuePosition,
+      estimated_start_at: estimatedStartAt,
+      active_queue_found: targetFoundInActiveQueue,
       own_processing_seconds: ownProcessingSeconds,
       own_remaining_service_seconds: ownServiceSeconds,
       total_estimated_seconds: totalSeconds,
@@ -8336,6 +8361,7 @@ app.get("/jobs/:id/eta", async (req, res) => {
       pending_stages: ownRemaining.pending_stages || [],
       eta_method: ownRemaining.method || null,
       queue_wait_human: formatEtaSeconds(waitSeconds),
+      estimated_start_human: formatEtaSeconds(waitSeconds),
       own_processing_human: formatEtaSeconds(ownProcessingSeconds),
       own_remaining_service_human: formatEtaSeconds(ownServiceSeconds),
       total_estimated_human: formatEtaSeconds(totalSeconds)
