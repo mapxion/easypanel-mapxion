@@ -1867,6 +1867,24 @@ async function ensureInvoiceColumns() {
   `);
 }
 
+let inviteCodeJobSchemaReady = false;
+
+async function ensureInviteCodeJobColumn() {
+  if (inviteCodeJobSchemaReady) return;
+
+  await pool.query(`
+    alter table invite_codes
+      add column if not exists used_job_id uuid
+  `);
+  await pool.query(`
+    create unique index if not exists invite_codes_used_job_id_unique
+      on invite_codes (used_job_id)
+      where used_job_id is not null
+  `);
+
+  inviteCodeJobSchemaReady = true;
+}
+
 function canUsePaidJob(job) {
   return ["paid", "exempt"].includes(String(job?.payment_status || "").toLowerCase());
 }
@@ -1874,24 +1892,48 @@ function canUsePaidJob(job) {
 async function recoverInviteExemption(job) {
   if (!job || canUsePaidJob(job)) return canUsePaidJob(job);
 
-  const email = String(job.client_email || "").trim().toLowerCase();
-  if (!email) return false;
+  await ensureInviteCodeJobColumn();
 
-  const inviteResult = await pool.query(
+  const email = String(job.client_email || "").trim().toLowerCase();
+  if (!email || !job.id) return false;
+
+  let inviteResult = await pool.query(
     `select id
        from invite_codes
-      where is_used = true
-        and lower(coalesce(used_by_email, '')) = lower($1)
-      order by used_at desc nulls last
+      where used_job_id = $1
       limit 1`,
-    [email]
+    [job.id]
   );
+
+  const legacyInviteFlag = job?.exif_summary?._xproces?.invite_payment_exempt === true;
+  if (!inviteResult.rows.length && legacyInviteFlag) {
+    inviteResult = await pool.query(
+      `with candidate as (
+         select id
+           from invite_codes
+          where is_used = true
+            and used_job_id is null
+            and lower(coalesce(used_by_email, '')) = lower($1)
+          order by used_at desc nulls last
+          limit 1
+          for update skip locked
+       )
+       update invite_codes i
+          set used_job_id = $2
+         from candidate c
+        where i.id = c.id
+          and i.used_job_id is null
+       returning i.id`,
+      [email, job.id]
+    );
+  }
 
   if (!inviteResult.rows.length) return false;
 
   await pool.query(
     `update jobs
         set payment_status='exempt',
+            payment_provider=coalesce(payment_provider, 'invite_code'),
             status=case when status='pending_payment' then 'created' else status end,
             stage=case when stage='pending_payment' then 'created' else stage end,
             message=case when message='Pendiente de pago' then 'Procesado sin coste por código invitado' else message end,
@@ -1909,7 +1951,7 @@ async function requirePaidJobBeforeUpload(req, res, next) {
   try {
     await ensurePaymentColumns();
     const { rows } = await pool.query(
-      `select id, status, payment_status, user_id, client_email from jobs where id=$1`,
+      `select id, status, payment_status, user_id, client_email, exif_summary from jobs where id=$1`,
       [req.params.id]
     );
     if (!rows.length) return res.status(404).json({ ok: false, error: "job_not_found" });
@@ -3842,6 +3884,9 @@ app.post("/jobs/:id/paypal/create-order", async (req, res) => {
     if (String(job.payment_status || "").toLowerCase() === "paid") {
       return res.json({ ok: true, already_paid: true, order_id: job.payment_order_id, amount: Number(job.payment_amount || job.price || 0), currency: job.payment_currency || PAYPAL_CURRENCY });
     }
+    if (String(job.payment_status || "").toLowerCase() === "exempt") {
+      return res.json({ ok: true, exempt: true, amount: Number(job.price || 0), currency: job.payment_currency || PAYPAL_CURRENCY });
+    }
 
     // PayPal debe cobrar exactamente el precio calculado y guardado al crear el trabajo.
     // No se vuelve a estimar aquí para evitar diferencias con el importe mostrado en la web.
@@ -4177,6 +4222,8 @@ const clientEmail = req.body?.client_email || null;
 const projectName = req.body?.project_name || null;
 const clientName = req.body?.client_name || null;
 const userId = req.body?.user_id || null;
+const inviteCode = String(req.body?.invite_code || "").trim().toUpperCase();
+const inviteSessionExempt = req.body?.invite_exempt === true;
     
 
     if (!clientEmail || !isValidEmail(clientEmail)) {
@@ -4187,23 +4234,9 @@ const userId = req.body?.user_id || null;
       });
     }
 
-    // Los usuarios que han accedido mediante un código invitado válido pueden
-    // iniciar el trabajo sin PayPal. El precio se conserva solo como referencia.
-    let invitePaymentExempt = false;
-    const inviteResult = await pool.query(
-      `select id
-         from invite_codes
-        where is_used = true
-          and lower(coalesce(used_by_email, '')) = lower($1)
-        order by used_at desc nulls last
-        limit 1`,
-      [clientEmail]
-    );
-
-    invitePaymentExempt = inviteResult.rows.length > 0;
-
     await ensurePaymentColumns();
     await ensureTimingAnalyticsSchema();
+    await ensureInviteCodeJobColumn();
 
     const declaredStats = pricingQuote ? {
       avgPhotoMb: Number(pricingQuote.avg_photo_mb || 0),
@@ -4230,77 +4263,200 @@ const userId = req.body?.user_id || null;
       ? Number(pricingQuote.price || 0)
       : calculatePriceFromInputs(expectedPhotosCount, expectedTotalBytes, 0, qualityMode, outputsRequested, projectType);
 
-    exifSummary = stripNullCharsDeep({
-      ...(exifSummary || {}),
-      _xproces: {
-        ...((exifSummary && exifSummary._xproces) || {}),
-        processing_load_score: initialLoadScore,
-        pricing_quote_locked: true,
-        pricing_quote_issued_at: pricingQuote?.issued_at || null,
-        pricing_quote_expires_at: pricingQuote?.expires_at || null,
-        prediction_method: "locked_web_quote",
-        predictor_version: pricingQuote?.predictor_version || TIMING_PREDICTOR_VERSION,
-        invite_payment_exempt: invitePaymentExempt
+    const db = await pool.connect();
+    let jobRow = null;
+
+    try {
+      await db.query("begin");
+
+      let inviteRow = null;
+
+      if (inviteCode) {
+        const inviteResult = await db.query(
+          `select id, is_used, used_job_id
+             from invite_codes
+            where code = $1
+            limit 1
+            for update`,
+          [inviteCode]
+        );
+
+        if (!inviteResult.rows.length) {
+          await db.query("rollback");
+          return res.status(404).json({
+            ok: false,
+            error: "invalid_invite_code",
+            message: "El código invitado no es válido."
+          });
+        }
+
+        if (inviteResult.rows[0].is_used || inviteResult.rows[0].used_job_id) {
+          await db.query("rollback");
+          return res.status(409).json({
+            ok: false,
+            error: "invite_code_already_used",
+            message: "Ese código invitado ya ha sido utilizado."
+          });
+        }
+
+        inviteRow = inviteResult.rows[0];
+      } else if (inviteSessionExempt) {
+        const inviteResult = await db.query(
+          `select id, is_used, used_job_id
+             from invite_codes
+            where is_used = true
+              and used_job_id is null
+              and lower(coalesce(used_by_email, '')) = lower($1)
+            order by used_at desc nulls last
+            limit 1
+            for update`,
+          [clientEmail]
+        );
+
+        if (!inviteResult.rows.length) {
+          await db.query("rollback");
+          return res.status(409).json({
+            ok: false,
+            error: "invite_session_code_unavailable",
+            message: "El código invitado de esta sesión ya fue utilizado en otro trabajo."
+          });
+        }
+
+        inviteRow = inviteResult.rows[0];
       }
-    });
-    const initialPaymentStatus = (invitePaymentExempt || initialPrice <= 0) ? "exempt" : "pending";
 
-    const insertSql = `insert into jobs (
-        status,
-        photos_count,
-        price,
-        exif_summary,
-        client_email,
-        project_name,
-        client_name,
-        user_id,
-        quality,
-        project_type,
-        outputs,
-        avg_photo_mb,
-        avg_width,
-        avg_height,
-        avg_megapixels,
-        total_megapixels,
-        processing_load_score,
-        estimated_processing_seconds,
-        payment_status,
-        payment_currency
-      )
-      values (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb,
-        $12, $13, $14, $15, $16, $17, $18, $19, $20
-      )
-      returning *`;
+      const invitePaymentExempt = !!inviteRow;
 
-    const insertParams = [
-      (invitePaymentExempt || initialPrice <= 0) ? "created" : "pending_payment",
-      0,
-      initialPrice,
-      exifSummary,
-      clientEmail,
-      projectName,
-      clientName,
-      userId,
-      qualityMode,
-      projectType,
-      JSON.stringify(normalizeOutputList(outputsRequested)),
-      declaredStats.avgPhotoMb,
-      declaredStats.avgWidth,
-      declaredStats.avgHeight,
-      declaredStats.avgMegapixels,
-      declaredStats.totalMegapixels,
-      initialLoadScore,
-      estimatedSecondsForPayment,
-      initialPaymentStatus,
-      PAYPAL_CURRENCY
-    ];
+      exifSummary = stripNullCharsDeep({
+        ...(exifSummary || {}),
+        _xproces: {
+          ...((exifSummary && exifSummary._xproces) || {}),
+          processing_load_score: initialLoadScore,
+          pricing_quote_locked: true,
+          pricing_quote_issued_at: pricingQuote?.issued_at || null,
+          pricing_quote_expires_at: pricingQuote?.expires_at || null,
+          prediction_method: "locked_web_quote",
+          predictor_version: pricingQuote?.predictor_version || TIMING_PREDICTOR_VERSION,
+          invite_payment_exempt: invitePaymentExempt
+        }
+      });
+      const initialPaymentStatus = (invitePaymentExempt || initialPrice <= 0) ? "exempt" : "pending";
 
-    const { rows } = await pool.query(insertSql, insertParams);
+      const insertSql = `insert into jobs (
+          status,
+          photos_count,
+          price,
+          exif_summary,
+          client_email,
+          project_name,
+          client_name,
+          user_id,
+          quality,
+          project_type,
+          outputs,
+          avg_photo_mb,
+          avg_width,
+          avg_height,
+          avg_megapixels,
+          total_megapixels,
+          processing_load_score,
+          estimated_processing_seconds,
+          payment_status,
+          payment_currency
+        )
+        values (
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb,
+          $12, $13, $14, $15, $16, $17, $18, $19, $20
+        )
+        returning *`;
 
-    const jobRow = rows[0];
+      const insertParams = [
+        (invitePaymentExempt || initialPrice <= 0) ? "created" : "pending_payment",
+        0,
+        initialPrice,
+        exifSummary,
+        clientEmail,
+        projectName,
+        clientName,
+        userId,
+        qualityMode,
+        projectType,
+        JSON.stringify(normalizeOutputList(outputsRequested)),
+        declaredStats.avgPhotoMb,
+        declaredStats.avgWidth,
+        declaredStats.avgHeight,
+        declaredStats.avgMegapixels,
+        declaredStats.totalMegapixels,
+        initialLoadScore,
+        estimatedSecondsForPayment,
+        initialPaymentStatus,
+        PAYPAL_CURRENCY
+      ];
+
+      const inserted = await db.query(insertSql, insertParams);
+      jobRow = inserted.rows[0];
+
+      if (inviteRow) {
+        const inviteUpdate = inviteCode
+          ? await db.query(
+              `update invite_codes
+                  set is_used = true,
+                      used_at = now(),
+                      used_by_email = $2,
+                      used_by_name = $3,
+                      used_job_id = $4
+                where id = $1
+                  and is_used = false
+                  and used_job_id is null
+              returning id`,
+              [inviteRow.id, clientEmail, clientName, jobRow.id]
+            )
+          : await db.query(
+              `update invite_codes
+                  set used_job_id = $2
+                where id = $1
+                  and is_used = true
+                  and used_job_id is null
+              returning id`,
+              [inviteRow.id, jobRow.id]
+            );
+
+        if (!inviteUpdate.rows.length) {
+          const error = new Error("El código invitado dejó de estar disponible.");
+          error.xprocesCode = "invite_code_already_used";
+          throw error;
+        }
+
+        const updatedJob = await db.query(
+          `update jobs
+              set payment_provider = 'invite_code',
+                  message = 'Procesado sin coste por código invitado',
+                  updated_at = now()
+            where id = $1
+          returning *`,
+          [jobRow.id]
+        );
+        jobRow = updatedJob.rows[0];
+      }
+
+      await db.query("commit");
+    } catch (transactionError) {
+      try { await db.query("rollback"); } catch (_) {}
+
+      if (transactionError?.xprocesCode === "invite_code_already_used") {
+        return res.status(409).json({
+          ok: false,
+          error: "invite_code_already_used",
+          message: transactionError.message
+        });
+      }
+
+      throw transactionError;
+    } finally {
+      db.release();
+    }
+
     ensureJobDirs(jobRow.id);
-
     res.json(jobRow);
   } catch (e) {
     console.error("create job error", e);
