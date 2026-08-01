@@ -100,7 +100,7 @@ function verifyClientPreviewToken(token) {
 // =====================
 const PAYPAL_CLIENT_ID = String(process.env.PAYPAL_CLIENT_ID || "AXq18BXXDy0_x4k-J6RmxbKRQsRX0zELhp6ve4FpfHJL9bv8LJ869sZtJUJykj3w7cN6q_vbUYUkcUxo").trim();
 const PAYPAL_CLIENT_SECRET = String(process.env.PAYPAL_CLIENT_SECRET || "EM5QNdoH-tVCW3bTjnpaxIWFQdBjKw2Xh4uqonD6dJvvwGJ6ZKG7x1z9-dIjBGA7XkTJqjJNHFjw-foJ").trim();
-const PAYPAL_ENV = String(process.env.PAYPAL_ENV || "sandbox").trim().toLowerCase() === "live" ? "live" : "sandbox";
+const PAYPAL_ENV = "live";
 const PAYPAL_CURRENCY = "EUR";
 const PAYPAL_API_BASE = PAYPAL_ENV === "live"
   ? "https://api-m.paypal.com"
