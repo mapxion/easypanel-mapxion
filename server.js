@@ -8305,25 +8305,42 @@ app.get("/jobs/:id/eta", async (req, res) => {
 
     let waitSeconds = 0;
     let jobsAhead = 0;
+    let queuedJobsAhead = 0;
+    let runningJobsAhead = 0;
     let queuePosition = null;
     let targetFoundInActiveQueue = false;
 
     for (const j of activeJobs) {
       if (j.id === id) {
         targetFoundInActiveQueue = true;
-        queuePosition = jobsAhead + 1;
+
+        // La posición corresponde solo a la cola de espera.
+        // El trabajo que ya está ejecutándose suma tiempo de espera,
+        // pero no ocupa una posición dentro de la cola.
+        queuePosition =
+          String(targetJob.status || "").toLowerCase() === "queued"
+            ? queuedJobsAhead + 1
+            : null;
         break;
       }
 
       waitSeconds += await estimateRemainingServiceSeconds(pool, j);
       jobsAhead += 1;
+
+      if (String(j.status || "").toLowerCase() === "queued") {
+        queuedJobsAhead += 1;
+      } else if (String(j.status || "").toLowerCase() === "running") {
+        runningJobsAhead += 1;
+      }
     }
 
-    // Un trabajo que ya está procesándose no está esperando para comenzar.
+    // Un trabajo que ya está procesándose no está esperando ni tiene posición.
     if (String(targetJob.status || "").toLowerCase() === "running") {
       waitSeconds = 0;
       jobsAhead = 0;
-      queuePosition = 0;
+      queuedJobsAhead = 0;
+      runningJobsAhead = 0;
+      queuePosition = null;
     }
 
     const estimatedStartAt =
@@ -8345,6 +8362,8 @@ app.get("/jobs/:id/eta", async (req, res) => {
       quality_mode_label: getQualityModeLabel(getJobQualityMode(targetJob)),
       queue_wait_seconds: waitSeconds,
       jobs_ahead: jobsAhead,
+      queued_jobs_ahead: queuedJobsAhead,
+      running_jobs_ahead: runningJobsAhead,
       queue_position: queuePosition,
       estimated_start_at: estimatedStartAt,
       active_queue_found: targetFoundInActiveQueue,
