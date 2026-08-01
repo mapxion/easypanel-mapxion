@@ -3263,17 +3263,24 @@ app.post("/admin/invite-codes/generate", requireAdmin, async (req, res) => {
 
 app.get("/admin/invite-codes", requireAdmin, async (_req, res) => {
   try {
+    await ensureInviteCodeJobColumn();
+
     const { rows } = await pool.query(
       `select
-         id,
-         code,
-         is_used,
-         used_at,
-         used_by_email,
-         used_by_name,
-         created_at
-       from invite_codes
-       order by created_at desc
+         i.id,
+         i.code,
+         (i.is_used or i.used_job_id is not null) as is_used,
+         i.used_at,
+         i.used_by_email,
+         i.used_by_name,
+         i.created_at,
+         i.used_job_id,
+         j.project_name as used_project_name,
+         j.status as used_job_status,
+         j.created_at as used_job_created_at
+       from invite_codes i
+       left join jobs j on j.id = i.used_job_id
+       order by i.created_at desc
        limit 500`
     );
 
@@ -3309,6 +3316,7 @@ app.get("/jobs/mine", async (req, res) => {
     await ensureDownloadCleanupColumns();
     await ensurePaymentColumns();
     await ensureInvoiceColumns();
+    await ensureInviteCodeJobColumn();
 
     const userIdRaw =
       req.headers["x-user-id"] ||
@@ -3355,7 +3363,11 @@ app.get("/jobs/mine", async (req, res) => {
           invoice_province,
           invoice_country,
           invoice_email,
-          invoice_number
+          invoice_number,
+          (select ic.code
+             from invite_codes ic
+            where ic.used_job_id = jobs.id
+            limit 1) as invite_code
         from jobs
         where user_id = $1
         order by created_at desc`
@@ -3386,7 +3398,11 @@ app.get("/jobs/mine", async (req, res) => {
           invoice_province,
           invoice_country,
           invoice_email,
-          invoice_number
+          invoice_number,
+          (select ic.code
+             from invite_codes ic
+            where ic.used_job_id = jobs.id
+            limit 1) as invite_code
         from jobs
         where user_id = $1
         order by created_at desc`;
@@ -3578,7 +3594,15 @@ app.get("/jobs/:id", async (req, res) => {
       return res.status(400).json({ ok: false, error: "invalid job id" });
     }
 
-    const { rows } = await pool.query("select * from jobs where id = $1", [id]);
+    await ensureInviteCodeJobColumn();
+
+    const { rows } = await pool.query(
+      `select j.*, ic.code as invite_code
+         from jobs j
+         left join invite_codes ic on ic.used_job_id = j.id
+        where j.id = $1`,
+      [id]
+    );
     if (!rows.length) return res.status(404).json({ ok: false, error: "not found" });
 
     const job = rows[0];
@@ -4273,7 +4297,7 @@ const inviteSessionExempt = req.body?.invite_exempt === true;
 
       if (inviteCode) {
         const inviteResult = await db.query(
-          `select id, is_used, used_job_id
+          `select id, code, is_used, used_job_id
              from invite_codes
             where code = $1
             limit 1
@@ -4302,7 +4326,7 @@ const inviteSessionExempt = req.body?.invite_exempt === true;
         inviteRow = inviteResult.rows[0];
       } else if (inviteSessionExempt) {
         const inviteResult = await db.query(
-          `select id, is_used, used_job_id
+          `select id, code, is_used, used_job_id
              from invite_codes
             where is_used = true
               and used_job_id is null
@@ -4437,6 +4461,7 @@ const inviteSessionExempt = req.body?.invite_exempt === true;
           [jobRow.id]
         );
         jobRow = updatedJob.rows[0];
+        jobRow.invite_code = String(inviteRow.code || inviteCode || "").trim().toUpperCase() || null;
       }
 
       await db.query("commit");
