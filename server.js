@@ -2454,7 +2454,7 @@ function calculatePriceFromInputs(photosCount, totalBytes, estimatedSeconds, qua
   // XProces: 12 EUR por hora estimada, con un mínimo de 8 EUR.
   // Equivale a 0,20 EUR por minuto.
   const minutes = Math.max(0, Number(estimatedSeconds || 0) / 60);
-  const price = Math.max(8, minutes * 0.20);
+  const price = Math.max(5, minutes * (8 / 60));
 
   // Se conservan céntimos exactos para la base de datos y PayPal.
   return Math.round((price + Number.EPSILON) * 100) / 100;
