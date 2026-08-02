@@ -27,7 +27,7 @@ const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 
 // Versiones estables del sistema de tiempos. Se guardan junto a cada muestra
 // para no mezclar historicos incompatibles si cambian perfiles o predictor.
-const TIMING_PREDICTOR_VERSION = "stage-v7-texture-load-learning-2026-07-31";
+const TIMING_PREDICTOR_VERSION = "stage-v8-no-manual-batch-wait-2026-08-02";
 const TIMING_METRICS_VERSION = "metrics-v4-protected-original-prediction-2026-07-26";
 const SHORT_STAGE_MIN_DURATION_MS = 500;
 const SHORT_STAGE_EXCLUDED_FROM_TRAINING = new Set([
@@ -7221,7 +7221,8 @@ async function estimateProcessingSecondsFromInputsHistorical(
 }
 
 const TIMING_STAGE_ORDER = [
-  "preparing",
+  // La espera entre "Ejecutando procesamiento por lotes" y el primer proceso
+  // real depende de una acción manual y nunca debe formar parte del predictor.
   "importing",
   "matching",
   "aligning",
@@ -7251,7 +7252,7 @@ const TIMING_STAGE_ORDER = [
 ];
 
 const FALLBACK_STAGE_WEIGHTS = {
-  preparing: 0.035,
+  // 'preparing' se excluye: puede incluir una espera humana indefinida.
   importing: 0.010,
   matching: 0.055,
   aligning: 0.025,
@@ -7284,7 +7285,7 @@ function requiredTimingStages(featuresInput) {
   const features = buildJobFeatures(featuresInput);
   const outputs = new Set(features.outputsRequested);
   const stages = new Set([
-    "preparing",
+    // La preparación manual del lote no se estima.
     "importing",
     "matching",
     "aligning",
@@ -7565,12 +7566,31 @@ function applyStageSanityBounds(stageInput, secondsInput) {
   let seconds = Math.max(1, Number(secondsInput || 0));
   if (stage === "report") seconds = clampNumber(seconds, 2, 60);
   else if (stage === "closing_metashape") seconds = clampNumber(seconds, 10, 180);
-  else if (stage === "preparing") seconds = clampNumber(seconds, 5, 600);
+  else if (stage === "preparing") seconds = 0;
   else if (stage === "exporting") seconds = clampNumber(seconds, 3, 180);
   return seconds;
 }
 
 function estimateStageFromMetricRows(stage, targetInput, rows, fallbackSeconds) {
+  const normalizedStage = normalizeProcessingStage(stage);
+
+  // "Ejecutando procesamiento por lotes" puede quedar esperando a que una
+  // persona pulse el botón. Esa duración no representa trabajo de la máquina.
+  // Se excluye por completo, tanto de históricos como de futuros planes.
+  if (normalizedStage === "preparing") {
+    return {
+      seconds: 0,
+      low_seconds: 0,
+      high_seconds: 0,
+      sample_count: 0,
+      average_distance: 0,
+      confidence: "high",
+      confidence_score: 1,
+      method: "excluded_manual_wait",
+      estimated_output_bytes: null
+    };
+  }
+
   const target = { ...buildJobFeatures(targetInput), ...targetInput };
   const now = Date.now();
   const window = stageSimilarityWindow(stage);
@@ -7808,7 +7828,9 @@ async function estimateStageTimingPlan(pool, targetInput, predictionInput = null
 
   const stageEstimates = [];
   for (const stage of stages) {
-    const actualSeconds = Number(actualStageSeconds[stage] || 0);
+    const actualSeconds = stage === "preparing"
+      ? 0
+      : Number(actualStageSeconds[stage] || 0);
     const fallbackSeconds = fallbackTotal * Number(FALLBACK_STAGE_WEIGHTS[stage] || 0.01) / fallbackWeightTotal;
     const stageRows = rowsByStage.get(stage) || [];
     const estimatedOutputBytes = stage === "zip"
