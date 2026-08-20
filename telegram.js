@@ -115,9 +115,66 @@ async function notifyPaymentReceived({ job, payment }) {
   return sendTelegramMessage(lines.join("\n"));
 }
 
+
+async function notifyUserRegistered({ user }) {
+  const lines = [
+    "👤 <b>NUEVO USUARIO EN XPROCES</b>",
+    "",
+    `👤 <b>Nombre:</b> ${escapeTelegramHtml(user?.name || "No indicado")}`,
+    `📧 <b>Email:</b> ${escapeTelegramHtml(user?.email || "Sin correo")}`,
+    `🆔 <b>Usuario:</b> <code>${escapeTelegramHtml(user?.id || "Sin ID")}</code>`,
+    `🕒 <b>Fecha:</b> ${escapeTelegramHtml(formatDate(user?.created_at))}`
+  ];
+  return sendTelegramMessage(lines.join("\n"));
+}
+
+async function notifyProcessingStarted({ job }) {
+  const projectName = job?.project_name || job?.name || job?.project_type || "Proyecto XProces";
+  const client = job?.email || job?.user_email || "Sin correo";
+  const photoCount = Number(job?.photos_count || job?.photo_count || 0);
+  const quality = job?.quality || job?.quality_mode || job?.exif_summary?._xproces?.quality_mode || "No indicada";
+  const lines = [
+    "🚀 <b>PROCESADO INICIADO</b>",
+    "",
+    `👤 <b>Cliente:</b> ${escapeTelegramHtml(client)}`,
+    `📦 <b>Proyecto:</b> ${escapeTelegramHtml(projectName)}`,
+    `📷 <b>Fotografías:</b> ${photoCount || "No indicadas"}`,
+    `⚡ <b>Calidad:</b> ${escapeTelegramHtml(quality)}`,
+    `🆔 <b>Job:</b> <code>${escapeTelegramHtml(job?.id || "Sin ID")}</code>`,
+    `🕒 <b>Inicio:</b> ${escapeTelegramHtml(formatDate(job?.processing_started_at || new Date()))}`
+  ];
+  return sendTelegramMessage(lines.join("\n"));
+}
+
+async function notifyProcessingFinished({ job }) {
+  const projectName = job?.project_name || job?.name || job?.project_type || "Proyecto XProces";
+  const client = job?.email || job?.user_email || "Sin correo";
+  const photoCount = Number(job?.photos_count || job?.photo_count || 0);
+  const quality = job?.quality || job?.quality_mode || job?.exif_summary?._xproces?.quality_mode || "No indicada";
+  const seconds = Number(job?.processing_seconds || 0);
+  const duration = seconds > 0
+    ? `${Math.floor(seconds / 3600)} h ${Math.floor((seconds % 3600) / 60)} min`
+    : "No disponible";
+  const lines = [
+    "✅ <b>PROCESADO FINALIZADO</b>",
+    "",
+    `👤 <b>Cliente:</b> ${escapeTelegramHtml(client)}`,
+    `📦 <b>Proyecto:</b> ${escapeTelegramHtml(projectName)}`,
+    `📷 <b>Fotografías:</b> ${photoCount || "No indicadas"}`,
+    `⚡ <b>Calidad:</b> ${escapeTelegramHtml(quality)}`,
+    `🆔 <b>Job:</b> <code>${escapeTelegramHtml(job?.id || "Sin ID")}</code>`,
+    `⏱ <b>Duración:</b> ${escapeTelegramHtml(duration)}`,
+    `🕒 <b>Finalizado:</b> ${escapeTelegramHtml(formatDate(job?.finished_at || new Date()))}`
+  ];
+  return sendTelegramMessage(lines.join("\n"));
+}
+
 export {
   telegramIsConfigured,
   escapeTelegramHtml,
   sendTelegramMessage,
-  notifyPaymentReceived
+  notifyPaymentReceived,
+  notifyUserRegistered,
+  notifyProcessingStarted,
+  notifyProcessingFinished
 };
