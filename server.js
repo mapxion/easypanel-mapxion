@@ -6327,18 +6327,24 @@ app.patch("/jobs/:id", async (req, res) => {
     // simplemente reclama/descarga el trabajo. Fin: solo cuando outputs.zip ya
     // existe en el VPS y el servidor acepta status=done.
     try {
-      const processingStages = new Set([
-        "preparing","importing","matching","aligning","cleaning","depth_maps",
+      // Aviso interno de inicio: NO usamos processing_started_at porque ese campo
+      // se marca ya en /confirm-download, antes de que Metashape empiece realmente.
+      // El primer cambio desde una fase previa (queued/downloading/preparing) a una
+      // fase real de Metashape dispara el aviso una sola vez en la transición.
+      const realProcessingStages = new Set([
+        "importing","matching","aligning","cleaning","depth_maps",
         "model","uv","texture","tiled_model","point_cloud","ground_classification",
         "dem","export_dem","dtm","export_dtm","orthomosaic","colorize_model",
         "report","export_tiled_model","export_model","export_point_cloud",
         "export_orthomosaic","export_texture","export_reference","exporting",
         "zip","closing_metashape","processing_complete"
       ]);
-      const oldProcessingStarted = Boolean(currentJob.processing_started_at);
-      const newProcessingStarted = processingStages.has(normalizeProcessingStage(updatedJobForTelegram.stage));
+      const oldAdminStage = normalizeProcessingStage(currentJob.stage);
+      const newAdminStage = normalizeProcessingStage(updatedJobForTelegram.stage);
+      const oldWasRealProcessing = realProcessingStages.has(oldAdminStage);
+      const newIsRealProcessing = realProcessingStages.has(newAdminStage);
 
-      if (!oldProcessingStarted && newProcessingStarted) {
+      if (!oldWasRealProcessing && newIsRealProcessing) {
         const adminStart = await notifyProcessingStarted({ job: updatedJobForTelegram });
         if (!adminStart.ok && !adminStart.skipped) {
           console.error("No se pudo enviar aviso interno de procesado iniciado", adminStart.error);
