@@ -116,10 +116,15 @@ async function notifyPaymentReceived({ job, payment }) {
 }
 
 
-async function notifyUserRegistered({ user }) {
+async function notifyUserRegistered({ user, accountType = "paid", inviteCode = null }) {
+  const isInvite = accountType === "invite";
   const lines = [
     "👤 <b>NUEVO USUARIO EN XPROCES</b>",
     "",
+    `🏷️ <b>Tipo:</b> ${isInvite ? "🎟️ Código invitado" : "💳 Cliente de pago"}`,
+    ...(isInvite && inviteCode
+      ? [`🎫 <b>Código:</b> <code>${escapeTelegramHtml(inviteCode)}</code>`]
+      : []),
     `👤 <b>Nombre:</b> ${escapeTelegramHtml(user?.name || "No indicado")}`,
     `📧 <b>Email:</b> ${escapeTelegramHtml(user?.email || "Sin correo")}`,
     `🆔 <b>Usuario:</b> <code>${escapeTelegramHtml(user?.id || "Sin ID")}</code>`,
@@ -139,9 +144,13 @@ async function notifyJobRequested({ job }) {
     0
   );
   const quality = job?.quality || job?.quality_mode || job?.exif_summary?._xproces?.quality_mode || "No indicada";
+  const isInvite =
+    job?.payment_provider === "invite_code" ||
+    job?.exif_summary?._xproces?.invite_payment_exempt === true;
   const lines = [
     "⚠️ <b>CLIENTE QUIERE PROCESAR</b>",
     "",
+    `🏷️ <b>Tipo:</b> ${isInvite ? "🎟️ Código invitado" : "💳 Cliente de pago"}`,
     `👤 <b>Cliente:</b> ${escapeTelegramHtml(clientName)}`,
     `📧 <b>Email:</b> ${escapeTelegramHtml(client)}`,
     `📦 <b>Proyecto:</b> ${escapeTelegramHtml(projectName)}`,
