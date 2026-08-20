@@ -128,6 +128,34 @@ async function notifyUserRegistered({ user }) {
   return sendTelegramMessage(lines.join("\n"));
 }
 
+async function notifyJobRequested({ job }) {
+  const projectName = job?.project_name || job?.name || job?.project_type || "Proyecto XProces";
+  const client = job?.client_email || job?.email || job?.user_email || "Sin correo";
+  const clientName = job?.client_name || "No indicado";
+  const expectedPhotos = Number(
+    job?.exif_summary?._xproces?.totalPhotos ||
+    job?.expected_photos_count ||
+    job?.photos_count ||
+    0
+  );
+  const quality = job?.quality || job?.quality_mode || job?.exif_summary?._xproces?.quality_mode || "No indicada";
+  const lines = [
+    "⚠️ <b>CLIENTE QUIERE PROCESAR</b>",
+    "",
+    `👤 <b>Cliente:</b> ${escapeTelegramHtml(clientName)}`,
+    `📧 <b>Email:</b> ${escapeTelegramHtml(client)}`,
+    `📦 <b>Proyecto:</b> ${escapeTelegramHtml(projectName)}`,
+    `📷 <b>Fotografías previstas:</b> ${expectedPhotos || "No indicadas"}`,
+    `⚡ <b>Calidad:</b> ${escapeTelegramHtml(quality)}`,
+    `💶 <b>Importe previsto:</b> ${escapeTelegramHtml(formatMoney(job?.price, job?.payment_currency || "EUR"))}`,
+    `🆔 <b>Job:</b> <code>${escapeTelegramHtml(job?.id || "Sin ID")}</code>`,
+    `🕒 <b>Fecha:</b> ${escapeTelegramHtml(formatDate(job?.created_at || new Date()))}`,
+    "",
+    "💻 Aviso temprano: el cliente acaba de crear el trabajo."
+  ];
+  return sendTelegramMessage(lines.join("\n"));
+}
+
 async function notifyProcessingStarted({ job }) {
   const projectName = job?.project_name || job?.name || job?.project_type || "Proyecto XProces";
   const client = job?.email || job?.user_email || "Sin correo";
@@ -175,6 +203,7 @@ export {
   sendTelegramMessage,
   notifyPaymentReceived,
   notifyUserRegistered,
+  notifyJobRequested,
   notifyProcessingStarted,
   notifyProcessingFinished
 };
