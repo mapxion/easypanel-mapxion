@@ -3097,7 +3097,10 @@ app.post("/auth/register", async (req, res) => {
 
     // Aviso interno: nueva cuenta. Un fallo de Telegram nunca bloquea el registro.
     try {
-      const telegramResult = await notifyUserRegistered({ user: rows[0] });
+      const telegramResult = await notifyUserRegistered({
+        user: rows[0],
+        accountType: "paid"
+      });
       console.log("[TELEGRAM ADMIN] nuevo usuario normal:", telegramResult);
       if (!telegramResult.ok && !telegramResult.skipped) {
         console.error("Usuario registrado, pero no se pudo enviar el aviso de Telegram", telegramResult.error);
@@ -3251,7 +3254,7 @@ app.post("/auth/invite-login", async (req, res) => {
       const createdUser = await pool.query(
         `insert into users (email, password_hash, name)
          values ($1, $2, $3)
-         returning id, email, name`,
+         returning id, email, name, created_at`,
         [email, guestPasswordHash, name]
       );
 
@@ -3271,7 +3274,11 @@ app.post("/auth/invite-login", async (req, res) => {
 
     if (userWasCreated) {
       try {
-        const telegramResult = await notifyUserRegistered({ user: userRow });
+        const telegramResult = await notifyUserRegistered({
+          user: userRow,
+          accountType: "invite",
+          inviteCode: code
+        });
         console.log("[TELEGRAM ADMIN] nuevo usuario invitado:", telegramResult);
       } catch (telegramError) {
         console.error("[TELEGRAM ADMIN] error nuevo usuario invitado:", telegramError?.message || telegramError);
