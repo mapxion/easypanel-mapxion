@@ -9,7 +9,7 @@ import archiver from "archiver";
 import cors from "cors";
 import bcrypt from "bcryptjs";
 import { randomBytes, createHmac, createHash } from "crypto";
-import { telegramIsConfigured, sendTelegramMessage, notifyPaymentReceived, notifyUserRegistered, notifyProcessingStarted, notifyProcessingFinished } from "./telegram.js";
+import { telegramIsConfigured, sendTelegramMessage, notifyPaymentReceived, notifyUserRegistered, notifyJobRequested, notifyProcessingStarted, notifyProcessingFinished } from "./telegram.js";
 
 
 const { Pool } = pkg;
@@ -3098,6 +3098,7 @@ app.post("/auth/register", async (req, res) => {
     // Aviso interno: nueva cuenta. Un fallo de Telegram nunca bloquea el registro.
     try {
       const telegramResult = await notifyUserRegistered({ user: rows[0] });
+      console.log("[TELEGRAM ADMIN] nuevo usuario normal:", telegramResult);
       if (!telegramResult.ok && !telegramResult.skipped) {
         console.error("Usuario registrado, pero no se pudo enviar el aviso de Telegram", telegramResult.error);
       }
@@ -3232,6 +3233,7 @@ app.post("/auth/invite-login", async (req, res) => {
     }
 
     let userRow = null;
+    let userWasCreated = false;
 
     const existingUser = await pool.query(
       `select id, email, name
@@ -3254,6 +3256,7 @@ app.post("/auth/invite-login", async (req, res) => {
       );
 
       userRow = createdUser.rows[0];
+      userWasCreated = true;
     }
 
     await pool.query(
@@ -3265,6 +3268,15 @@ app.post("/auth/invite-login", async (req, res) => {
         where id = $1`,
       [inviteRow.id, email, name]
     );
+
+    if (userWasCreated) {
+      try {
+        const telegramResult = await notifyUserRegistered({ user: userRow });
+        console.log("[TELEGRAM ADMIN] nuevo usuario invitado:", telegramResult);
+      } catch (telegramError) {
+        console.error("[TELEGRAM ADMIN] error nuevo usuario invitado:", telegramError?.message || telegramError);
+      }
+    }
 
     return res.json({
       ok: true,
@@ -4523,6 +4535,16 @@ const inviteSessionExempt = req.body?.invite_exempt === true;
     }
 
     ensureJobDirs(jobRow.id);
+
+    // Aviso temprano: el cliente ya ha creado un trabajo y tiene intención de procesar.
+    // Se envía antes de pago/subida/worker para dar tiempo a encender el PC de procesado.
+    try {
+      const telegramResult = await notifyJobRequested({ job: jobRow });
+      console.log("[TELEGRAM ADMIN] cliente quiere procesar:", telegramResult);
+    } catch (telegramError) {
+      console.error("[TELEGRAM ADMIN] error cliente quiere procesar:", telegramError?.message || telegramError);
+    }
+
     res.json(jobRow);
   } catch (e) {
     console.error("create job error", e);
@@ -6327,24 +6349,18 @@ app.patch("/jobs/:id", async (req, res) => {
     // simplemente reclama/descarga el trabajo. Fin: solo cuando outputs.zip ya
     // existe en el VPS y el servidor acepta status=done.
     try {
-      // Aviso interno de inicio: NO usamos processing_started_at porque ese campo
-      // se marca ya en /confirm-download, antes de que Metashape empiece realmente.
-      // El primer cambio desde una fase previa (queued/downloading/preparing) a una
-      // fase real de Metashape dispara el aviso una sola vez en la transición.
-      const realProcessingStages = new Set([
-        "importing","matching","aligning","cleaning","depth_maps",
+      const processingStages = new Set([
+        "preparing","importing","matching","aligning","cleaning","depth_maps",
         "model","uv","texture","tiled_model","point_cloud","ground_classification",
         "dem","export_dem","dtm","export_dtm","orthomosaic","colorize_model",
         "report","export_tiled_model","export_model","export_point_cloud",
         "export_orthomosaic","export_texture","export_reference","exporting",
         "zip","closing_metashape","processing_complete"
       ]);
-      const oldAdminStage = normalizeProcessingStage(currentJob.stage);
-      const newAdminStage = normalizeProcessingStage(updatedJobForTelegram.stage);
-      const oldWasRealProcessing = realProcessingStages.has(oldAdminStage);
-      const newIsRealProcessing = realProcessingStages.has(newAdminStage);
+      const oldProcessingStarted = Boolean(currentJob.processing_started_at);
+      const newProcessingStarted = processingStages.has(normalizeProcessingStage(updatedJobForTelegram.stage));
 
-      if (!oldWasRealProcessing && newIsRealProcessing) {
+      if (!oldProcessingStarted && newProcessingStarted) {
         const adminStart = await notifyProcessingStarted({ job: updatedJobForTelegram });
         if (!adminStart.ok && !adminStart.skipped) {
           console.error("No se pudo enviar aviso interno de procesado iniciado", adminStart.error);
