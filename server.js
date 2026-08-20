@@ -9,7 +9,7 @@ import archiver from "archiver";
 import cors from "cors";
 import bcrypt from "bcryptjs";
 import { randomBytes, createHmac, createHash } from "crypto";
-import { telegramIsConfigured, sendTelegramMessage, notifyPaymentReceived } from "./telegram.js";
+import { telegramIsConfigured, sendTelegramMessage, notifyPaymentReceived, notifyUserRegistered, notifyProcessingStarted, notifyProcessingFinished } from "./telegram.js";
 
 
 const { Pool } = pkg;
@@ -3095,6 +3095,16 @@ app.post("/auth/register", async (req, res) => {
       [email, passwordHash, name || null]
     );
 
+    // Aviso interno: nueva cuenta. Un fallo de Telegram nunca bloquea el registro.
+    try {
+      const telegramResult = await notifyUserRegistered({ user: rows[0] });
+      if (!telegramResult.ok && !telegramResult.skipped) {
+        console.error("Usuario registrado, pero no se pudo enviar el aviso de Telegram", telegramResult.error);
+      }
+    } catch (telegramError) {
+      console.error("Error enviando aviso Telegram de nuevo usuario", telegramError?.message || telegramError);
+    }
+
     return res.json({
       ok: true,
       user: rows[0]
@@ -6104,11 +6114,13 @@ app.patch("/jobs/:id", async (req, res) => {
     }
 
     const currentJobResult = await pool.query(
-      `select id, status, stage, progress, started_at, finished_at, created_at,
-              processing_started_at, processing_finished_at, exif_summary,
-              user_id, project_name, project_type, message, error
-         from jobs
-        where id = $1`,
+      `select j.id, j.status, j.stage, j.progress, j.started_at, j.finished_at, j.created_at,
+              j.processing_started_at, j.processing_finished_at, j.exif_summary,
+              j.user_id, j.project_name, j.project_type, j.message, j.error,
+              j.photos_count, j.quality, j.processing_seconds, u.email as user_email
+         from jobs j
+         left join users u on u.id = j.user_id
+        where j.id = $1`,
       [id]
     );
 
@@ -6299,13 +6311,50 @@ app.patch("/jobs/:id", async (req, res) => {
 
     if (!rows.length) return res.status(404).json({ error: "not found" });
 
+    const updatedJobForTelegram = { ...rows[0], user_email: currentJob.user_email };
+
     try {
-      const telegramTransition = await notifyUserJobTransition(currentJob, rows[0]);
+      const telegramTransition = await notifyUserJobTransition(currentJob, updatedJobForTelegram);
       if (!telegramTransition.ok && !telegramTransition.skipped) {
         console.error("No se pudo enviar el cambio de estado por Telegram", telegramTransition.error);
       }
     } catch (telegramTransitionError) {
       console.error("Error enviando transición del trabajo por Telegram", telegramTransitionError?.message || telegramTransitionError);
+    }
+
+    // Avisos internos al chat de administración.
+    // Inicio: primera entrada real en una fase de Metashape, no cuando el worker
+    // simplemente reclama/descarga el trabajo. Fin: solo cuando outputs.zip ya
+    // existe en el VPS y el servidor acepta status=done.
+    try {
+      const processingStages = new Set([
+        "preparing","importing","matching","aligning","cleaning","depth_maps",
+        "model","uv","texture","tiled_model","point_cloud","ground_classification",
+        "dem","export_dem","dtm","export_dtm","orthomosaic","colorize_model",
+        "report","export_tiled_model","export_model","export_point_cloud",
+        "export_orthomosaic","export_texture","export_reference","exporting",
+        "zip","closing_metashape","processing_complete"
+      ]);
+      const oldProcessingStarted = Boolean(currentJob.processing_started_at);
+      const newProcessingStarted = processingStages.has(normalizeProcessingStage(updatedJobForTelegram.stage));
+
+      if (!oldProcessingStarted && newProcessingStarted) {
+        const adminStart = await notifyProcessingStarted({ job: updatedJobForTelegram });
+        if (!adminStart.ok && !adminStart.skipped) {
+          console.error("No se pudo enviar aviso interno de procesado iniciado", adminStart.error);
+        }
+      }
+
+      const oldStatusAdmin = String(currentJob.status || "").toLowerCase();
+      const newStatusAdmin = String(updatedJobForTelegram.status || "").toLowerCase();
+      if (newStatusAdmin === "done" && oldStatusAdmin !== "done") {
+        const adminDone = await notifyProcessingFinished({ job: updatedJobForTelegram });
+        if (!adminDone.ok && !adminDone.skipped) {
+          console.error("No se pudo enviar aviso interno de procesado finalizado", adminDone.error);
+        }
+      }
+    } catch (adminTelegramError) {
+      console.error("Error enviando aviso interno Telegram del procesado", adminTelegramError?.message || adminTelegramError);
     }
 
     if (terminalStatus) {
